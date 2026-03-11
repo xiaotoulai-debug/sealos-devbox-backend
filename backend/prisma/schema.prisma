@@ -1,0 +1,326 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+/// 员工表
+model User {
+  id           Int        @id @default(autoincrement())
+  username     String     @unique
+  passwordHash String     @map("password_hash")
+  name         String
+  avatar       String?
+  status       UserStatus @default(ACTIVE)
+  createdAt    DateTime   @default(now()) @map("created_at")
+  roleId       Int        @map("role_id")
+  products     Product[]
+  role         Role       @relation(fields: [roleId], references: [id])
+
+  @@map("users")
+}
+
+/// 角色表
+model Role {
+  id          Int              @id @default(autoincrement())
+  name        String           @unique
+  description String?
+  createdAt   DateTime         @default(now()) @map("created_at")
+  permissions RolePermission[]
+  users       User[]
+
+  @@map("roles")
+}
+
+/// 权限节点表（树状结构核心）
+model Permission {
+  id        Int              @id @default(autoincrement())
+  code      String           @unique
+  name      String
+  type      PermissionType
+  sortOrder Int              @default(0) @map("sort_order")
+  parentId  Int?             @map("parent_id")
+  parent    Permission?      @relation("PermissionTree", fields: [parentId], references: [id])
+  children  Permission[]     @relation("PermissionTree")
+  roles     RolePermission[]
+
+  @@map("permissions")
+}
+
+/// 角色-权限 中间表（多对多关联，方便后续扩展字段如 grantedAt）
+model RolePermission {
+  roleId       Int        @map("role_id")
+  permissionId Int        @map("permission_id")
+  assignedAt   DateTime   @default(now()) @map("assigned_at")
+  permission   Permission @relation(fields: [permissionId], references: [id], onDelete: Cascade)
+  role         Role       @relation(fields: [roleId], references: [id], onDelete: Cascade)
+
+  @@id([roleId, permissionId])
+  @@map("role_permissions")
+}
+
+/// 产品表（eMAG 选品池）
+model Product {
+  id                Int            @id @default(autoincrement())
+  pnk               String         @unique
+  title             String
+  brand             String?
+  price             Decimal?       @db.Decimal(10, 2)
+  tags              String[]
+  rating            Decimal?       @db.Decimal(3, 2)
+  reviewCount       Int?           @map("review_count")
+  category          String?
+  categoryL1        String?        @map("category_l1")
+  categoryL2        String?        @map("category_l2")
+  categoryL3        String?        @map("category_l3")
+  categoryL4        String?        @map("category_l4")
+  imageUrl          String?        @map("image_url")
+  productUrl        String?        @map("product_url")
+  costPrice         Decimal?       @map("cost_price") @db.Decimal(10, 2)
+  stock             Int            @default(0)
+  linkTag           String?        @map("link_tag")
+  purchasePrice     Decimal?       @map("purchase_price") @db.Decimal(10, 2)
+  purchaseUrl       String?        @map("purchase_url")
+  actualWeight      Decimal?       @map("actual_weight") @db.Decimal(10, 3)
+  freightCost       Decimal?       @map("freight_cost") @db.Decimal(10, 2)
+  fbeFee            Decimal?       @map("fbe_fee") @db.Decimal(10, 2)
+  margin            Decimal?       @map("margin") @db.Decimal(6, 2)
+  collectedAt       DateTime?      @map("collected_at")
+  length            Decimal?       @map("length") @db.Decimal(10, 2)
+  width             Decimal?       @map("width") @db.Decimal(10, 2)
+  height            Decimal?       @map("height") @db.Decimal(10, 2)
+  sku               String?        @unique @map("sku")
+  chineseName       String?        @map("chinese_name")
+  developer         String?        @map("developer")
+  purchaseQuantity  Int?           @map("purchase_quantity")
+  purchaseType      String?        @map("purchase_type")
+  purchasePeriod    Int?           @map("purchase_period")
+  handlingTime      Int            @default(2) @map("handling_time")
+  vat               Int            @default(19)
+  publishStatus     String         @default("UNPUBLISHED") @map("publish_status")
+  externalProductId String?        @map("external_product_id")
+  externalSkuId     String?        @map("external_sku_id")
+  externalSynced    Boolean        @default(false) @map("external_synced")
+  externalOrderId   String?        @map("external_order_id")
+  stockActual       Float          @default(0) @map("stock_actual")
+  stockInTransit    Float          @default(0) @map("stock_in_transit")
+  sales1d           Int            @default(0) @map("sales_1d")
+  sales7d           Int            @default(0) @map("sales_7d")
+  sales14d          Int            @default(0) @map("sales_14d")
+  sales30d          Int            @default(0) @map("sales_30d")
+  status            ProductStatus  @default(PENDING)
+  createdAt         DateTime       @default(now()) @map("created_at")
+  updatedAt         DateTime       @updatedAt @map("updated_at")
+  ownerId           Int?           @map("owner_id")
+  purchaseOrderId   Int?           @map("purchase_order_id")
+  owner             User?          @relation(fields: [ownerId], references: [id])
+  purchaseOrder     PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
+
+  @@index([status, createdAt(sort: Desc)])
+  @@index([category])
+  @@index([categoryL1, categoryL2, categoryL3, categoryL4])
+  @@index([title])
+  @@index([status, ownerId, collectedAt(sort: Desc)])
+  @@index([purchaseOrderId])
+  @@index([sku])
+  @@index([externalProductId])
+  @@map("products")
+}
+
+/// 采购单
+model PurchaseOrder {
+  id          Int         @id @default(autoincrement())
+  orderNo     String      @unique @map("order_no")
+  operator    String
+  totalAmount Decimal     @map("total_amount") @db.Decimal(12, 2)
+  itemCount   Int         @default(0) @map("item_count")
+  status      OrderStatus @default(PLACED)
+  createdAt   DateTime    @default(now()) @map("created_at")
+  products    Product[]
+
+  @@index([createdAt(sort: Desc)])
+  @@index([operator])
+  @@map("purchase_orders")
+}
+
+/// 店铺授权（eMAG / Shein / Temu / Amazon 等多平台）
+model ShopAuthorization {
+  id              Int              @id @default(autoincrement())
+  platform        String
+  shopName        String           @map("shop_name")
+  businessModel   String           @default("TRADITIONAL") @map("business_model")
+  apiKey          String           @map("api_key")
+  apiSecret       String           @map("api_secret")
+  accessToken     String?          @map("access_token")
+  refreshToken     String?          @map("refresh_token")
+  supplierId      String?          @map("supplier_id")
+  expiresAt       DateTime?        @map("expires_at")
+  status          String           @default("active")
+  isSandbox       Boolean          @default(false) @map("is_sandbox")
+  createdAt       DateTime        @default(now()) @map("created_at")
+  updatedAt       DateTime        @updatedAt @map("updated_at")
+  createdBy       Int?             @map("created_by")
+  storeProducts   StoreProduct[]
+  platformOrders  PlatformOrder[]
+
+  @@index([platform])
+  @@index([status])
+  @@index([businessModel])
+  @@map("shop_authorizations")
+}
+
+/// 平台订单（eMAG order/read 全量同步到本地）
+model PlatformOrder {
+  id           Int      @id @default(autoincrement())
+  shopId       Int      @map("shop_id")
+  emagOrderId  Int      @map("emag_order_id")
+  status       Int
+  statusText   String   @map("status_text")
+  orderTime    DateTime @map("order_time")
+  orderType    Int?     @map("order_type")
+  paymentMode  String?  @map("payment_mode")
+  total        Decimal  @db.Decimal(12, 2)
+  currency     String?  @default("RON")
+  customerJson String?  @map("customer_json") @db.Text
+  productsJson String?  @map("products_json") @db.Text
+  rawJson      String?  @map("raw_json") @db.Text
+  syncedAt     DateTime @default(now()) @map("synced_at")
+  shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, emagOrderId])
+  @@index([shopId])
+  @@index([shopId, orderTime(sort: Desc)])
+  @@map("platform_orders")
+}
+
+/// 店铺在售产品（eMAG product_offer/read 同步，与公海 Product 表分离）
+model StoreProduct {
+  id               Int      @id @default(autoincrement())
+  shopId           Int      @map("shop_id")
+  pnk              String   // eMAG part_number_key (如 D9MSJJ3BM)
+  vendorSku        String?  @map("vendor_sku") // part_number / 供应商 SKU (如 CDX001)
+  sku              String?  // eMAG part_number (平台 SKU)
+  ean              String?  // eMAG ean 数组取第一个或合并
+  emagOfferId      String?  @map("emag_offer_id")
+  name             String
+  salePrice        Decimal  @map("sale_price") @db.Decimal(10, 2)
+  currency         String?  @default("RON") // eMAG 币种，RO=RON, BG=BGN, HU=HUF
+  stock            Int      @default(0)
+  status           Int      @default(1) // 1=Active, 0=Inactive
+  categoryId       Int?     @map("category_id")
+  imageUrl         String?  @map("image_url")
+  mainImage        String?  @map("main_image") // images[display_type=1] 主图 URL
+  mappedInventorySku String? @map("mapped_inventory_sku") // 手动绑定的库存 SKU
+  validationStatus String?  @map("validation_status")
+  docErrors        String?  @map("doc_errors") // eMAG 驳回原因 (JSON 或文本)
+  rejectionReason  String?  @map("rejection_reason") // 驳回原因（便于展示）
+  syncedAt         DateTime @default(now()) @map("synced_at")
+  shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, pnk])
+  @@index([shopId])
+  @@index([pnk])
+  @@index([vendorSku])
+  @@map("store_products")
+}
+
+/// 本地库存/SKU 映射表（用于图片反哺、成本核算、物流计算）
+model Inventory {
+  id            Int      @id @default(autoincrement())
+  sku           String   @unique // 唯一标识，对应 eMAG part_number
+  localImage    String?  @map("local_image") // 本地高清图 URL
+  purchaseCost  Decimal? @map("purchase_cost") @db.Decimal(10, 2) // 采购单价
+  weight        Decimal? @db.Decimal(10, 3) // 重量 (kg)，用于物流
+  length        Decimal? @db.Decimal(10, 2) // 长 (cm)
+  width         Decimal? @db.Decimal(10, 2) // 宽 (cm)
+  height        Decimal? @db.Decimal(10, 2) // 高 (cm)
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+
+  @@index([sku])
+  @@map("inventory")
+}
+
+/// 1688 授权令牌存储
+model AlibabaAuth {
+  id                    Int       @id @default(autoincrement())
+  appKey                String    @map("app_key")
+  appSecret             String    @map("app_secret")
+  accessToken           String    @map("access_token")
+  refreshToken          String    @map("refresh_token")
+  expiresAt             DateTime  @map("expires_at")
+  refreshTokenExpiresAt DateTime? @map("refresh_token_expires_at")
+  memberId              String?   @map("member_id")
+  aliId                 String?   @map("ali_id")
+  loginId               String?   @map("login_id")
+  createdAt             DateTime  @default(now()) @map("created_at")
+  updatedAt             DateTime  @updatedAt @map("updated_at")
+
+  @@map("alibaba_auth")
+}
+
+/// This table has subclasses and requires additional setup for migrations. Visit https://pris.ly/d/table-inheritance for more info.
+/// This table contains check constraints and requires additional setup for migrations. Visit https://pris.ly/d/check-constraints for more info.
+/// The underlying table does not contain a valid unique identifier and can therefore currently not be handled by Prisma Client.
+model postgres_log {
+  log_time               DateTime? @db.Timestamptz(3)
+  user_name              String?
+  database_name          String?
+  process_id             Int?
+  connection_from        String?
+  session_id             String
+  session_line_num       BigInt
+  command_tag            String?
+  session_start_time     DateTime? @db.Timestamptz(6)
+  virtual_transaction_id String?
+  transaction_id         BigInt?
+  error_severity         String?
+  sql_state_code         String?
+  message                String?
+  detail                 String?
+  hint                   String?
+  internal_query         String?
+  internal_query_pos     Int?
+  context                String?
+  query                  String?
+  query_pos              Int?
+  location               String?
+  application_name       String?
+  backend_type           String?
+  leader_pid             Int?
+  query_id               BigInt?
+
+  @@ignore
+}
+
+/// 员工账号状态
+enum UserStatus {
+  ACTIVE
+  INACTIVE
+}
+
+/// 权限节点类型
+enum PermissionType {
+  MENU
+  BUTTON
+  DATA
+}
+
+/// 产品状态（公海 or 已入选私有池）
+enum ProductStatus {
+  PENDING
+  SELECTED
+  PURCHASING
+  ORDERED
+}
+
+/// 采购单状态
+enum OrderStatus {
+  PLACED
+  IN_TRANSIT
+  RECEIVED
+}
