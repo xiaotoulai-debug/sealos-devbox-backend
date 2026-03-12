@@ -2,16 +2,54 @@ import { Router, Request, Response } from 'express';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { authenticate } from '../middleware/auth';
-import { getIsSyncing, setIsSyncing } from '../lib/syncStatus';
-import { syncPlatformOrdersForShop } from '../services/platformOrderSync';
+import { getIsSyncing, tryAcquireSyncLock, releaseSyncLock } from '../lib/syncStatus';
+import { syncPlatformOrdersForShop, syncAllPlatformOrders } from '../services/platformOrderSync';
 import { statusMap } from '../services/emagOrder';
 
 function toStatusText(status: number): string {
   return statusMap[status] ?? `状态${status}`;
 }
 
-/** 无图片占位图 URL */
-const PLACEHOLDER_IMAGE = 'https://via.placeholder.com/150x150?text=No+Image';
+// ─── 统一 DTO 映射（列表 & 详情共用，保证格式绝对一致）────────────────
+type PlatformOrderRow = {
+  id: number;
+  shopId: number;
+  emagOrderId: number;
+  status: number;
+  orderType: number | null;
+  orderTime: Date;
+  paymentMode: string | null;
+  total: { toNumber(): number } | number;
+  currency: string | null;
+  customerJson: string | null;
+  productsJson: string | null;
+  shop?: { region?: string | null } | null;
+};
+
+function mapOrderToDTO(r: PlatformOrderRow, productsOverride?: unknown[]) {
+  const statusNum = r.status != null ? Number(r.status) : 0;
+  const region = (r.shop?.region ?? 'RO') as string;
+  const totalPrice = typeof r.total === 'object' ? r.total.toNumber() : Number(r.total ?? 0);
+  const currency = r.currency ?? 'RON';
+  return {
+    emag_order_id: r.emagOrderId,
+    id: r.emagOrderId,
+    shop_id: r.shopId,
+    region,
+    status: statusNum,
+    status_text: toStatusText(statusNum),
+    total: totalPrice,
+    total_price: totalPrice,
+    currency,
+    date: r.orderTime.toISOString().slice(0, 19).replace('T', ' '),
+    orderTime: r.orderTime.toISOString().slice(0, 19).replace('T', ' '),
+    payment_mode: r.paymentMode ?? null,
+    payment_mode_id: null,
+    type: r.orderType ?? null,
+    customer: r.customerJson ? JSON.parse(r.customerJson) : {},
+    products: productsOverride ?? (r.productsJson ? JSON.parse(r.productsJson) : []),
+  };
+}
 
 const router = Router();
 router.use(authenticate);
@@ -21,6 +59,82 @@ router.use(authenticate);
 router.get('/sync-status', (_req: Request, res: Response) => {
   res.json({ code: 200, data: { isSyncing: getIsSyncing() }, message: 'success' });
 });
+
+// ── POST /api/orders/sync ────────────────────────────────────────
+// 平台订单同步（「强制重加载」入口，必须在 /:id 之前注册）
+// Body: shopId | shopIds[] | 空=全部店铺
+const syncPlatformHandler = async (req: Request, res: Response) => {
+  if (!tryAcquireSyncLock()) {
+    res.status(409).json({ code: 409, data: null, message: '同步进行中，请稍候' });
+    return;
+  }
+  try {
+    const incremental = !!(req.body?.incremental ?? (req.query?.incremental === '1' || req.query?.incremental === 'true'));
+    const rawShopIds = req.body?.shopIds ?? req.query?.shopIds;
+    let targetShopIds: number[] = [];
+
+    if (rawShopIds != null) {
+      const arr = Array.isArray(rawShopIds) ? rawShopIds : String(rawShopIds).split(',');
+      targetShopIds = arr.map(Number).filter((n) => !isNaN(n) && n > 0);
+    } else {
+      const single = Number(req.body?.shopId ?? req.query?.shopId);
+      if (!isNaN(single) && single > 0) targetShopIds = [single];
+    }
+
+    if (targetShopIds.length === 1) {
+      const result = await syncPlatformOrdersForShop(targetShopIds[0], incremental);
+      return res.json({
+        code: 200,
+        data: {
+          totalUpserted: result.totalUpserted,
+          totalFetched: result.totalFetched,
+          pages: result.pages,
+          orderIds: result.orderIds,
+          errors: result.errors,
+        },
+        message: `同步完成，入库 ${result.totalUpserted} 条`,
+      });
+    }
+
+    const results = await syncAllPlatformOrders(
+      incremental,
+      undefined,
+      targetShopIds.length > 0 ? targetShopIds : undefined,
+    );
+
+    const allOrderIds   = results.flatMap((r) => r.orderIds);
+    const totalUpserted = results.reduce((s, r) => s + r.totalUpserted, 0);
+    const totalFetched  = results.reduce((s, r) => s + r.totalFetched, 0);
+
+    return res.json({
+      code: 200,
+      data: {
+        totalUpserted,
+        totalFetched,
+        results: results.map((r) => ({
+          shopId:        r.shopId,
+          totalFetched:  r.totalFetched,
+          totalUpserted: r.totalUpserted,
+          orderIds:      r.orderIds,
+          errors:        r.errors,
+        })),
+        orderIds: allOrderIds,
+      },
+      message: `同步完成，共 ${results.length} 个店铺，入库 ${totalUpserted} 条`,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/orders/sync]', err);
+    const msg = err?.message ?? String(err);
+    const isAuthError = /401|403|未授权|禁止|API 账号或密码无效/.test(msg);
+    const status = isAuthError ? 400 : 500;
+    const responseMsg = isAuthError ? 'API 账号或密码无效，请检查凭证' : '服务器内部错误';
+    res.status(status).json({ code: status, data: null, message: responseMsg });
+  } finally {
+    releaseSyncLock();
+  }
+};
+
+router.post('/sync', syncPlatformHandler);
 
 // ── POST /api/orders/sync-platform/:id ─────────────────────────
 // 强制同步单笔订单（更具体路由需在前）
@@ -54,32 +168,8 @@ router.post('/sync-platform/:id', async (req: Request, res: Response) => {
 });
 
 // ── POST /api/orders/sync-platform ────────────────────────────
-// 手动触发平台订单全量同步（按 shopId），完成后 isSyncing 置 false
-router.post('/sync-platform', async (req: Request, res: Response) => {
-  if (getIsSyncing()) {
-    res.status(409).json({ code: 409, data: null, message: '同步进行中，请稍候' });
-    return;
-  }
-  try {
-    const shopId = Number(req.body?.shopId ?? req.query?.shopId);
-    if (!shopId || isNaN(shopId)) {
-      res.status(400).json({ code: 400, data: null, message: '请提供 shopId' });
-      return;
-    }
-    setIsSyncing(true);
-    const result = await syncPlatformOrdersForShop(shopId);
-    setIsSyncing(false);
-    res.json({
-      code: 200,
-      data: { totalUpserted: result.totalUpserted, totalFetched: result.totalFetched, pages: result.pages },
-      message: `同步完成，入库 ${result.totalUpserted} 条`,
-    });
-  } catch (err) {
-    setIsSyncing(false);
-    console.error('[POST /api/orders/sync-platform]', err);
-    res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
-  }
-});
+// 同上，兼容旧前端调用
+router.post('/sync-platform', syncPlatformHandler);
 
 // ── POST /api/orders ─────────────────────────────────────────
 // 创建采购单：将选中的 PURCHASING 产品归集为一张采购单
@@ -150,14 +240,36 @@ router.post('/', async (req: Request, res: Response) => {
   }
 });
 
+/** 解析 shopIds：支持 shopIds=1,2,3 或 shopId=1 或 shopId=1&shopId=2（向后兼容） */
+function parseShopIds(req: Request): number[] {
+  const shopIdsRaw = req.query.shopIds;
+  const shopIdRaw = req.query.shopId;
+  if (typeof shopIdsRaw === 'string') {
+    const arr = shopIdsRaw.split(',').map((s) => Number(s.trim())).filter((n) => !isNaN(n) && n > 0);
+    return [...new Set(arr)];
+  }
+  if (Array.isArray(shopIdsRaw)) {
+    const arr = shopIdsRaw.flatMap((s) => String(s).split(',')).map((s) => Number(s.trim())).filter((n) => !isNaN(n) && n > 0);
+    return [...new Set(arr)];
+  }
+  if (shopIdRaw != null) {
+    const single = Number(Array.isArray(shopIdRaw) ? shopIdRaw[0] : shopIdRaw);
+    if (!isNaN(single) && single > 0) return [single];
+    if (Array.isArray(shopIdRaw)) {
+      const arr = shopIdRaw.map((s) => Number(s)).filter((n) => !isNaN(n) && n > 0);
+      return [...new Set(arr)];
+    }
+  }
+  return [];
+}
+
 // ── GET /api/orders ──────────────────────────────────────────
-// shopId 存在时：平台订单（eMAG order/read）；否则：采购单列表
+// shopId/shopIds 存在时：平台订单（支持多店铺聚合）；否则：采购单列表
 router.get('/', async (req: Request, res: Response) => {
   try {
-    const shopId = Number(req.query.shopId);
-    if (shopId && !isNaN(shopId)) {
-      // 平台订单：从本地 PlatformOrder 表读取
-      // 兼容 currentPage/itemsPerPage 和 page/pageSize 两种参数命名
+    const shopIds = parseShopIds(req);
+    if (shopIds.length > 0) {
+      // 平台订单：从本地 PlatformOrder 表读取（支持多 shop_id 聚合）
       const currentPage = Math.max(1,
         parseInt(String(req.query.currentPage ?? req.query.page ?? 1), 10) || 1
       );
@@ -173,14 +285,14 @@ router.get('/', async (req: Request, res: Response) => {
         ? Number(req.query.status)
         : null;
 
-      // 动态构建 where 条件
-      const where: Prisma.PlatformOrderWhereInput = { shopId };
+      const where: Prisma.PlatformOrderWhereInput = { shopId: { in: shopIds } };
 
       // 订单号模糊查询（emagOrderId 转字符串匹配）
       if (orderNumber) {
         const ids = await prisma.$queryRaw<{ emag_order_id: number }[]>`
           SELECT emag_order_id FROM platform_orders
-          WHERE shop_id = ${shopId} AND emag_order_id::text LIKE ${'%' + orderNumber + '%'}
+          WHERE shop_id IN (${Prisma.join(shopIds)})
+          AND emag_order_id::text LIKE ${'%' + orderNumber + '%'}
         `;
         const orderIds = ids.map((r) => r.emag_order_id);
         if (orderIds.length === 0) {
@@ -218,30 +330,15 @@ router.get('/', async (req: Request, res: Response) => {
           orderBy: { orderTime: 'desc' },
           skip,
           take: itemsPerPage,
+          include: { shop: { select: { region: true } } },
         }),
       ]);
 
-      const list = rows.map((r) => {
-        const statusText = toStatusText(r.status);
-        // 验证打印：关注订单 480702441 及所有 status=4 的映射
-        if (r.emagOrderId === 480702441 || r.status === 4) {
-          console.log(`[StatusCheck] 订单 ${r.emagOrderId}: status=${r.status} -> "${statusText}"`);
-        }
-        return {
-          id: r.emagOrderId,
-          status: r.status,
-          status_text: statusText,
-          date: r.orderTime.toISOString().slice(0, 19).replace('T', ' '),
-          orderTime: r.orderTime.toISOString().slice(0, 19).replace('T', ' '),
-          payment_mode: r.paymentMode,
-          payment_mode_id: null,
-          type: r.orderType,
-          customer: r.customerJson ? JSON.parse(r.customerJson) : {},
-          products: r.productsJson ? JSON.parse(r.productsJson) : [],
-          total: Number(r.total),
-          currency: r.currency ?? 'RON',
-        };
-      });
+      const list = rows.map((r) => mapOrderToDTO(r));
+
+      if (list.length > 0) {
+        console.log(`[平台订单] 查询样本(shopIds=${shopIds}):`, JSON.stringify(list[0], null, 2));
+      }
 
       res.json({
         code: 200,
@@ -283,33 +380,39 @@ router.get('/', async (req: Request, res: Response) => {
 });
 
 // ── GET /api/orders/:id ──────────────────────────────────────
-// shopId 存在时：平台订单详情（从 PlatformOrder 读取）；否则：采购单详情或 400
+// shopId/shopIds 存在时：平台订单详情；否则 400
 router.get('/:id', async (req: Request, res: Response) => {
   try {
-    const shopId = Number(req.query.shopId);
-    if (!shopId || isNaN(shopId)) {
-      res.status(400).json({ code: 400, data: null, message: '平台订单详情需提供 shopId' });
+    const shopIds = parseShopIds(req);
+    if (shopIds.length === 0) {
+      res.status(400).json({ code: 400, data: null, message: '平台订单详情需提供 shopId 或 shopIds' });
       return;
     }
+
     const orderId = Number(req.params.id);
     if (isNaN(orderId)) {
       res.status(400).json({ code: 400, data: null, message: '订单 ID 无效' });
       return;
     }
 
-    const row = await prisma.platformOrder.findUnique({
-      where: { shopId_emagOrderId: { shopId, emagOrderId: orderId } },
-    });
+    const shopInclude = { shop: { select: { region: true } } } as const;
+    const row = shopIds.length === 1
+      ? await prisma.platformOrder.findUnique({
+          where: { shopId_emagOrderId: { shopId: shopIds[0], emagOrderId: orderId } },
+          include: shopInclude,
+        })
+      : await prisma.platformOrder.findFirst({
+          where: { shopId: { in: shopIds }, emagOrderId: orderId },
+          include: shopInclude,
+        });
 
     if (!row) {
       res.status(404).json({ code: 404, data: null, message: '订单不存在' });
       return;
     }
 
-    const detailStatusText = toStatusText(row.status);
-    console.log(`[StatusCheck] 详情 订单 ${row.emagOrderId}: status=${row.status} -> "${detailStatusText}"`);
-
-    const rawProducts: Array<{ sku?: string | null; product_name?: string; pnk?: string; sale_price?: number; quantity?: number; vat_rate?: number; [k: string]: unknown }> =
+    // 富化产品列表：补充图片状态（仅详情接口需要）
+    const rawProducts: Array<{ sku?: string | null; [k: string]: unknown }> =
       row.productsJson ? JSON.parse(row.productsJson) : [];
 
     const orderSkus = [...new Set(rawProducts.map((p) => String(p.sku ?? '').trim()).filter(Boolean))];
@@ -318,46 +421,34 @@ router.get('/:id', async (req: Request, res: Response) => {
     if (orderSkus.length > 0) {
       const storeProducts = await prisma.storeProduct.findMany({
         where: {
-          shopId,
+          shopId: row.shopId,
           OR: [{ sku: { in: orderSkus } }, { vendorSku: { in: orderSkus } }],
         },
-        select: { sku: true, vendorSku: true, mainImage: true, imageUrl: true, mappedInventorySku: true },
+        select: { sku: true, vendorSku: true, mainImage: true, imageUrl: true },
       });
 
       for (const sp of storeProducts) {
         const platformImg = (sp.mainImage ?? sp.imageUrl ?? '').trim() || null;
-        const image_status = platformImg ? '正常' : '待补全平台产品资料';
-        const display_image = platformImg;
-        if (sp.sku) storeProductMap.set(sp.sku, { display_image, image_status });
-        if (sp.vendorSku) storeProductMap.set(sp.vendorSku, { display_image, image_status });
+        const info = { display_image: platformImg, image_status: platformImg ? '正常' : '待补全平台产品资料' };
+        if (sp.sku) storeProductMap.set(sp.sku, info);
+        if (sp.vendorSku) storeProductMap.set(sp.vendorSku, info);
       }
     }
 
-    const products = rawProducts.map((p) => {
+    const enrichedProducts = rawProducts.map((p) => {
       const sku = String(p.sku ?? '').trim();
       const spData = sku ? storeProductMap.get(sku) : undefined;
-      const display_image = spData?.display_image ?? null;
-      const image_status = spData?.image_status ?? (sku ? '待补全平台产品资料' : '正常');
       const { image_url, ...rest } = p as { image_url?: string; [k: string]: unknown };
-      return { ...rest, display_image, image_status };
+      return {
+        ...rest,
+        display_image: spData?.display_image ?? null,
+        image_status: spData?.image_status ?? (sku ? '待补全平台产品资料' : '正常'),
+      };
     });
 
     res.json({
       code: 200,
-      data: {
-        id: row.emagOrderId,
-        status: row.status,
-        type: row.orderType,
-        status_text: detailStatusText,
-        date: row.orderTime.toISOString().slice(0, 19).replace('T', ' '),
-        orderTime: row.orderTime.toISOString().slice(0, 19).replace('T', ' '),
-        payment_mode: row.paymentMode,
-        payment_mode_id: null,
-        customer: row.customerJson ? JSON.parse(row.customerJson) : {},
-        products,
-        total: Number(row.total),
-        currency: row.currency ?? 'RON',
-      },
+      data: mapOrderToDTO(row, enrichedProducts),
       message: 'success',
     });
   } catch (err) {

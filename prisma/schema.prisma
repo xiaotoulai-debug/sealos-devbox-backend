@@ -147,11 +147,19 @@ model PurchaseOrder {
   @@map("purchase_orders")
 }
 
+/// eMAG 多站点区域枚举（RO=罗马尼亚, BG=保加利亚, HU=匈牙利）
+enum EmagRegion {
+  RO
+  BG
+  HU
+}
+
 /// 店铺授权（eMAG / Shein / Temu / Amazon 等多平台）
 model ShopAuthorization {
   id              Int              @id @default(autoincrement())
   platform        String
   shopName        String           @map("shop_name")
+  region          EmagRegion?      // eMAG 站点区域 RO/BG/HU，仅 emag 平台使用；null 时按 shopName 推断
   businessModel   String           @default("TRADITIONAL") @map("business_model")
   apiKey          String           @map("api_key")
   apiSecret       String           @map("api_secret")
@@ -208,12 +216,13 @@ model StoreProduct {
   emagOfferId      String?  @map("emag_offer_id")
   name             String
   salePrice        Decimal  @map("sale_price") @db.Decimal(10, 2)
-  currency         String?  @default("RON") // eMAG 币种，RO=RON, BG=BGN, HU=HUF
+  currency         String?  @default("RON") // eMAG 币种，RO=RON, BG=EUR(2026欧元区), HU=HUF
   stock            Int      @default(0)
   status           Int      @default(1) // 1=Active, 0=Inactive
   categoryId       Int?     @map("category_id")
   imageUrl         String?  @map("image_url")
   mainImage        String?  @map("main_image") // images[display_type=1] 主图 URL
+  productUrl       String?  @map("product_url") // 前台商品链接，用于爬虫补图
   mappedInventorySku String? @map("mapped_inventory_sku") // 手动绑定的库存 SKU
   validationStatus String?  @map("validation_status")
   docErrors        String?  @map("doc_errors") // eMAG 驳回原因 (JSON 或文本)
@@ -243,6 +252,21 @@ model Inventory {
 
   @@index([sku])
   @@map("inventory")
+}
+
+/// 自动同步日志（订单哨兵、产品雷达、库存同步）
+model SyncLog {
+  id          Int      @id @default(autoincrement())
+  syncType    String   @map("sync_type")   // order_sentinel | product_radar | inventory_sync
+  updatedCount Int     @default(0) @map("updated_count")
+  durationMs  Int      @default(0) @map("duration_ms")
+  result      String?  @db.Text            // success | partial | failed
+  detail      String?  @db.Text            // JSON 或简要说明
+  createdAt   DateTime @default(now()) @map("created_at")
+
+  @@index([syncType])
+  @@index([createdAt(sort: Desc)])
+  @@map("sync_logs")
 }
 
 /// 1688 授权令牌存储

@@ -21,7 +21,7 @@ export interface EmagProductOffer {
   recommended_price?: number;
   min_sale_price?: number;
   max_sale_price?: number;
-  currency_type?: string;            // RON / BGN / HUF
+  currency_type?: string;            // RON / EUR(BG) / HUF
   vat_id?: number;                   // 税率 ID (19% → vat_id=1 for RO)
   status?: number;                   // 1=Active
   stock?: Array<{
@@ -196,4 +196,20 @@ export async function findDocumentationByEans(
   const filtered = eans.map((e) => String(e).trim()).filter(Boolean);
   if (filtered.length === 0) return { isError: true, messages: ['eans 为空'] };
   return emagApiCall(creds, 'documentation', 'find_by_eans', { eans: filtered });
+}
+
+/**
+ * Catalog 产品详情接口 — 根据 PNK 批量查询完整产品数据（含 images/attachments）
+ * 用于两段式同步的第二阶段：深层图片补全
+ * 尝试参数: part_number_key | ids | part_numbers（依 eMAG API 版本而定）
+ * @param pnkList part_number_key 数组，每批建议 50 个
+ */
+export async function readProductsByPnk(
+  creds: EmagCredentials,
+  pnkList: string[],
+): Promise<EmagApiResponse<any[]>> {
+  const filtered = pnkList.map((p) => String(p).trim()).filter(Boolean);
+  if (filtered.length === 0) return { isError: true, messages: ['pnkList 为空'] };
+  const payload = { part_number_key: filtered };
+  return emagApiCall(creds, 'product', 'read', payload);
 }
