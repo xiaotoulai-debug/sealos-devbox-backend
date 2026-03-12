@@ -2,11 +2,37 @@ import { Router, Request, Response } from 'express';
 import { prisma } from '../lib/prisma';
 import { authenticate } from '../middleware/auth';
 import { importPublicSeaFromDisk } from '../services/importPublicSea';
+import { backfillProductUrls } from '../services/storeProductSync';
 
 const router = Router();
 
 // 所有产品接口必须登录
 router.use(authenticate);
+
+// ── POST /api/products/sync-urls ─────────────────────────────────
+// 平台产品 product_url 全量补齐（store_products 表）
+router.post('/sync-urls', async (_req: Request, res: Response) => {
+  try {
+    const result = await backfillProductUrls();
+    const nullCount = await prisma.storeProduct.count({ where: { productUrl: null } });
+    const total = await prisma.storeProduct.count();
+    res.json({
+      code: 200,
+      data: {
+        updated: result.updated,
+        total: result.total,
+        product_url_null_remaining: nullCount,
+        product_url_filled: total - nullCount,
+        total_products: total,
+        errors: result.errors,
+      },
+      message: `已补齐 ${result.updated} 个 product_url，当前 null 剩余: ${nullCount}/${total}`,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/products/sync-urls]', err);
+    res.status(500).json({ code: 500, data: null, message: err?.message ?? '服务器内部错误' });
+  }
+});
 
 // ── POST /api/products/import-json ──────────────────────────
 // 从服务器本地 JSON 文件导入公海产品

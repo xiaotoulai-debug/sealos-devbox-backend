@@ -9,11 +9,152 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../lib/prisma';
 import { authenticate } from '../middleware/auth';
-import { resolveRegion } from '../services/emagClient';
+import { getEmagCredentials, resolveRegion, REGION_CURRENCY, REGION_DOMAIN } from '../services/emagClient';
 import { getSalesStatsByShop, getSalesForProduct, logZeroSalesDiagnostic } from '../services/salesStats';
+import { tryAcquireSyncLock, releaseSyncLock } from '../lib/syncStatus';
+import { backfillProductUrls, backfillProductImages, syncStoreProducts } from '../services/storeProductSync';
 
 const router = Router();
 router.use(authenticate);
+
+/**
+ * POST /api/store-products/sync
+ * 逻辑流: 接收请求 -> 解析 shopId/shopIds -> 查库获取 shop(s) -> 初始化 Adapter -> 拉取原生数据 -> Normalizer 管线 -> upsert(shopId+sku)
+ * Body: { shopId: number } | { shopIds: number[] }  或 Query: ?shopId=1 或 ?shopIds=1,2,3
+ */
+router.post('/sync', async (req: Request, res: Response) => {
+  if (!tryAcquireSyncLock()) {
+    res.status(409).json({ code: 409, data: null, message: '同步进行中，请稍候' });
+    return;
+  }
+  try {
+    const rawShopIds = req.body?.shopIds ?? req.query?.shopIds;
+    const rawShopId = req.body?.shopId ?? req.query?.shopId;
+
+    let shopIds: number[] = [];
+    if (rawShopIds != null) {
+      const arr = Array.isArray(rawShopIds) ? rawShopIds : String(rawShopIds).split(',');
+      shopIds = arr.map(Number).filter((n) => !isNaN(n) && n > 0);
+    } else if (rawShopId != null) {
+      const single = Number(Array.isArray(rawShopId) ? rawShopId[0] : rawShopId);
+      if (!isNaN(single) && single > 0) shopIds = [single];
+    }
+
+    if (shopIds.length === 0) {
+      res.status(400).json({ code: 400, data: null, message: '请提供 shopId 或 shopIds' });
+      return;
+    }
+
+    // 查库获取 shop(s)，确保存在且为 eMAG
+    const shops = await prisma.shopAuthorization.findMany({
+      where: { id: { in: shopIds }, platform: { equals: 'emag', mode: 'insensitive' } },
+      select: { id: true },
+    });
+    const validIds = shops.map((s) => s.id);
+    if (validIds.length === 0) {
+      res.status(400).json({ code: 400, data: null, message: '未找到有效的 eMAG 店铺' });
+      return;
+    }
+
+    const results: Array<{ shopId: number; totalFetched: number; upserted: number; rejectedCount: number; errors: string[]; eanImagesRecovered?: number; deepSyncImagesUpdated?: number }> = [];
+    for (const shopId of validIds) {
+      const creds = await getEmagCredentials(shopId);
+      console.log(`[POST /api/store-products/sync] shopId=${shopId} region=${creds.region} baseUrl=${creds.baseUrl}`);
+      const result = await syncStoreProducts(creds);
+      results.push({
+        shopId: result.shopId,
+        totalFetched: result.totalFetched,
+        upserted: result.upserted,
+        rejectedCount: result.rejectedCount,
+        errors: result.errors,
+        eanImagesRecovered: result.eanImagesRecovered,
+        deepSyncImagesUpdated: result.deepSyncImagesUpdated,
+      });
+    }
+
+    const totalUpserted = results.reduce((s, r) => s + r.upserted, 0);
+    res.json({
+      code: 200,
+      data: {
+        results,
+        totalUpserted,
+      },
+      message: `同步完成，共 ${validIds.length} 个店铺，入库 ${totalUpserted} 个产品`,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/store-products/sync]', err);
+    const msg = err?.message ?? String(err);
+    const isAuthError = /401|403|未授权|禁止|API 账号或密码无效/.test(msg);
+    const status = isAuthError ? 400 : 500;
+    const responseMsg = isAuthError ? 'API 账号或密码无效，请检查凭证' : msg.slice(0, 500);
+    res.status(status).json({ code: status, data: null, message: responseMsg });
+  } finally {
+    releaseSyncLock();
+  }
+});
+
+/**
+ * POST /api/store-products/sync-urls
+ * 全量补齐 product_url（遍历 product_url 为 null 的产品，从 API 或构造链接）
+ */
+const syncUrlsHandler = async (req: Request, res: Response) => {
+  console.log('[POST /api/store-products/sync-urls] 收到请求，触发 backfillProductUrls');
+  try {
+    const result = await backfillProductUrls();
+    const nullCount = await prisma.storeProduct.count({ where: { productUrl: null } });
+    const total = await prisma.storeProduct.count();
+    res.json({
+      code: 200,
+      data: {
+        updated: result.updated,
+        total: result.total,
+        product_url_null_remaining: nullCount,
+        product_url_filled: total - nullCount,
+        total_products: total,
+        errors: result.errors,
+      },
+      message: `已补齐 ${result.updated} 个 product_url，当前 null 剩余: ${nullCount}/${total}`,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/store-products/sync-urls]', err);
+    res.status(500).json({ code: 500, data: null, message: err?.message ?? '服务器内部错误' });
+  }
+};
+router.post('/sync-urls', syncUrlsHandler);
+router.post('/sync-urls/', syncUrlsHandler); // 兼容带尾斜杠的请求
+
+/**
+ * POST /api/store-products/sync-images
+ * 全局图片回补：针对 main_image 为空或 eMAG Logo/占位图的产品（无论店铺/站点），
+ * 重新调用融合了提纯算法的 product_offer/read + normalizeEmagProduct 进行回补
+ */
+const syncImagesHandler = async (req: Request, res: Response) => {
+  console.log('[POST /api/store-products/sync-images] 全局图片回补，触发 backfillProductImages');
+  try {
+    const result = await backfillProductImages();
+    const withImage = await prisma.storeProduct.count({
+      where: { AND: [{ mainImage: { not: null } }, { mainImage: { not: '' } }] },
+    });
+    const total = await prisma.storeProduct.count();
+    res.json({
+      code: 200,
+      data: {
+        updated: result.updated,
+        total: result.total,
+        with_image: withImage,
+        total_products: total,
+        errors: result.errors,
+      },
+      message: `已补齐 ${result.updated} 个 main_image，当前有图: ${withImage}/${total}`,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/store-products/sync-images]', err);
+    res.status(500).json({ code: 500, data: null, message: err?.message ?? '服务器内部错误' });
+  }
+};
+router.post('/sync-images', syncImagesHandler);
+router.post('/sync-images/', syncImagesHandler);
+router.post('/backfill-images', syncImagesHandler); // 全局图片回补（与 sync-images 相同）
 
 /**
  * POST /api/store-products/map
@@ -109,7 +250,7 @@ router.get('/', async (req: Request, res: Response) => {
         orderBy: { syncedAt: 'desc' },
         skip,
         take: limit,
-        include: { shop: { select: { shopName: true } } },
+        include: { shop: { select: { shopName: true, region: true } } },
       }),
     ]);
 
@@ -154,8 +295,9 @@ router.get('/', async (req: Request, res: Response) => {
     }
 
     const shopName = list[0]?.shop?.shopName ?? '';
-    const region = resolveRegion(shopName);
-    const defaultCurrency = region === 'RO' ? 'RON' : region === 'BG' ? 'BGN' : 'HUF';
+    const shopRegion = list[0]?.shop?.region;
+    const region = shopRegion && ['RO', 'BG', 'HU'].includes(shopRegion) ? shopRegion : resolveRegion(shopName);
+    const defaultCurrency = (region && REGION_CURRENCY[region as keyof typeof REGION_CURRENCY]) ?? 'RON';
 
     let zeroSalesDiagnosticCount = 0;
     const data = list.map((p) => {
@@ -188,12 +330,21 @@ router.get('/', async (req: Request, res: Response) => {
       }
 
       const salesStatsObj = { d7: sales_stats.d7, d14: sales_stats.d14, d30: sales_stats.d30 };
+      const productUrl = p.productUrl ?? (() => {
+        const domain = (region && REGION_DOMAIN[region as keyof typeof REGION_DOMAIN]) ?? 'emag.ro';
+        const name = (p.name ?? '').trim();
+        const slug = name
+          ? name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 150)
+          : 'product';
+        return `https://www.${domain}/${slug}/pd/${p.pnk}/`;
+      })();
       return {
         id: p.id,
         pnk: p.pnk,
         sku: p.sku ?? null,
         ean: p.ean ?? null,
         mapped_inventory_sku: p.mappedInventorySku ?? null,
+        product_url: productUrl,
         image: finalImage,
         main_image: finalImage,
         local_image: localImage,

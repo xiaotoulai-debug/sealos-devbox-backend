@@ -1,22 +1,28 @@
 /**
- * 店铺初始化同步 — 从 eMAG product_offer/read 拉取全部产品到 StoreProduct 表
+ * 店铺初始化同步 — 两段式深层抓取 (Two-Stage Deep Sync)
  *
- * 数据源: 仅 eMAG API，与公海 Product 表完全分离
- * 限流: 3 req/sec (product_offer 路由)
- * 包含: 在售(status=1)、驳回(status=0)等全部状态，强制抓取 doc_errors
+ * 第一阶段：Offer Sync — product_offer/read 快速拉取 SKU、价格、库存，upsert 基础信息
+ * 第二阶段：Deep Catalog Enrichment — product/read 批量查询无图产品详情，应用图片提纯算法，回写 main_image
+ *
+ * 双引擎抓图：attachments/images + documentation/find_by_eans + product/read Catalog
  */
 
 import { prisma } from '../lib/prisma';
-import { EmagCredentials } from './emagClient';
-import { readProductOffers, findDocumentationByEans } from './emagProduct';
-import type { EmagProductOffer } from './emagProduct';
+import { EmagCredentials, getEmagCredentials, REGION_DOMAIN } from './emagClient';
+import { readProductOffers, findDocumentationByEans, readProductsByPnk } from './emagProduct';
+import { normalizeEmagProduct, slugifyProductName, isInvalidImageUrl } from './emagProductNormalizer';
 
 const PAGE_SIZE = 100;
 const DELAY_MS = 350; // 3 req/sec (product_offer)
 const EAN_BATCH_SIZE = 100;
-const EAN_DELAY_MS = 200; // 5 req/sec (documentation/find_by_eans)
-const PLACEHOLDER = '待完善';
-const PENDING_UPDATE = '待更新';
+const EAN_DELAY_MS = 200;
+const CATALOG_BATCH_SIZE = 50; // 第二阶段每批 SKU 数
+const CATALOG_DELAY_MS = 300;
+
+function isJpgOrPngUrl(u: string): boolean {
+  const lower = u.toLowerCase();
+  return lower.includes('.jpg') || lower.includes('.jpeg') || lower.includes('.png') || lower.includes('.jpg?') || lower.includes('.png?');
+}
 
 export interface SyncResult {
   shopId: number;
@@ -27,16 +33,20 @@ export interface SyncResult {
   rejectedReasons: string[];
   rejectedSample?: { pnk: string; docErrors: string };
   eanImagesRecovered?: number;
+  deepSyncImagesUpdated?: number; // 第二阶段 Catalog 补图数量
 }
 
 /**
  * 分页拉取店铺全部产品（含已驳回），强制抓取 doc_errors
  */
-export async function syncStoreProducts(creds: EmagCredentials): Promise<SyncResult> {
-  const result: SyncResult = { shopId: creds.shopId, totalFetched: 0, upserted: 0, errors: [], rejectedCount: 0, rejectedReasons: [] };
+export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: string): Promise<SyncResult> {
+  const result: SyncResult = { shopId: creds.shopId, totalFetched: 0, upserted: 0, errors: [], rejectedCount: 0, rejectedReasons: [], eanImagesRecovered: 0, deepSyncImagesUpdated: 0 };
 
   const allOffers: any[] = [];
   const seenPnkKey = new Set<string>();
+
+  const baseFilters: Record<string, any> = {};
+  if (modifiedAfter) baseFilters.modified = { from: modifiedAfter };
 
   const fetchPage = async (extraFilters: Record<string, any> = {}) => {
     let page = 1;
@@ -44,11 +54,17 @@ export async function syncStoreProducts(creds: EmagCredentials): Promise<SyncRes
       const filters: Record<string, any> = {
         currentPage: page,
         itemsPerPage: PAGE_SIZE,
+        ...baseFilters,
         ...extraFilters,
       };
 
       const res = await readProductOffers(creds, filters);
-      if (res.isError) return;
+      if (res.isError) {
+        const msgs = res.messages?.join('; ') ?? JSON.stringify(res.errors ?? res).slice(0, 300);
+        const errMsg = `[EMAG API ERROR] Shop: ${creds.region}, BaseURL: ${creds.baseUrl}, product_offer/read 失败: ${msgs}`;
+        console.error(`\n========== ${errMsg} ==========`);
+        throw new Error(errMsg);
+      }
       const raw = res.results as any;
       const batch = Array.isArray(raw) ? raw : (raw?.items ?? raw?.results ?? []);
       if (batch.length === 0) break;
@@ -79,214 +95,34 @@ export async function syncStoreProducts(creds: EmagCredentials): Promise<SyncRes
   }
   result.totalFetched = allOffers.length;
 
-  await prisma.storeProduct.deleteMany({ where: { shopId: creds.shopId } });
-  console.log(`[storeProductSync] shop=${creds.shopId} 已清空旧数据，开始覆盖更新 ${allOffers.length} 个产品`);
+  console.log(
+    `[storeProductSync] shop=${creds.shopId} ${modifiedAfter ? `增量 modified_after=${modifiedAfter}` : '全量'}，upsert ${allOffers.length} 个产品（强制更新 main_image/price）`,
+  );
 
   const firstFiveRaw: Array<{ pn: string; pnk: string; imageUrl: string }> = [];
+  const PIPELINE_LOG_LIMIT = 20;
+  let pipelineLogCount = 0;
+
+  // ─── 预拉取 EAN 图片（引擎二：documentation/find_by_eans，跨境 B 店验证有效）───
+  const eanToImage = new Map<string, string>();
+  const needEanOffers: Array<{ o: any; np: ReturnType<typeof normalizeEmagProduct> }> = [];
   for (const o of allOffers) {
-    try {
-      const pnk = String(o.part_number_key ?? o.pnk ?? o.part_number ?? '').trim();
-      const sku = o.part_number != null ? String(o.part_number).trim() : null;
-      const vendorSku = sku;
-      const eanRaw = o.ean;
-      const ean = Array.isArray(eanRaw) && eanRaw.length > 0
-        ? (eanRaw.map((x: any) => (typeof x === 'string' ? x : x?.value ?? x?.ean ?? String(x))).filter(Boolean).join(', ') || null)
-        : (typeof eanRaw === 'string' && eanRaw.trim() ? eanRaw.trim() : null);
-      if (!pnk) continue;
-
-      const mainImageUrl = (() => {
-        const imgs = o.images;
-        if (!Array.isArray(imgs) || imgs.length === 0) return null;
-        const main = imgs.find((img: any) => img?.display_type === 1 || img?.display_type === '1' || img?.displayType === 1);
-        const url = main?.url ?? imgs[0]?.url;
-        return typeof url === 'string' ? url.trim() : null;
-      })();
-      if (firstFiveRaw.length < 5) {
-        firstFiveRaw.push({
-          pn: vendorSku ?? o.part_number ?? '(空)',
-          pnk,
-          imageUrl: mainImageUrl ?? '(无)',
-        });
-      }
-
-      const vsRaw = o.validation_status ?? o.offer_validation_status;
-      const vsArr = Array.isArray(vsRaw) ? vsRaw : (vsRaw ? [vsRaw] : []);
-      const transVsRaw = o.translation_validation_status;
-      const transVsArr = Array.isArray(transVsRaw) ? transVsRaw : (transVsRaw ? [transVsRaw] : []);
-      const offerVs = o.offer_validation_status;
-      const offerVsArr = Array.isArray(offerVs) ? offerVs : (offerVs ? [offerVs] : []);
-
-      const extractMsg = (e: any): string => {
-        if (typeof e === 'string') return e;
-        return e?.message ?? e?.error ?? e?.description ?? e?.field ?? e?.text
-          ?? (e?.code ? `[${e.code}] ${e.message || e.description || e.detail || ''}`.trim() : '')
-          ?? (e?.details ? (Array.isArray(e.details) ? e.details.map(extractMsg).join('; ') : String(e.details)) : '')
-          ?? JSON.stringify(e);
-      };
-      const collectErrorsFromArr = (arr: any[]): string[] => {
-        const msgs: string[] = [];
-        for (const v of arr) {
-          if (!v || typeof v !== 'object') continue;
-          const errs = v.errors ?? v.doc_errors ?? v.docErrors ?? v.messages ?? v.documents;
-          if (Array.isArray(errs)) {
-            for (const e of errs) {
-              const m = extractMsg(e);
-              if (m && m !== '{}') msgs.push(m);
-            }
-          } else if (typeof errs === 'string') msgs.push(errs);
-          else if (errs && typeof errs === 'object' && !Array.isArray(errs)) {
-            const m = extractMsg(errs);
-            if (m && m !== '{}') msgs.push(m);
-          }
-        }
-        return msgs;
-      };
-
-      const docErrorsTop = o.doc_errors ?? o.docErrors;
-      const docErrorsFromVs = collectErrorsFromArr(vsArr);
-      const docErrorsFromTrans = collectErrorsFromArr(transVsArr);
-      const docErrorsFromOffer = collectErrorsFromArr(offerVsArr);
-      const docErrorsFromTop = Array.isArray(docErrorsTop)
-        ? docErrorsTop.map((e: any) => typeof e === 'string' ? e : (e?.message ?? e?.error ?? e?.description ?? e?.field ?? JSON.stringify(e)))
-        : (typeof docErrorsTop === 'string' ? [docErrorsTop] : []);
-
-      const allErrorMsgs = [...new Set([...docErrorsFromTop, ...docErrorsFromVs, ...docErrorsFromTrans, ...docErrorsFromOffer])].filter(Boolean);
-      const mergedRejectionReason = allErrorMsgs.length > 0 ? allErrorMsgs.join('; ') : null;
-
-      let vsValue: any = null;
-      let vsDesc: string | null = null;
-      for (const v of vsArr) {
-        const val = typeof v === 'object' && v ? (v as any).value : v;
-        vsValue = val;
-        vsDesc = typeof v === 'object' && v ? (v as any).description : null;
-        if (val === 8 || val === '8') break;
-      }
-      let transRejected = false;
-      for (const v of transVsArr) {
-        const val = typeof v === 'object' && v ? (v as any).value : v;
-        if (val === 8 || val === '8') {
-          transRejected = true;
-          break;
-        }
-      }
-      let offerRejected = false;
-      for (const v of offerVsArr) {
-        const val = typeof v === 'object' && v ? (v as any).value : v;
-        if (val === 0 || val === '0' || val === 8 || val === '8') {
-          offerRejected = true;
-          break;
-        }
-      }
-
-      const isRejected = vsValue === 8 || vsValue === '8' || transRejected || (offerRejected && allErrorMsgs.length > 0);
-      const isApproved = vsValue === 9 || vsValue === '9' && !transRejected;
-      const fallbackText = isRejected ? PENDING_UPDATE : PLACEHOLDER;
-
-      const rejectionReason = isRejected ? (mergedRejectionReason || vsDesc || '已驳回') : null;
-      const docErrors = isRejected ? mergedRejectionReason : null;
-
-      if (isRejected) {
-        result.rejectedCount++;
-        if (rejectionReason && !result.rejectedReasons.includes(rejectionReason)) {
-          result.rejectedReasons.push(rejectionReason);
-        }
-        console.log(`\n========== [eMAG 已驳回产品] PNK=${pnk} ==========`);
-        console.log(`  rejection_reason: ${rejectionReason || '(无)'}`);
-        console.log(`  validation_status 原始 JSON:`);
-        console.log(JSON.stringify(o.validation_status, null, 2));
-        if (o.translation_validation_status) {
-          console.log(`  translation_validation_status 原始 JSON:`);
-          console.log(JSON.stringify(o.translation_validation_status, null, 2));
-        }
-        if (o.doc_errors || o.docErrors) {
-          console.log(`  doc_errors 原始:`, JSON.stringify(o.doc_errors ?? o.docErrors, null, 2));
-        }
-        console.log(`  合并后错误词条: ${allErrorMsgs.join(' | ') || '(无)'}`);
-        if (!result.rejectedSample) result.rejectedSample = { pnk, docErrors: rejectionReason || '' };
-      }
-
-      const salePrice = Number(o.sale_price ?? o.salePrice ?? o.main_offer_price ?? 0);
-      const currencyRaw = o.currency ?? o.currency_type;
-      const currency = (typeof currencyRaw === 'string' && currencyRaw.trim())
-        ? currencyRaw.trim().toUpperCase()
-        : (creds.region === 'RO' ? 'RON' : creds.region === 'BG' ? 'BGN' : 'HUF');
-      let stock = 0;
-      if (o.general_stock != null) {
-        stock = Number(o.general_stock) || 0;
-      } else if (o.estimated_stock != null) {
-        stock = Number(o.estimated_stock) || 0;
-      } else if (Array.isArray(o.stock) && o.stock.length > 0) {
-        stock = o.stock.reduce((s: number, x: any) => s + Number(x.value ?? x ?? 0), 0);
-      } else if (typeof o.stock === 'number') {
-        stock = o.stock;
-      }
-
-      const rawName = String(o.name ?? o.title ?? '').trim();
-      const name = rawName || fallbackText;
-
-      const emagId = o.id != null ? String(o.id) : null;
-      const mainImage = mainImageUrl;
-      const imageUrl = mainImage;
-
-      const statusNum = Number(o.status ?? 1);
-      const validationStatus = isApproved ? 'active' : (vsDesc || 'rejected');
-
-      await prisma.storeProduct.create({
-        data: {
-          shopId: creds.shopId,
-          pnk,
-          vendorSku: vendorSku ?? undefined,
-          sku: sku ?? undefined,
-          ean: ean ?? undefined,
-          emagOfferId: emagId ?? undefined,
-          name,
-          salePrice,
-          currency,
-          stock,
-          status: statusNum,
-          categoryId: o.category_id ?? undefined,
-          imageUrl: imageUrl ?? undefined,
-          mainImage: mainImage ?? undefined,
-          validationStatus: validationStatus ?? undefined,
-          docErrors: docErrors ?? undefined,
-          rejectionReason: rejectionReason,
-        },
-      });
-      result.upserted++;
-    } catch (e) {
-      result.errors.push(`${o.part_number_key ?? o.part_number ?? o.pnk}: ${e instanceof Error ? e.message : String(e)}`);
+    const np = normalizeEmagProduct(o as Record<string, unknown>, creds.region, { logOutput: false });
+    if (!np.pnk) continue;
+    if (!np.mainImage && np.ean) {
+      const firstEan = String(np.ean).split(/[,\s]+/)[0]?.trim();
+      if (firstEan) needEanOffers.push({ o, np });
     }
   }
-
-  console.log(`[storeProductSync] shop=${creds.shopId} 已同步 ${result.upserted} 个产品到 StoreProduct`);
-
-  // ─── EAN 补全模式：main_image 为 null 的产品通过 documentation/find_by_eans 补图
-  const noImageProducts = await prisma.storeProduct.findMany({
-    where: { shopId: creds.shopId, mainImage: null, ean: { not: null } },
-    select: { id: true, pnk: true, ean: true },
-  });
-  let eanImagesRecovered = 0;
-  if (noImageProducts.length > 0) {
+  const uniqueEans = [...new Set(needEanOffers.map(({ np }) => String(np.ean).split(/[,\s]+/)[0]?.trim()).filter(Boolean))];
+  if (uniqueEans.length > 0) {
     try {
-      const eanToProducts = new Map<string, Array<{ id: number; pnk: string }>>();
-      for (const p of noImageProducts) {
-        const eans = String(p.ean ?? '').split(/[,\s]+/).map((e) => e.trim()).filter(Boolean);
-        const firstEan = eans[0];
-        if (firstEan) {
-          const list = eanToProducts.get(firstEan) ?? [];
-          list.push({ id: p.id, pnk: p.pnk });
-          eanToProducts.set(firstEan, list);
-        }
-      }
-      const uniqueEans = [...eanToProducts.keys()];
-      console.log(`\n[EAN 补全] 发现 ${noImageProducts.length} 个无图产品，共 ${uniqueEans.length} 个唯一 EAN，开始批量查询...`);
       for (let i = 0; i < uniqueEans.length; i += EAN_BATCH_SIZE) {
         const batch = uniqueEans.slice(i, i + EAN_BATCH_SIZE);
         await new Promise((r) => setTimeout(r, EAN_DELAY_MS));
         const res = await findDocumentationByEans(creds, batch);
         if (res.isError || !res.results) continue;
         const items = Array.isArray(res.results) ? res.results : (res.results as any)?.items ?? [];
-        const eanToImage = new Map<string, string>();
         for (const item of items) {
           const ean = item?.ean ?? item?.EAN ?? item?.ean_code;
           const img = item?.product_image ?? item?.productImage ?? item?.image ?? item?.main_image;
@@ -295,28 +131,149 @@ export async function syncStoreProducts(creds: EmagCredentials): Promise<SyncRes
             if (!eanToImage.has(eanStr)) eanToImage.set(eanStr, img.trim());
           }
         }
-        for (const ean of batch) {
-          const img = eanToImage.get(ean);
-          const prods = eanToProducts.get(ean) ?? [];
-          for (const prod of prods) {
-            const got = !!img;
-            if (got) eanImagesRecovered++;
-            console.log(`[EAN 补全] PNK: ${prod.pnk}, EAN: ${ean}, 是否抓取到图片: ${got ? '是' : '否'}`);
-            if (img) {
-              await prisma.storeProduct.update({
-                where: { id: prod.id },
-                data: { mainImage: img, imageUrl: img },
-              });
-            }
-          }
-        }
       }
-      result.eanImagesRecovered = eanImagesRecovered;
-      console.log(`\n[EAN 补全] 完成，共找回 ${eanImagesRecovered} 张图片`);
+      console.log(`[Engine 2 API] documentation/find_by_eans 预拉取 ${eanToImage.size} 张图片（${uniqueEans.length} 个 EAN）`);
     } catch (eanErr: any) {
-      console.error(`[EAN 补全] 接口调用失败，跳过: ${eanErr?.message ?? eanErr}`);
-      console.error(`  提示: 若 documentation/find_by_eans 路由不存在，请核对 eMAG API v4.5+ 文档中的正确 resource/action`);
+      console.warn(`[Engine 2 API] EAN 预拉取失败，跳过: ${eanErr?.message ?? eanErr}`);
     }
+  }
+
+  for (const o of allOffers) {
+    try {
+      const np = normalizeEmagProduct(o as Record<string, unknown>, creds.region, {
+        logOutput: pipelineLogCount < PIPELINE_LOG_LIMIT,
+      });
+      if (pipelineLogCount < PIPELINE_LOG_LIMIT) pipelineLogCount++;
+      if (!np.pnk) continue;
+
+      // 引擎一（JSON）+ 引擎二（EAN API）合并
+      const firstEan = np.ean ? String(np.ean).split(/[,\s]+/)[0]?.trim() : null;
+      const eanImage = firstEan ? eanToImage.get(firstEan) ?? null : null;
+      const mainImage: string | null = np.mainImage ?? eanImage;
+      if (eanImage && !np.mainImage) result.eanImagesRecovered!++;
+
+      const skuForLog = np.sku ?? np.vendorSku ?? np.pnk;
+
+      if (firstFiveRaw.length < 5) {
+        firstFiveRaw.push({
+          pn: np.vendorSku ?? np.sku ?? '(空)',
+          pnk: np.pnk,
+          imageUrl: mainImage ?? '(无)',
+        });
+      }
+
+      if (np.isRejected) {
+        result.rejectedCount++;
+        if (np.rejectionReason && !result.rejectedReasons.includes(np.rejectionReason)) {
+          result.rejectedReasons.push(np.rejectionReason);
+        }
+        if (!result.rejectedSample) result.rejectedSample = { pnk: np.pnk, docErrors: np.rejectionReason || '' };
+      }
+
+      const data = {
+        shopId: creds.shopId,
+        pnk: np.pnk,
+        vendorSku: np.vendorSku ?? undefined,
+        sku: np.sku ?? undefined,
+        ean: np.ean ?? undefined,
+        emagOfferId: np.emagOfferId ?? undefined,
+        name: np.name,
+        salePrice: np.salePrice,
+        currency: np.currency,
+        stock: np.stock,
+        status: np.status,
+        categoryId: np.categoryId,
+        imageUrl: mainImage ?? undefined,
+        mainImage: mainImage ?? undefined,
+        productUrl: np.productUrl ?? undefined,
+        validationStatus: np.validationStatus,
+        docErrors: np.docErrors ?? undefined,
+        rejectionReason: np.rejectionReason,
+      };
+
+      // 始终 upsert：已存在则更新 main_image、price 等，不跳过
+      await prisma.storeProduct.upsert({
+        where: { shopId_pnk: { shopId: creds.shopId, pnk: np.pnk } },
+        create: data,
+        update: data,
+      });
+
+      if (mainImage) {
+        console.log(`[Global Pipeline] SKU: ${skuForLog} -> Valid Image: ${mainImage}`);
+      }
+      result.upserted++;
+    } catch (e) {
+      const pnk = o?.part_number_key ?? o?.part_number ?? o?.pnk ?? '(unknown)';
+      const errMsg = e instanceof Error ? e.message : String(e);
+      result.errors.push(`${pnk}: ${errMsg}`);
+      console.error(`[storeProductSync] Skip broken item PNK=${pnk}:`, e);
+    }
+  }
+
+  console.log(`[storeProductSync] shop=${creds.shopId} 第一阶段完成，已同步 ${result.upserted} 个产品（EAN 补图: ${result.eanImagesRecovered ?? 0}）`);
+
+  // ─── 第二阶段：深层图片补全 (Deep Catalog Enrichment) ───
+  try {
+    const noImageProducts = await prisma.storeProduct.findMany({
+      where: {
+        shopId: creds.shopId,
+        OR: [
+          { mainImage: null },
+          { mainImage: '' },
+          { mainImage: { contains: 'logo', mode: 'insensitive' } },
+          { mainImage: { contains: 'emag-logo', mode: 'insensitive' } },
+          { mainImage: { contains: 'placeholder', mode: 'insensitive' } },
+          { mainImage: { contains: 'emag-placeholder', mode: 'insensitive' } },
+          { mainImage: { contains: 'temporary-images', mode: 'insensitive' } },
+          { mainImage: { endsWith: '.svg' } },
+        ],
+      },
+      select: { pnk: true, sku: true, vendorSku: true },
+    });
+
+    const pnkList = noImageProducts.map((p) => p.pnk).filter(Boolean);
+    if (pnkList.length > 0) {
+      let totalFetched = 0;
+      let totalUpdated = 0;
+      for (let i = 0; i < pnkList.length; i += CATALOG_BATCH_SIZE) {
+        const batch = pnkList.slice(i, i + CATALOG_BATCH_SIZE);
+        await new Promise((r) => setTimeout(r, CATALOG_DELAY_MS));
+        let res = await readProductsByPnk(creds, batch);
+        if (res.isError) {
+          const msgs = res.messages?.join('; ') ?? '未知';
+          if (/404|not found|resource/i.test(msgs)) {
+            console.warn(`[Deep Sync] Shop: ${creds.region}, product/read 接口不可用（可能需 API 升级），跳过: ${msgs}`);
+          } else {
+            console.warn(`[Deep Sync] Shop: ${creds.region}, product/read 批次失败: ${msgs}`);
+          }
+          continue;
+        }
+        if (!res.results) continue;
+        const items = Array.isArray(res.results) ? res.results : (res.results as any)?.items ?? (res.results as any)?.results ?? [];
+        totalFetched += items.length;
+        let batchUpdated = 0;
+        for (const raw of items) {
+          const np = normalizeEmagProduct(raw as Record<string, unknown>, creds.region, { logOutput: false });
+          if (!np.pnk || !np.mainImage) continue;
+          await prisma.storeProduct.updateMany({
+            where: { shopId: creds.shopId, pnk: np.pnk },
+            data: { mainImage: np.mainImage, imageUrl: np.mainImage },
+          });
+          batchUpdated++;
+          const skuDisplay = np.sku ?? np.vendorSku ?? np.pnk;
+          console.log(`[Global Pipeline] SKU: ${skuDisplay} -> Valid Image: ${np.mainImage}`);
+        }
+        totalUpdated += batchUpdated;
+        console.log(`[Deep Sync] Shop: ${creds.region}, Fetched details for ${batch.length} SKUs. Updated ${batchUpdated} images.`);
+      }
+      result.deepSyncImagesUpdated = totalUpdated;
+      console.log(`[Deep Sync] Shop: ${creds.region}, Fetched details for ${totalFetched} products. Updated ${totalUpdated} images.`);
+    } else {
+      console.log(`[Deep Sync] Shop: ${creds.region}, 无需要补图的产品，跳过 Catalog 调用`);
+    }
+  } catch (deepErr: any) {
+    console.warn(`[Deep Sync] Shop: ${creds.region}, Catalog 补图失败（不影响主同步）:`, deepErr?.message ?? deepErr);
+    result.errors.push(`Deep Sync: ${deepErr?.message ?? String(deepErr)}`);
   }
 
   const saved = await prisma.storeProduct.findMany({
@@ -375,5 +332,207 @@ export async function syncStoreProducts(creds: EmagCredentials): Promise<SyncRes
   }
   console.log('');
 
+  return result;
+}
+
+/**
+ * 补齐 product_url — 遍历 product_url 为 null 的产品，从 eMAG API 或构造链接并保存
+ */
+export async function backfillProductUrls(): Promise<{ updated: number; total: number; errors: string[] }> {
+  const products = await prisma.storeProduct.findMany({
+    where: { productUrl: null },
+    select: { id: true, pnk: true, name: true, shopId: true, shop: { select: { shopName: true } } },
+  });
+
+  const result = { updated: 0, total: products.length, errors: [] as string[] };
+  if (products.length === 0) {
+    console.log('[backfillProductUrls] 无 product_url 为 null 的产品');
+    return result;
+  }
+
+  const byShop = new Map<number, typeof products>();
+  for (const p of products) {
+    const list = byShop.get(p.shopId) ?? [];
+    list.push(p);
+    byShop.set(p.shopId, list);
+  }
+
+  for (const [shopId, list] of byShop) {
+    try {
+      const creds = await getEmagCredentials(shopId);
+      const domain = REGION_DOMAIN[creds.region];
+
+      const pnkSet = new Set(list.map((p) => p.pnk));
+      const apiUrlMap = new Map<string, string>();
+      let page = 1;
+      while (true) {
+        const res = await readProductOffers(creds, { currentPage: page, itemsPerPage: PAGE_SIZE });
+        if (res.isError) {
+          const msgs = res.messages?.join('; ') ?? 'API 返回错误';
+          throw new Error(`[EMAG API ERROR] Shop: ${creds.region}, backfillProductUrls 失败: ${msgs}`);
+        }
+        const raw = res.results as any;
+        const batch = Array.isArray(raw) ? raw : (raw?.items ?? raw?.results ?? []);
+        if (batch.length === 0) break;
+        for (const o of batch) {
+          const pnk = String(o?.part_number_key ?? o?.pnk ?? o?.part_number ?? '').trim();
+          if (!pnk || !pnkSet.has(pnk)) continue;
+          const u = o.url ?? o.product_url ?? o.link ?? o.product_link ?? o.page_url ?? o.product_page ?? o.links?.view;
+          let url: string;
+          if (typeof u === 'string' && u.trim()) {
+            url = u.trim();
+          } else {
+            const name = String(o.name ?? o.title ?? '').trim();
+            const slug = name ? slugifyProductName(name) : 'product';
+            url = `https://www.${domain}/${slug}/pd/${pnk}/`;
+          }
+          apiUrlMap.set(pnk, url);
+        }
+        if (batch.length < PAGE_SIZE) break;
+        page++;
+        if (page > 50) break;
+        await new Promise((r) => setTimeout(r, DELAY_MS));
+      }
+
+      for (const p of list) {
+        let url = apiUrlMap.get(p.pnk);
+        if (!url) {
+          const name = (p.name ?? '').trim();
+          const slug = name ? slugifyProductName(name) : 'product';
+          url = `https://www.${domain}/${slug}/pd/${p.pnk}/`;
+        }
+        await prisma.storeProduct.update({
+          where: { id: p.id },
+          data: { productUrl: url },
+        });
+        result.updated++;
+        console.log(`[backfillProductUrls] SKU: ${p.pnk} -> URL: ${url}`);
+      }
+    } catch (e) {
+      result.errors.push(`shopId=${shopId}: ${e instanceof Error ? e.message : String(e)}`);
+      console.error(`[backfillProductUrls] shopId=${shopId} 失败:`, e);
+    }
+  }
+
+  return result;
+}
+
+/**
+ * 批量补齐 main_image — 遍历 main_image 为空或占位图的产品，从 API 重新获取并更新
+ * 来源优先级: main_url > images 数组(过滤 logo/placeholder/svg/temporary-images) > description HTML > EAN API
+ */
+export async function backfillProductImages(): Promise<{ updated: number; total: number; errors: string[] }> {
+  const products = await prisma.storeProduct.findMany({
+    where: {
+      OR: [
+        { mainImage: null },
+        { mainImage: '' },
+        { mainImage: { contains: 'logo', mode: 'insensitive' } },
+        { mainImage: { contains: 'emag-logo', mode: 'insensitive' } },
+        { mainImage: { contains: 'placeholder', mode: 'insensitive' } },
+        { mainImage: { contains: 'emag-placeholder', mode: 'insensitive' } },
+        { mainImage: { contains: 'temporary-images', mode: 'insensitive' } },
+        { mainImage: { endsWith: '.svg' } },
+      ],
+    },
+    select: { id: true, pnk: true, sku: true, ean: true, shopId: true },
+  });
+
+  const result = { updated: 0, total: products.length, errors: [] as string[] };
+  if (products.length === 0) {
+    console.log('[backfillProductImages] 无需要补齐图片的产品');
+    return result;
+  }
+
+  const byShop = new Map<number, typeof products>();
+  for (const p of products) {
+    const list = byShop.get(p.shopId) ?? [];
+    list.push(p);
+    byShop.set(p.shopId, list);
+  }
+
+  for (const [shopId, list] of byShop) {
+    try {
+      const creds = await getEmagCredentials(shopId);
+      const pnkSet = new Set(list.map((p) => p.pnk));
+      const apiImageMap = new Map<string, string>();
+      let page = 1;
+      while (true) {
+        const res = await readProductOffers(creds, { currentPage: page, itemsPerPage: PAGE_SIZE });
+        if (res.isError) {
+          const msgs = res.messages?.join('; ') ?? 'API 返回错误';
+          throw new Error(`[EMAG API ERROR] Shop: ${creds.region}, backfillProductImages 失败: ${msgs}`);
+        }
+        const raw = res.results as any;
+        const batch = Array.isArray(raw) ? raw : (raw?.items ?? raw?.results ?? []);
+        if (batch.length === 0) break;
+        for (const o of batch) {
+          const np = normalizeEmagProduct(o as Record<string, unknown>, creds.region, { logOutput: false });
+          const pnk = np.pnk;
+          if (!pnk || !pnkSet.has(pnk) || apiImageMap.has(pnk)) continue;
+          if (np.mainImage) apiImageMap.set(pnk, np.mainImage);
+        }
+        if (batch.length < PAGE_SIZE) break;
+        page++;
+        if (page > 50) break;
+        await new Promise((r) => setTimeout(r, DELAY_MS));
+      }
+
+      const noImageFromApi = list.filter((p) => !apiImageMap.has(p.pnk));
+      const eanToProducts = new Map<string, Array<{ id: number; pnk: string }>>();
+      for (const p of noImageFromApi) {
+        const eans = String(p.ean ?? '').split(/[,\s]+/).map((e) => e.trim()).filter(Boolean);
+        const firstEan = eans[0];
+        if (firstEan) {
+          const arr = eanToProducts.get(firstEan) ?? [];
+          arr.push({ id: p.id, pnk: p.pnk });
+          eanToProducts.set(firstEan, arr);
+        }
+      }
+      const uniqueEans = [...eanToProducts.keys()];
+      if (uniqueEans.length > 0) {
+        try {
+          for (let i = 0; i < uniqueEans.length; i += EAN_BATCH_SIZE) {
+            const batch = uniqueEans.slice(i, i + EAN_BATCH_SIZE);
+            await new Promise((r) => setTimeout(r, EAN_DELAY_MS));
+            const res = await findDocumentationByEans(creds, batch);
+            if (!res.isError && res.results) {
+              const items = Array.isArray(res.results) ? res.results : (res.results as any)?.items ?? [];
+              for (const item of items) {
+                const ean = item?.ean ?? item?.EAN ?? item?.ean_code;
+                const img = item?.product_image ?? item?.productImage ?? item?.image ?? item?.main_image;
+                if (ean && typeof img === 'string' && img.trim() && !isInvalidImageUrl(img)) {
+                  const eanStr = String(ean).trim();
+                  for (const prod of eanToProducts.get(eanStr) ?? []) {
+                    apiImageMap.set(prod.pnk, img.trim());
+                  }
+                }
+              }
+            }
+          }
+        } catch (eanErr: any) {
+          console.warn('[backfillProductImages] EAN 补图接口跳过:', eanErr?.message ?? eanErr);
+        }
+      }
+
+      for (const p of list) {
+        const img = apiImageMap.get(p.pnk);
+        const skuDisplay = p.sku ?? p.pnk;
+        if (img) {
+          await prisma.storeProduct.update({
+            where: { id: p.id },
+            data: { mainImage: img, imageUrl: img },
+          });
+          result.updated++;
+          console.log(`[Global Pipeline] SKU: ${skuDisplay} -> Valid Image: ${img}`);
+        } else {
+          console.log(`[Global Pipeline] SKU: ${skuDisplay} -> (无有效图)`);
+        }
+      }
+    } catch (e) {
+      result.errors.push(`shopId=${shopId}: ${e instanceof Error ? e.message : String(e)}`);
+      console.error('[backfillProductImages] shopId=' + shopId, e);
+    }
+  }
   return result;
 }

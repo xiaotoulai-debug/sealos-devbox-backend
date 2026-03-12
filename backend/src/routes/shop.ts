@@ -15,17 +15,40 @@ function resolveBusinessModel(platform: string, explicit?: string): string {
   return FULLY_MANAGED_PLATFORMS.includes(platform.toLowerCase()) ? 'FULLY_MANAGED' : 'TRADITIONAL';
 }
 
+/** 判断是否为脱敏占位值，不应用其覆盖真实凭证 */
+function isMaskedCredential(val: string | null | undefined): boolean {
+  if (val == null || typeof val !== 'string') return true;
+  const s = val.trim();
+  if (s === '') return true;
+  if (s.includes('****')) return true;
+  if (/^\*+$/.test(s)) return true;  // 全星号如 ********
+  if (s.length <= 6) return true;    // 过短视为占位
+  return false;
+}
+
 // GET /api/shops
 router.get('/', async (_req: Request, res: Response) => {
   try {
     const shops = await prisma.shopAuthorization.findMany({ orderBy: { createdAt: 'desc' } });
-    const safe = shops.map((s) => ({
-      ...s,
-      apiKey: maskSecret(decrypt(s.apiKey)),
-      apiSecret: '********',
-      accessToken: s.accessToken ? maskSecret(decrypt(s.accessToken)) : null,
-      refreshToken: s.refreshToken ? '********' : null,
-    }));
+    if (shops.length > 0) {
+      const sample = { id: shops[0].id, shopName: shops[0].shopName, platform: shops[0].platform, region: shops[0].region };
+      console.log('Shop Data:', JSON.stringify(sample, null, 2));
+    }
+    const safe = shops.map((s) => {
+      const region = s.platform.toLowerCase() === 'emag' && s.region == null ? 'RO' : s.region;
+      return {
+        ...s,
+        region,
+        apiKey: maskSecret(decrypt(s.apiKey)),
+        apiSecret: '********',
+        accessToken: s.accessToken ? maskSecret(decrypt(s.accessToken)) : null,
+        refreshToken: s.refreshToken ? '********' : null,
+      };
+    });
+    if (safe.length > 0) {
+      const out = { id: safe[0].id, shopName: safe[0].shopName, platform: safe[0].platform, region: safe[0].region };
+      console.log('Shop API Response (first):', JSON.stringify(out, null, 2));
+    }
     res.json({ code: 200, data: safe, message: 'success' });
   } catch (err) {
     console.error('[GET /api/shops]', err);
@@ -33,10 +56,10 @@ router.get('/', async (_req: Request, res: Response) => {
   }
 });
 
-// POST /api/shops
+// POST /api/shops — 新增店铺
 router.post('/', async (req: Request, res: Response) => {
   try {
-    const { platform, shopName, apiKey, apiSecret, accessToken, refreshToken, supplierId, expiresAt, isSandbox, businessModel } = req.body;
+    const { platform, shopName, region, apiKey, apiSecret, accessToken, refreshToken, supplierId, expiresAt, isSandbox, businessModel } = req.body;
     if (!platform || !shopName) {
       res.status(400).json({ code: 400, data: null, message: '平台和店铺名为必填项' });
       return;
@@ -44,11 +67,13 @@ router.post('/', async (req: Request, res: Response) => {
     const bm = resolveBusinessModel(platform, businessModel);
     const needKey = apiKey || '';
     const needSecret = apiSecret || '-';
+    const validRegion = region && ['RO', 'BG', 'HU'].includes(region) ? region : undefined;
 
     const shop = await prisma.shopAuthorization.create({
       data: {
         platform,
         shopName,
+        region: validRegion ?? (platform.toLowerCase() === 'emag' ? 'RO' : undefined),
         businessModel: bm,
         apiKey: encrypt(needKey),
         apiSecret: encrypt(needSecret),
@@ -68,30 +93,83 @@ router.post('/', async (req: Request, res: Response) => {
   }
 });
 
-// PATCH /api/shops/:id
-router.patch('/:id', async (req: Request, res: Response) => {
+// PUT /api/shops/:id — 更新店铺（紧挨 POST 注册）
+router.put('/:id', updateShop);
+// PATCH /api/shops/:id — 同上
+router.patch('/:id', updateShop);
+
+// 更新店铺 Controller
+async function updateShop(req: Request, res: Response) {
+  console.log('HIT UPDATE API! ID:', req.params.id, 'Body:', req.body);
   try {
     const id = Number(req.params.id);
-    const { shopName, apiKey, apiSecret, accessToken, refreshToken, supplierId, expiresAt, isSandbox, status, businessModel } = req.body;
+    if (isNaN(id) || id < 1) {
+      res.status(400).json({ code: 400, data: null, message: '无效的店铺 ID' });
+      return;
+    }
+    if (req.body?.id !== undefined) {
+      res.status(400).json({ code: 400, data: null, message: '不允许修改店铺 ID' });
+      return;
+    }
+
+    const shop = await prisma.shopAuthorization.findUnique({ where: { id } });
+    if (!shop) {
+      res.status(404).json({ code: 404, data: null, message: '店铺不存在' });
+      return;
+    }
+
+    const body = req.body;
+    const apiKey = body.apiKey ?? body.username;
+    const apiSecret = body.apiSecret ?? body.password;
+    const { shopName, region, accessToken, refreshToken, supplierId, expiresAt, isSandbox, status, businessModel } = body;
     const data: Record<string, unknown> = {};
+
     if (shopName !== undefined) data.shopName = shopName;
-    if (apiKey !== undefined) data.apiKey = encrypt(apiKey);
-    if (apiSecret !== undefined) data.apiSecret = encrypt(apiSecret);
-    if (accessToken !== undefined) data.accessToken = accessToken ? encrypt(accessToken) : null;
-    if (refreshToken !== undefined) data.refreshToken = refreshToken ? encrypt(refreshToken) : null;
+    if (region !== undefined && ['RO', 'BG', 'HU'].includes(region)) data.region = region;
     if (supplierId !== undefined) data.supplierId = supplierId || null;
     if (expiresAt !== undefined) data.expiresAt = expiresAt ? new Date(expiresAt) : null;
     if (isSandbox !== undefined) data.isSandbox = !!isSandbox;
     if (status !== undefined) data.status = status;
     if (businessModel !== undefined) data.businessModel = businessModel;
 
+    // 凭证：仅当传入且非脱敏时才更新，避免用星号覆盖真实账号密码
+    const keyMasked = isMaskedCredential(apiKey);
+    const secretMasked = isMaskedCredential(apiSecret);
+    const updatingCreds = (!keyMasked && apiKey !== undefined) || (!secretMasked && apiSecret !== undefined);
+
+    if (!keyMasked && apiKey !== undefined) data.apiKey = encrypt(String(apiKey).trim());
+    if (!secretMasked && apiSecret !== undefined) data.apiSecret = encrypt(String(apiSecret).trim());
+    if (!isMaskedCredential(accessToken) && accessToken !== undefined) data.accessToken = accessToken ? encrypt(accessToken) : null;
+    if (!isMaskedCredential(refreshToken) && refreshToken !== undefined) data.refreshToken = refreshToken ? encrypt(refreshToken) : null;
+
+    // eMAG：若更新了凭证，先验证再保存
+    if (shop.platform.toLowerCase() === 'emag' && updatingCreds) {
+      const username = !keyMasked && apiKey ? String(apiKey).trim() : decrypt(shop.apiKey);
+      const password = !secretMasked && apiSecret ? String(apiSecret).trim() : decrypt(shop.apiSecret);
+      try {
+        const existingCreds = await getEmagCredentials(id);
+        const credsToTest = { ...existingCreds, username, password };
+        const result = await verifyConnection(credsToTest);
+        if (!result.verified) {
+          res.status(400).json({ code: 400, data: null, message: '凭证验证失败，请重新输入正确的账号密码' });
+          return;
+        }
+      } catch (e: any) {
+        const msg = e?.message ?? String(e);
+        res.status(400).json({ code: 400, data: null, message: msg.includes('401') || msg.includes('Unauthorized') ? '凭证验证失败，请重新输入正确的账号密码' : msg.slice(0, 200) });
+        return;
+      }
+    }
+
     await prisma.shopAuthorization.update({ where: { id }, data: data as any });
     res.json({ code: 200, data: null, message: '更新成功' });
-  } catch (err) {
-    console.error('[PATCH /api/shops/:id]', err);
-    res.status(500).json({ code: 500, data: null, message: '更新失败' });
+  } catch (err: any) {
+    console.error('[PUT/PATCH /api/shops/:id]', err);
+    const msg = err?.message ?? String(err);
+    const isCredential = /decrypt|encrypt|凭证|401|Unauthorized/i.test(msg);
+    res.status(500).json({ code: 500, data: null, message: isCredential ? '凭证处理失败，请检查输入' : (msg.slice(0, 150) || '更新失败') });
   }
-});
+}
 
 // DELETE /api/shops/:id
 router.delete('/:id', async (req: Request, res: Response) => {

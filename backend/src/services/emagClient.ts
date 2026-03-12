@@ -1,21 +1,47 @@
 import axios from 'axios';
 import { prisma } from '../lib/prisma';
 import { decrypt } from '../utils/shopCrypto';
+import { updateRateLimitFromHeaders, shouldDelayNextSync, setDelayMultiplier } from './emagRateLimit';
 
 // ═══════════════════════════════════════════════════════════════════
 // eMAG Marketplace API v4.5.0 — 核心客户端
 //
+//  架构: 无全局单例，每次调用通过 getEmagCredentials(shopId) 实时读取
+//        shop.region，动态分配 BaseURL（.ro / .bg / .hu）
 //  认证: Basic Authorization  base64(username:password)
 //  规范: 所有请求均为 POST, 业务参数包裹在 mandatory "data" key 中
 //  响应: 统一检查 isError === false
 //  限流: Orders 12 req/sec, 其他 3 req/sec
 //  安全: 密码从 AES-256 加密存储读取, Authorization 报头绝不明文输出
+//  错误: 401/403/404 绝不静默，抛出并 [EMAG API ERROR] 大写打印
 // ═══════════════════════════════════════════════════════════════════
 
-// ─── 多站点 Endpoint 映射 ────────────────────────────────────────
+// ─── 全局 eMAG API 适配器配置（单一数据源，无硬编码）────────────────
 
 export type EmagRegion = 'RO' | 'BG' | 'HU';
 
+/** BaseURL 后缀映射，Adapter 通过 shop.region 查表获取，禁止 if/else 特判 */
+export const REGION_BASE_SUFFIX: Record<EmagRegion, string> = {
+  RO: '.ro',
+  BG: '.bg',
+  HU: '.hu',
+};
+
+/** 站点货币映射（保加利亚 2026 年加入欧元区，BG 已切换为 EUR） */
+export const REGION_CURRENCY: Record<EmagRegion, string> = {
+  RO: 'RON',
+  BG: 'EUR',
+  HU: 'HUF',
+};
+
+/** 站点前台域名（商品页 URL） */
+export const REGION_DOMAIN: Record<EmagRegion, string> = {
+  RO: 'emag.ro',
+  BG: 'emag.bg',
+  HU: 'emag.hu',
+};
+
+/** API BaseURL 完整映射，由 REGION_BASE_SUFFIX 推导 */
 const REGION_ENDPOINTS: Record<EmagRegion, string> = {
   RO: 'https://marketplace-api.emag.ro/api-3',
   BG: 'https://marketplace-api.emag.bg/api-3',
@@ -92,6 +118,30 @@ class TokenBucketThrottle {
 const orderThrottle   = new TokenBucketThrottle(12);  // Orders: 12 req/sec
 const generalThrottle = new TokenBucketThrottle(3);   // 其他: 3 req/sec
 
+/** 并发限制：同一时间最多 5 个请求 */
+const MAX_CONCURRENT = 5;
+let concurrentCount = 0;
+const concurrentQueue: Array<() => void> = [];
+
+async function acquireConcurrent(): Promise<void> {
+  if (concurrentCount < MAX_CONCURRENT) {
+    concurrentCount++;
+    return;
+  }
+  await new Promise<void>((resolve) => {
+    concurrentQueue.push(resolve);
+  });
+  concurrentCount++;
+}
+
+function releaseConcurrent(): void {
+  concurrentCount--;
+  if (concurrentQueue.length > 0) {
+    const next = concurrentQueue.shift();
+    if (next) next();
+  }
+}
+
 function isOrderRoute(resource: string): boolean {
   return resource.startsWith('order');
 }
@@ -128,8 +178,17 @@ export async function getFirstEmagShopId(): Promise<number | null> {
 }
 
 /**
+ * 创建 eMAG 客户端（通用 Adapter，无 region 特判）
+ * 等价于 getEmagCredentials，BaseURL 完全依赖 shop.region 查表
+ */
+export async function createEmagClient(shopId: number): Promise<EmagCredentials> {
+  return getEmagCredentials(shopId);
+}
+
+/**
  * 从数据库加密存储中读取 eMAG 店铺凭证
  * 密码经 AES-256-CBC 解密, 绝不记录明文
+ * BaseURL 根据店铺 region 字段动态选择，未设置时默认 RO
  */
 export async function getEmagCredentials(shopId: number): Promise<EmagCredentials> {
   const shop = await prisma.shopAuthorization.findUnique({ where: { id: shopId } });
@@ -138,7 +197,10 @@ export async function getEmagCredentials(shopId: number): Promise<EmagCredential
 
   const username = decrypt(shop.apiKey);
   const password = decrypt(shop.apiSecret);
-  const region   = resolveRegion(shop.shopName);
+  // 无 region 时默认 RO，保证老店不掉线（https://marketplace-api.emag.ro）
+  const region: EmagRegion = shop.region && ['RO', 'BG', 'HU'].includes(shop.region)
+    ? (shop.region as EmagRegion)
+    : 'RO';
   const baseUrl  = shop.isSandbox ? SANDBOX_ENDPOINTS[region] : REGION_ENDPOINTS[region];
 
   return { shopId, username, password, baseUrl, region, isSandbox: shop.isSandbox };
@@ -173,6 +235,9 @@ function safeErrorDetail(err: any): string {
 //   - 认证: Authorization: Basic base64(username:password)
 //   - 响应: { isError: bool, messages: [], results: ..., errors: [] }
 
+const MAX_RETRIES_429 = 5;
+const BACKOFF_BASE_MS = 1000;
+
 export async function emagApiCall<T = any>(
   creds: EmagCredentials,
   resource: string,
@@ -182,57 +247,102 @@ export async function emagApiCall<T = any>(
 ): Promise<EmagApiResponse<T>> {
   const throttle = isOrderRoute(resource) ? orderThrottle : generalThrottle;
   await throttle.acquire();
+  await acquireConcurrent();
 
   const url = `${creds.baseUrl}/${resource}/${action}`;
   const basicAuth = Buffer.from(`${creds.username}:${creds.password}`).toString('base64');
   const tag = safeLogTag(creds);
 
+  // 每次请求前打印真实 URL，便于排查 BG/HU 站点 BaseURL 是否正确
+  console.log(`[eMAG] POST ${url}  shop=${creds.region} resource=${resource}/${action}`);
+
+  const doRequest = async (): Promise<{ data: any; headers: Record<string, any>; status: number }> => {
+    const resp = await axios.post(url, { data }, {
+      headers: { 'Authorization': `Basic ${basicAuth}`, 'Content-Type': 'application/json' },
+      timeout: options.timeout ?? 30000,
+      validateStatus: () => true,
+    });
+    return { data: resp.data, headers: resp.headers ?? {}, status: resp.status };
+  };
+
   const startMs = Date.now();
+  let lastErr: Error | null = null;
+
   try {
-    const resp = await axios.post(
-      url,
-      { data },
-      {
-        headers: {
-          'Authorization': `Basic ${basicAuth}`,
-          'Content-Type': 'application/json',
-        },
-        timeout: options.timeout ?? 30000,
-      },
-    );
+    for (let attempt = 0; attempt <= MAX_RETRIES_429; attempt++) {
+      const { data: body, headers, status } = await doRequest();
+      const elapsed = Date.now() - startMs;
 
-    const body: EmagApiResponse<T> = resp.data;
-    const elapsed = Date.now() - startMs;
-
-    // order/read 时打印 eMAG 原始 totalResults 便于核对
-    if (resource === 'order' && action === 'read' && !body.isError) {
-      const raw = resp.data as any;
-      const res = body.results as any;
-      const totalResults = raw?.totalResults ?? raw?.noOfItems ?? res?.totalResults ?? res?.noOfItems ?? (Array.isArray(res) ? res.length : null);
-      const pageCount = Array.isArray(res) ? res.length : (res?.length ?? res?.items?.length ?? 0);
-      console.log(`[eMAG order/read] totalResults=${totalResults ?? 'N/A'} (本页${pageCount}条)`);
-    }
-
-    if (body.isError) {
-      const msgs = body.messages ?? [];
-      console.error(`${tag} ${resource}/${action} FAILED (${elapsed}ms) — isError: true`);
-      if (msgs.length > 0) {
-        msgs.forEach((m: string, i: number) => console.error(`  [eMAG messages][${i}]`, m));
+      if (status === 429) {
+        const waitMs = BACKOFF_BASE_MS * Math.pow(2, attempt);
+        if (attempt < MAX_RETRIES_429) {
+          console.warn(`${tag} ${resource}/${action} 429 — 指数退避 ${waitMs}ms 后重试 (${attempt + 1}/${MAX_RETRIES_429})`);
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+        console.error(`${tag} ${resource}/${action} 429 已达最大重试次数`);
+        setDelayMultiplier(2);
+        throw new Error(`eMAG API 429 Rate Limit，已退避重试 ${MAX_RETRIES_429} 次`);
       }
-      if (body.errors?.length) {
-        console.error('  [eMAG errors]', JSON.stringify(body.errors).slice(0, 800));
-      }
-    } else {
-      console.log(`${tag} ${resource}/${action} OK (${elapsed}ms)`);
-    }
 
-    return body;
+      // 401/403 透传为 400，明确提示凭证问题（便于前端区分，不模糊报 500）
+      if (status === 401) {
+        const msg = 'API 账号或密码无效，请检查凭证';
+        console.error(`\n========== [EMAG API ERROR] Shop: ${creds.region}, Status: 401 ==========`);
+        console.error(`${tag} ${resource}/${action} 401 未授权`);
+        const err = new Error(msg) as Error & { status?: number };
+        err.status = 400;
+        throw err;
+      }
+      if (status === 403) {
+        const msg = 'API 账号或密码无效，请检查凭证';
+        console.error(`\n========== [EMAG API ERROR] Shop: ${creds.region}, Status: 403 ==========`);
+        console.error(`${tag} ${resource}/${action} 403 禁止访问`);
+        const err = new Error(msg) as Error & { status?: number };
+        err.status = 400;
+        throw err;
+      }
+      if (status === 404) {
+        const apiMsg = (body as any)?.messages?.join('; ') ?? 'Not Found';
+        const msg = `[EMAG API ERROR] Shop: ${creds.region}, Status: 404, Message: ${apiMsg}`;
+        console.error(`\n========== ${msg} ==========`);
+        console.error(`${tag} ${resource}/${action} 404 资源不存在`);
+        throw new Error(msg);
+      }
+
+      updateRateLimitFromHeaders(headers);
+      if (shouldDelayNextSync()) setDelayMultiplier(2);
+
+      const apiBody: EmagApiResponse<T> = body;
+      if (resource === 'order' && action === 'read' && !apiBody.isError) {
+        const raw = body as any;
+        const res = apiBody.results as any;
+        const totalResults = raw?.totalResults ?? raw?.noOfItems ?? res?.totalResults ?? res?.noOfItems ?? (Array.isArray(res) ? res.length : null);
+        const pageCount = Array.isArray(res) ? res.length : (res?.length ?? res?.items?.length ?? 0);
+        console.log(`[eMAG order/read] totalResults=${totalResults ?? 'N/A'} (本页${pageCount}条)`);
+      }
+
+      if (apiBody.isError) {
+        const msgs = apiBody.messages ?? [];
+        console.error(`${tag} ${resource}/${action} FAILED (${elapsed}ms) — isError: true`);
+        if (msgs.length > 0) msgs.forEach((m: string, i: number) => console.error(`  [eMAG messages][${i}]`, m));
+        if (apiBody.errors?.length) console.error('  [eMAG errors]', JSON.stringify(apiBody.errors).slice(0, 800));
+      } else {
+        console.log(`${tag} ${resource}/${action} OK (${elapsed}ms)`);
+      }
+
+      return apiBody;
+    }
   } catch (err: any) {
-    const elapsed = Date.now() - startMs;
-    const detail = safeErrorDetail(err);
-    console.error(`${tag} ${resource}/${action} ERROR (${elapsed}ms) →`, detail);
-    throw new Error(`eMAG API 请求失败 [${resource}/${action}]: ${detail}`);
+    lastErr = err;
+    const status = err?.response?.status;
+    if (status === 401) console.error(`${tag} ${resource}/${action} 401 未授权 — 请检查凭证或 IP 白名单`);
+    throw err;
+  } finally {
+    releaseConcurrent();
   }
+
+  throw lastErr ?? new Error('eMAG API 请求失败');
 }
 
 // ─── 便捷方法 ────────────────────────────────────────────────────

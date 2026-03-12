@@ -1,4 +1,4 @@
-import { EmagCredentials, emagApiCall, EmagApiResponse } from './emagClient';
+import { EmagCredentials, emagApiCall, EmagApiResponse, REGION_CURRENCY, EmagRegion } from './emagClient';
 
 // ─── eMAG 订单服务 (API v4.5.0) ──────────────────────────────────
 //
@@ -69,8 +69,9 @@ export interface MappedProduct {
 
 /**
  * 将 eMAG 原始订单转为前端展示格式（深度映射 customer 与 products）
+ * @param region 站点区域，用于确定 currency（BG 自 2026 年起为 EUR）
  */
-export function mapOrderForDisplay(o: EmagOrder): {
+export function mapOrderForDisplay(o: EmagOrder, region?: EmagRegion): {
   id: number;
   status: number;
   type?: number;
@@ -84,7 +85,7 @@ export function mapOrderForDisplay(o: EmagOrder): {
   total: number;
   currency: string;
 } {
-  const c = o.customer ?? {};
+  const c = o?.customer ?? {};
   const customer: MappedCustomer = {
     name: c.name ?? null,
     phone_1: c.phone_1 ?? null,
@@ -92,39 +93,45 @@ export function mapOrderForDisplay(o: EmagOrder): {
     billing_city: c.billing_city ?? null,
     billing_suburb: c.billing_suburb ?? null,
   };
-  const products: MappedProduct[] = (o.products ?? []).map((p: any) => {
-    const rawVat = Number(p.vat_rate ?? p.vat ?? 0.21);
-    const vatRate = rawVat <= 1 ? rawVat : rawVat / 100;
-    return {
-      product_name: p.product_name ?? p.name ?? null,
-      pnk: p.part_number ?? null,
-      sku: p.ext_part_number ?? null,
-      sale_price: Number(p.sale_price ?? 0),
-      vat_rate: vatRate,
-      quantity: Number(p.quantity ?? 0),
-    };
-  });
-  const statusNum = Number(o.status ?? 0);
-  const shipping = Number(o.shipping_cost ?? o.shipping_cost_vat ?? o.shipping ?? 0);
+  const products: MappedProduct[] = (o?.products ?? [])
+    .filter((p: any) => p != null && typeof p === 'object')
+    .map((p: any) => {
+      const rawVat = Number(p?.vat_rate ?? p?.vat ?? 0.21);
+      const vatRate = rawVat <= 1 ? rawVat : rawVat / 100;
+      return {
+        product_name: p?.product_name ?? p?.name ?? null,
+        pnk: p?.part_number ?? null,
+        sku: p?.ext_part_number ?? null,
+        sale_price: Number(p?.sale_price ?? 0),
+        vat_rate: vatRate,
+        quantity: Number(p?.quantity ?? 0),
+      };
+    });
+  const statusNum = Number(o?.status ?? 0);
+  const shipping = Number(o?.shipping_cost ?? o?.shipping_cost_vat ?? o?.shipping ?? 0);
   const productsGross = products.reduce(
     (s, p) => s + p.sale_price * (1 + p.vat_rate) * p.quantity,
     0
   );
   const total = Math.round((productsGross + shipping) * 100) / 100;
-  const orderTime = o.date ?? o.created_at ?? null;
+  const orderTime = o?.date ?? o?.created_at ?? null;
+  const rawCurrency = (o as any)?.currency;
+  const currency = (typeof rawCurrency === 'string' && rawCurrency.trim())
+    ? (rawCurrency.trim().toUpperCase() === 'BGN' ? 'EUR' : rawCurrency.trim().toUpperCase())
+    : (region && REGION_CURRENCY[region]) ?? 'RON';
   return {
-    id: o.id,
+    id: o?.id ?? 0,
     status: statusNum,
-    type: o.type,
+    type: o?.type,
     status_text: getStatusText(statusNum),
     date: orderTime,
     orderTime,
-    payment_mode: o.payment_mode ?? null,
-    payment_mode_id: o.payment_mode_id ?? null,
+    payment_mode: o?.payment_mode ?? null,
+    payment_mode_id: o?.payment_mode_id ?? null,
     customer,
     products,
     total,
-    currency: 'RON',
+    currency,
   };
 }
 
@@ -149,12 +156,16 @@ export { statusMap };
 
 export interface ReadOrdersOptions {
   id?: number;            // 单订单查询
-  status?: number;
+  status?: number;        // 单状态筛选；不传则 API 可能只返回 New，需显式传 1,2,3,4,5 分批拉取
   createdAfter?: string;   // YYYY-mm-dd HH:ii:ss 或 YYYY-MM-DD
   createdBefore?: string;
+  modifiedAfter?: string;  // 增量优先：仅拉取该时间后有变动的订单 YYYY-mm-dd HH:ii:ss
   currentPage?: number;
   itemsPerPage?: number;
 }
+
+/** 全状态常量：1=New, 2=In progress, 3=Prepared, 4=Finalized, 5=Cancelled */
+export const ALL_ORDER_STATUSES = [1, 2, 3, 4, 5] as const;
 
 /** 转为 eMAG 日期格式 YYYY-mm-dd HH:ii:ss */
 function toEmagDateTime(dateStr: string, time: string): string {
@@ -186,10 +197,51 @@ export async function readOrders(
       filters.created.to = toEmagDateTime(raw, opts.createdBefore.includes(' ') ? opts.createdBefore.slice(11, 19) : '23:59:59');
     }
   }
+  if (opts.modifiedAfter) {
+    filters.modified = { from: opts.modifiedAfter.includes(' ') ? opts.modifiedAfter : `${opts.modifiedAfter} 00:00:00` };
+  }
   if (opts.currentPage)  filters.currentPage = opts.currentPage;
   if (opts.itemsPerPage) filters.itemsPerPage = opts.itemsPerPage;
 
   return emagApiCall<EmagOrder[]>(creds, 'order', 'read', filters);
+}
+
+/**
+ * 按全状态分页拉取订单（status 1,2,3,4,5 各查一遍，合并去重）
+ * 用于平台订单同步，确保不漏单
+ */
+export async function readOrdersForAllStatuses(
+  creds: EmagCredentials,
+  opts: Omit<ReadOrdersOptions, 'status'> & { statuses?: number[] } = {},
+): Promise<EmagApiResponse<EmagOrder[]>> {
+  const statuses = opts.statuses ?? [...ALL_ORDER_STATUSES];
+  const allOrders = new Map<number, EmagOrder>();
+  const errors: string[] = [];
+
+  for (const status of statuses) {
+    let page = 1;
+    while (true) {
+      const res = await readOrders(creds, { ...opts, status, currentPage: page, itemsPerPage: opts.itemsPerPage ?? 100 });
+      if (res.isError) {
+        errors.push(`status=${status} page=${page}: ${res.messages?.join(';') ?? 'API 错误'}`);
+        break;
+      }
+      const batch = Array.isArray(res.results) ? res.results : [];
+      for (const o of batch) {
+        if (o?.id != null) allOrders.set(o.id, o);
+      }
+      if (batch.length < (opts.itemsPerPage ?? 100)) break;
+      page++;
+      if (page > 100) break;
+      await new Promise((r) => setTimeout(r, 100)); // 限速
+    }
+  }
+
+  return {
+    isError: errors.length > 0 && allOrders.size === 0,
+    messages: errors.length > 0 ? errors : undefined,
+    results: [...allOrders.values()],
+  };
 }
 
 /**
