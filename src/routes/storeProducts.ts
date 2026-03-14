@@ -1,8 +1,8 @@
 /**
  * 店铺在售产品 API — StoreProduct + Inventory SKU 碰头
  *
- * 数据源: StoreProduct（eMAG 同步），通过 sku 关联 Inventory 获取本地资料
- * 图片优先级: Inventory.local_image > 平台 main_image > 占位图
+ * 数据源: StoreProduct（eMAG 同步），通过 mapped_inventory_sku 联表 Inventory
+ * 图片优先级: 平台 main_image/imageUrl > 本地 Inventory.local_image（本地关联 SKU 兜底）
  * 毛利预估: sale_price - (purchase_cost + 预估物流费)
  */
 
@@ -12,7 +12,7 @@ import { authenticate } from '../middleware/auth';
 import { getEmagCredentials, resolveRegion, REGION_CURRENCY, REGION_DOMAIN } from '../services/emagClient';
 import { getSalesStatsByShop, getSalesForProduct, logZeroSalesDiagnostic } from '../services/salesStats';
 import { tryAcquireSyncLock, releaseSyncLock } from '../lib/syncStatus';
-import { backfillProductUrls, backfillProductImages, syncStoreProducts } from '../services/storeProductSync';
+import { backfillProductUrls, backfillProductImages, syncStoreProducts, backfillComprehensiveSales } from '../services/storeProductSync';
 
 const router = Router();
 router.use(authenticate);
@@ -157,6 +157,27 @@ router.post('/sync-images/', syncImagesHandler);
 router.post('/backfill-images', syncImagesHandler); // 全局图片回补（与 sync-images 相同）
 
 /**
+ * POST /api/store-products/backfill-comprehensive-sales
+ * 全量回填 comprehensive_sales（从 platform_orders 聚合销量后计算并写入）
+ * Query: ?shopId=1（可选，不传则全店铺回填）
+ */
+router.post('/backfill-comprehensive-sales', async (req: Request, res: Response) => {
+  const rawShopId = req.body?.shopId ?? req.query?.shopId;
+  const shopId = rawShopId != null ? Number(rawShopId) : undefined;
+  try {
+    const result = await backfillComprehensiveSales(shopId);
+    res.json({
+      code: 200,
+      data: { updated: result.updated, errors: result.errors },
+      message: `综合日销回填完成，共更新 ${result.updated} 条`,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/store-products/backfill-comprehensive-sales]', err);
+    res.status(500).json({ code: 500, data: null, message: err?.message ?? '服务器内部错误' });
+  }
+});
+
+/**
  * POST /api/store-products/map
  * 手动绑定平台产品与库存 SKU
  * Body: { storeProductId: number, inventorySku: string }
@@ -233,6 +254,31 @@ router.get('/', async (req: Request, res: Response) => {
     const limit = Math.min(1000, Math.max(1, parseInt(String(req.query.limit ?? req.query.pageSize ?? 500), 10) || 500));
     const skip = (page - 1) * limit;
 
+    // 动态排序：前端 Ant Design 传 sortBy(camelCase 或 snake_case) + sortOrder(ascend/descend/asc/desc)
+    // snake_case → camelCase 映射，兼容前端两种写法
+    const FIELD_MAP: Record<string, string> = {
+      comprehensive_sales: 'comprehensiveSales',
+      comprehensiveSales: 'comprehensiveSales',
+      sale_price: 'salePrice',
+      salePrice: 'salePrice',
+      stock: 'stock',
+      synced_at: 'syncedAt',
+      syncedAt: 'syncedAt',
+      name: 'name',
+    };
+    const rawSortBy = String(req.query.sortBy ?? req.query.sort ?? '').trim();
+    const rawSortOrder = String(req.query.sortOrder ?? req.query.order ?? '').trim().toLowerCase();
+    const sortByField = FIELD_MAP[rawSortBy] ?? '';
+    // Ant Design 取消排序时传 'null' 字符串，需过滤
+    const sortOrderPrisma: 'asc' | 'desc' =
+      rawSortOrder === 'ascend' || rawSortOrder === 'asc' ? 'asc' : 'desc';
+    const hasValidSort = sortByField !== '' && rawSortOrder !== '' && rawSortOrder !== 'null' && rawSortOrder !== 'undefined';
+    const orderBy: Record<string, 'asc' | 'desc'> = hasValidSort
+      ? { [sortByField]: sortOrderPrisma }
+      : { syncedAt: 'desc' };
+
+    console.log('=== BACKEND Prisma OrderBy ===', orderBy, { rawSortBy, rawSortOrder, hasValidSort });
+
     const where: { shopId: number; OR?: Array<{ sku?: { contains: string; mode: 'insensitive' }; ean?: { contains: string; mode: 'insensitive' }; pnk?: { contains: string; mode: 'insensitive' } }> } = { shopId };
     if (search) {
       const q = { contains: search, mode: 'insensitive' as const };
@@ -243,18 +289,22 @@ router.get('/', async (req: Request, res: Response) => {
       ];
     }
 
-    const [total, list] = await Promise.all([
-      prisma.storeProduct.count({ where }),
+    // 分页必须分离查数据与查总数；联表 include 关联的本地库存（mapped_inventory_sku -> Inventory）
+    const [list, total] = await Promise.all([
       prisma.storeProduct.findMany({
         where,
-        orderBy: { syncedAt: 'desc' },
+        orderBy,
         skip,
         take: limit,
-        include: { shop: { select: { shopName: true, region: true } } },
+        include: {
+          shop: { select: { shopName: true, region: true } },
+          mappedInventory: { select: { localImage: true, purchaseCost: true, weight: true } },
+        },
       }),
+      prisma.storeProduct.count({ where }), // 仅 where，无 skip/take，返回符合条件的绝对总条数
     ]);
 
-    console.log(`[StoreProducts] DB actual count: ${total}`);
+    console.log(`[StoreProducts] DB actual count: ${total}, page size: ${list.length}`);
 
     if (search) {
       console.log(`[Search Debug] Keyword: ${search}, Found Records: ${total}`);
@@ -309,16 +359,16 @@ router.get('/', async (req: Request, res: Response) => {
       const isRejected = validationStatusDisplay === '已驳回';
 
       const skuKey = (p.mappedInventorySku ?? '').trim() || (p.sku ?? p.vendorSku ?? '').trim();
-      const inv = skuKey ? inventoryMap.get(skuKey) : undefined;
+      const inv = p.mappedInventory ?? (skuKey ? inventoryMap.get(skuKey) : undefined);
 
-      const platformImage = p.mainImage ?? p.imageUrl ?? null;
+      // 核心回退逻辑：优先平台图，平台没图用本地关联 SKU 兜底
+      const emagImage = p.mainImage ?? p.imageUrl ?? null;
       const localImage = inv?.localImage ?? null;
-      const finalImage = localImage || platformImage || null;
+      const finalImage = emagImage || localImage || null;
 
-      const purchaseCost = inv?.purchaseCost ?? 0;
-      const estShipping = inv?.weight != null && inv.weight > 0
-        ? inv.weight * SHIPPING_PER_KG
-        : DEFAULT_SHIPPING;
+      const purchaseCost = inv ? Number(inv.purchaseCost ?? 0) : 0;
+      const invWeight = inv?.weight != null ? Number(inv.weight) : null;
+      const estShipping = invWeight != null && invWeight > 0 ? invWeight * SHIPPING_PER_KG : DEFAULT_SHIPPING;
       const estimatedProfit = salePriceNum - (purchaseCost + estShipping);
 
       const currency = p.currency ?? defaultCurrency;
@@ -330,6 +380,12 @@ router.get('/', async (req: Request, res: Response) => {
       }
 
       const salesStatsObj = { d7: sales_stats.d7, d14: sales_stats.d14, d30: sales_stats.d30 };
+
+      // ★ 强耦合计算：在同一作用域内用实时销量原子计算 comprehensive_sales
+      // 公式: (d7/7*0.3) + (d14/14*0.3) + (d30/30*0.4)，与 backfillComprehensiveSales 完全一致
+      const compSales = parseFloat(
+        (((sales_stats.d7 || 0) / 7) * 0.3 + ((sales_stats.d14 || 0) / 14) * 0.3 + ((sales_stats.d30 || 0) / 30) * 0.4).toFixed(2)
+      );
       const productUrl = p.productUrl ?? (() => {
         const domain = (region && REGION_DOMAIN[region as keyof typeof REGION_DOMAIN]) ?? 'emag.ro';
         const name = (p.name ?? '').trim();
@@ -346,6 +402,7 @@ router.get('/', async (req: Request, res: Response) => {
         mapped_inventory_sku: p.mappedInventorySku ?? null,
         product_url: productUrl,
         image: finalImage,
+        imageUrl: finalImage,
         main_image: finalImage,
         local_image: localImage,
         name: displayName,
@@ -358,6 +415,7 @@ router.get('/', async (req: Request, res: Response) => {
         stock_display: isRejected && stockNum === 0 ? '待更新' : stockNum,
         purchase_cost: purchaseCost || null,
         estimated_profit: Number(estimatedProfit.toFixed(2)),
+        comprehensive_sales: compSales,   // 实时计算，与 sales_stats 强耦合，永不陈旧
         sales_stats: salesStatsObj,
         salesStats: salesStatsObj,
         validation_status: validationStatusDisplay,
@@ -368,12 +426,32 @@ router.get('/', async (req: Request, res: Response) => {
 
     const sampleWithSales = data.find((d) => (d.sales_stats?.d30 ?? 0) > 0);
     if (sampleWithSales) {
-      console.log(`[StoreProducts] Sample product with sales: ${sampleWithSales.name} -> d7=${sampleWithSales.sales_stats?.d7}, d14=${sampleWithSales.sales_stats?.d14}, d30=${sampleWithSales.sales_stats?.d30}`);
+      console.log(`[StoreProducts] Sample product with sales: ${sampleWithSales.name} -> d7=${sampleWithSales.sales_stats?.d7}, d14=${sampleWithSales.sales_stats?.d14}, d30=${sampleWithSales.sales_stats?.d30}, compSales=${sampleWithSales.comprehensive_sales}`);
     } else {
       console.log(`[StoreProducts] Sample product with sales: (none in this page, total ${data.length} products)`);
     }
 
-    res.json({ code: 200, data, total, page, limit, message: 'success' });
+    // ★ 异步写回 DB：将本次实时计算结果持久化到 store_products.comprehensive_sales
+    // 火箭发射式（fire-and-forget），不阻塞响应，失败只打印日志
+    // 只写有变化的行（stale 检测），避免无意义写入
+    const staleItems = data
+      .map((d, i) => ({ id: list[i].id, newVal: d.comprehensive_sales, oldVal: list[i].comprehensiveSales }))
+      .filter((x) => Math.abs(x.newVal - x.oldVal) > 0.001);
+    if (staleItems.length > 0) {
+      setImmediate(async () => {
+        try {
+          await Promise.all(
+            staleItems.map((x) => prisma.storeProduct.update({ where: { id: x.id }, data: { comprehensiveSales: x.newVal } }))
+          );
+          console.log(`[StoreProducts] 后台写回 comprehensive_sales: ${staleItems.length} 条已更新 (shopId=${shopId})`);
+        } catch (e) {
+          console.error('[StoreProducts] 后台写回 comprehensive_sales 失败:', e instanceof Error ? e.message : e);
+        }
+      });
+    }
+
+    console.log('=== PAGING DEBUG ===', { listLength: list.length, actualTotal: total, page, limit, shopId });
+    res.json({ code: 200, data: { list: data, total, page, limit }, message: 'success' });
   } catch (err) {
     console.error('[GET /api/store-products]', err);
     res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });

@@ -8,7 +8,7 @@ import cron from 'node-cron';
 import { prisma } from '../lib/prisma';
 import { tryAcquireSyncLock, releaseSyncLock } from '../lib/syncStatus';
 import { syncAllPlatformOrders } from './platformOrderSync';
-import { syncStoreProducts, backfillProductUrls, backfillProductImages } from './storeProductSync';
+import { syncStoreProducts, backfillProductUrls, backfillProductImages, backfillComprehensiveSales } from './storeProductSync';
 import { syncInventoryToPlatform } from './inventorySync';
 import { getEmagCredentials } from './emagClient';
 import { shouldDelayNextSync, setDelayMultiplier, getDelayMultiplier } from './emagRateLimit';
@@ -121,9 +121,12 @@ function runProductRadar() {
       totalUpdated += urlRes.updated;
       const imgRes = await backfillProductImages();
       totalUpdated += imgRes.updated;
+      // 产品雷达完成后联动更新全站综合日销（全站通用，无 shopId/region 特判）
+      const salesRes = await backfillComprehensiveSales();
+      totalUpdated += salesRes.updated;
       const durationMs = Date.now() - start;
-      logSync('product_radar', totalUpdated, durationMs, 'success', JSON.stringify({ urls: urlRes.updated, images: imgRes.updated }));
-      console.log(`[产品雷达] 完成 更新=${totalUpdated} 耗时=${durationMs}ms`);
+      logSync('product_radar', totalUpdated, durationMs, 'success', JSON.stringify({ urls: urlRes.updated, images: imgRes.updated, comprehensiveSales: salesRes.updated }));
+      console.log(`[产品雷达] 完成 更新=${totalUpdated} 综合日销已回填=${salesRes.updated} 耗时=${durationMs}ms`);
     } catch (e) {
       const durationMs = Date.now() - start;
       logSync('product_radar', totalUpdated, durationMs, 'failed', e instanceof Error ? e.message : String(e));

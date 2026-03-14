@@ -5,6 +5,7 @@ import { authenticate } from '../middleware/auth';
 import { getIsSyncing, tryAcquireSyncLock, releaseSyncLock } from '../lib/syncStatus';
 import { syncPlatformOrdersForShop, syncAllPlatformOrders } from '../services/platformOrderSync';
 import { statusMap } from '../services/emagOrder';
+import { syncAndUpdatePurchaseOrderItem } from '../services/alibabaOrderSync';
 
 function toStatusText(status: number): string {
   return statusMap[status] ?? `状态${status}`;
@@ -458,7 +459,8 @@ router.get('/:id', async (req: Request, res: Response) => {
 });
 
 // ── GET /api/orders/:id/products ─────────────────────────────
-// 查询某个采购单下的所有产品
+// 查询某个采购单下的所有产品，并联查 PurchaseOrderItem 补全 1688 金额/状态/物流字段
+// 若金额为 null 则自动触发 1688 内联同步并返回 debug_raw_price
 router.get('/:id/products', async (req: Request, res: Response) => {
   try {
     const orderId = Number(req.params.id);
@@ -472,21 +474,127 @@ router.get('/:id/products', async (req: Request, res: Response) => {
       orderBy: { updatedAt: 'desc' },
     });
 
-    const list = products.map((p) => ({
-      id:               p.id,
-      pnk:              p.pnk,
-      sku:              p.sku ?? null,
-      chineseName:      p.chineseName ?? null,
-      imageUrl:         p.imageUrl,
-      purchaseUrl:      p.purchaseUrl ?? null,
-      purchasePrice:    p.purchasePrice ? Number(p.purchasePrice) : null,
-      purchaseQuantity: p.purchaseQuantity ?? null,
-      price:            p.price ? Number(p.price) : null,
-    }));
+    // 联查 PurchaseOrderItem：以 alibabaOrderId = Product.externalOrderId 作为桥接
+    const orderIds = [...new Set(products.map((p) => p.externalOrderId).filter(Boolean))] as string[];
+    const itemsMap = new Map<string, {
+      id: number;
+      alibabaOrderId: string | null;
+      alibabaOrderStatus: string | null;
+      alibabaTotalAmount: number | null;
+      shippingFee: number | null;
+      logisticsCompany: string | null;
+      logisticsNo: string | null;
+      debug_raw_price: Record<string, unknown> | null;
+    }>();
+    if (orderIds.length > 0) {
+      const items = await prisma.purchaseOrderItem.findMany({
+        where: { purchaseOrderId: orderId, alibabaOrderId: { in: orderIds } },
+        select: {
+          id: true,
+          alibabaOrderId: true,
+          alibabaOrderStatus: true,
+          alibabaTotalAmount: true,
+          shippingFee: true,
+          logisticsCompany: true,
+          logisticsNo: true,
+        },
+      });
+      for (const item of items) {
+        if (item.alibabaOrderId) {
+          let totalAmount = item.alibabaTotalAmount != null ? Number(item.alibabaTotalAmount) : null;
+          let shippingFee = item.shippingFee != null ? Number(item.shippingFee) : null;
+          let status = item.alibabaOrderStatus ?? null;
+          let debug_raw_price: Record<string, unknown> | null = null;
+
+          // ★ 金额为 null 时自动触发 1688 内联同步（必须走 res.result.baseInfo）
+          if ((totalAmount == null || shippingFee == null) && item.alibabaOrderId) {
+            const synced = await syncAndUpdatePurchaseOrderItem(item.id, item.alibabaOrderId);
+            if (synced && !('error' in synced && synced.error)) {
+              totalAmount = synced.totalAmount;
+              shippingFee = synced.shippingFee;
+              status = synced.status;
+              debug_raw_price = synced.debug_raw_price;
+            }
+          }
+
+          itemsMap.set(item.alibabaOrderId, {
+            id: item.id,
+            alibabaOrderId: item.alibabaOrderId,
+            alibabaOrderStatus: status,
+            alibabaTotalAmount: totalAmount,
+            shippingFee,
+            logisticsCompany: item.logisticsCompany ?? null,
+            logisticsNo: item.logisticsNo ?? null,
+            debug_raw_price,
+          });
+        }
+      }
+    }
+
+    const list = products.map((p) => {
+      const orderItem = p.externalOrderId ? itemsMap.get(p.externalOrderId) : undefined;
+      return {
+        id:                  p.id,
+        pnk:                 p.pnk,
+        sku:                 p.sku ?? null,
+        chineseName:         p.chineseName ?? null,
+        imageUrl:            p.imageUrl,
+        purchaseUrl:         p.purchaseUrl ?? null,
+        purchasePrice:       p.purchasePrice ? Number(p.purchasePrice) : null,
+        purchaseQuantity:    p.purchaseQuantity ?? null,
+        price:               p.price ? Number(p.price) : null,
+        // 1688 关联字段
+        externalOrderId:     p.externalOrderId ?? null,
+        purchaseOrderItemId: orderItem?.id ?? null,
+        alibabaOrderStatus:  orderItem?.alibabaOrderStatus ?? null,
+        alibabaTotalAmount:  orderItem?.alibabaTotalAmount ?? null,
+        shippingFee:         orderItem?.shippingFee ?? null,
+        logisticsCompany:    orderItem?.logisticsCompany ?? null,
+        logisticsNo:         orderItem?.logisticsNo ?? null,
+        debug_raw_price:     orderItem?.debug_raw_price ?? null,
+      };
+    });
 
     res.json({ code: 200, data: list, message: 'success' });
   } catch (err) {
     console.error('[GET /api/orders/:id/products]', err);
+    res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
+  }
+});
+
+// ── GET /api/orders/:id/items ─────────────────────────────────
+// 查询采购单下的 1688 子单明细（含 alibabaOrderId、物流等，供展开子表与同步接口使用）
+router.get('/:id/items', async (req: Request, res: Response) => {
+  try {
+    const orderId = Number(req.params.id);
+    if (isNaN(orderId)) {
+      res.status(400).json({ code: 400, data: null, message: '订单 ID 无效' });
+      return;
+    }
+
+    const items = await prisma.purchaseOrderItem.findMany({
+      where: { purchaseOrderId: orderId },
+      orderBy: { id: 'asc' },
+    });
+
+    const list = items.map((i) => ({
+      id:                  i.id,
+      offerId:             i.offerId ?? null,
+      productIds:         i.productIds ?? null,
+      quantity:           i.quantity,
+      externalOrderId:     i.alibabaOrderId ?? null,
+      alibabaOrderId:     i.alibabaOrderId ?? null,
+      alibabaOrderStatus: i.alibabaOrderStatus ?? null,
+      alibabaTotalAmount: i.alibabaTotalAmount != null ? Number(i.alibabaTotalAmount) : null,
+      shippingFee:        i.shippingFee != null ? Number(i.shippingFee) : null,
+      logisticsCompany:   i.logisticsCompany ?? null,
+      logisticsNo:        i.logisticsNo ?? null,
+      createdAt:          i.createdAt,
+    }));
+
+    res.json({ code: 200, data: list, message: 'success' });
+  } catch (err) {
+    console.error('[GET /api/orders/:id/items]', err);
     res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
   }
 });

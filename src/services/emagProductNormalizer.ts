@@ -57,38 +57,86 @@ function extractFirstImageFromDescription(html: string): string | null {
   return null;
 }
 
-/** 从 images 数组提取第一张有效大图（兼容 RO/BG/HU，严格执行提纯过滤） */
+/**
+ * 从 images 数组提取主图（严格遵循 eMAG 官方 API 文档 product_offer/read 第 23 页）
+ * - images 为对象数组，每项含 display_type、url
+ * - display_type === 1 为主图，优先取该对象的 url
+ * - 若无 display_type === 1，则降级取数组第一个有效 url
+ * - 无条件信任 eMAG 返回的 url，不做任何正则过滤
+ */
 function extractFirstImageFromArray(images: unknown): string | null {
-  if (!Array.isArray(images) || images.length === 0) return null;
-  const urls: string[] = [];
-  for (const img of images) {
-    const u = typeof img === 'string' ? img : (img && typeof img === 'object' ? ((img as any).url ?? (img as any).image ?? (img as any).src ?? (img as any).link) : null);
-    if (typeof u !== 'string' || !u.trim()) continue;
-    if (u.includes('logo') || u.includes('placeholder') || u.endsWith('.svg')) continue; // 黄金逻辑：严格过滤
-    if (isInvalidImageUrl(u)) continue;
-    urls.push(u.trim());
+  let arr: any[];
+  if (typeof images === 'string') {
+    try { arr = JSON.parse(images); } catch { return null; }
+    if (!Array.isArray(arr)) return null;
+  } else if (Array.isArray(images)) {
+    arr = images;
+  } else {
+    return null;
   }
-  const jpgPng = urls.find((x) => isJpgOrPngUrl(x));
-  return (jpgPng ?? urls[0]) ?? null;
+  if (arr.length === 0) return null;
+
+  if (arr.length > 0) {
+    const sample = arr[0];
+    console.log('🔍 [extractFirstImageFromArray] images[0] 原始结构:', JSON.stringify(sample));
+    console.log('🔍 [extractFirstImageFromArray] images 长度:', arr.length);
+  }
+
+  for (const img of arr) {
+    if (!img || typeof img !== 'object') continue;
+    const displayType = (img as any).display_type ?? (img as any).type;
+    if (displayType === 1 || displayType === '1') {
+      const u = (img as any).url ?? (img as any).image ?? (img as any).src ?? (img as any).link;
+      if (typeof u === 'string' && u.trim()) {
+        console.log('✅ [extractFirstImageFromArray] 命中 display_type=1, url:', u.trim());
+        return u.trim();
+      }
+    }
+  }
+
+  for (const img of arr) {
+    const u = typeof img === 'string'
+      ? img
+      : (img && typeof img === 'object' ? ((img as any).url ?? (img as any).image ?? (img as any).src ?? (img as any).link) : null);
+    if (typeof u === 'string' && u.trim()) {
+      console.log('⚠️ [extractFirstImageFromArray] 无 display_type=1, 降级取首项 url:', u.trim());
+      return u.trim();
+    }
+  }
+
+  console.log('❌ [extractFirstImageFromArray] 遍历完毕，无任何可用 url');
+  return null;
 }
 
-/** 从 attachments 数组提取第一张有效图（type===1 为主图，严格执行提纯过滤） */
+/** 从 attachments 数组提取第一张有效图（type===1 为主图，无条件信任 eMAG 返回的 url） */
 function extractFirstImageFromAttachments(attachments: unknown): string | null {
-  if (!Array.isArray(attachments) || attachments.length === 0) return null;
-  const urls: string[] = [];
-  for (const att of attachments) {
+  let arr: any[];
+  if (typeof attachments === 'string') {
+    try { arr = JSON.parse(attachments); } catch { return null; }
+    if (!Array.isArray(arr)) return null;
+  } else if (Array.isArray(attachments)) {
+    arr = attachments;
+  } else {
+    return null;
+  }
+  if (arr.length === 0) return null;
+
+  for (const att of arr) {
+    if (!att || typeof att !== 'object') continue;
+    const type = (att as any).type ?? (att as any).display_type;
+    if (type === 1 || type === '1' || type === 'main') {
+      const u = (att as any).url ?? (att as any).image ?? (att as any).src ?? (att as any).link;
+      if (typeof u === 'string' && u.trim()) return u.trim();
+    }
+  }
+
+  for (const att of arr) {
     if (!att || typeof att !== 'object') continue;
     const u = (att as any).url ?? (att as any).image ?? (att as any).src ?? (att as any).link;
-    if (typeof u !== 'string' || !u.trim()) continue;
-    if (u.includes('logo') || u.includes('placeholder') || u.endsWith('.svg')) continue; // 黄金逻辑：严格过滤
-    if (isInvalidImageUrl(u)) continue;
-    const trimmed = u.trim();
-    const type = (att as any).type ?? (att as any).display_type;
-    if (type === 1 || type === '1' || type === 'main') return trimmed;
-    urls.push(trimmed);
+    if (typeof u === 'string' && u.trim()) return u.trim();
   }
-  const jpgPng = urls.find((x) => isJpgOrPngUrl(x));
-  return (jpgPng ?? urls[0]) ?? null;
+
+  return null;
 }
 
 // ─── 输出类型 ─────────────────────────────────────────────────────
@@ -163,20 +211,33 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
     }
   }
 
-  // main_image：多源优先级，attachments(type===1) > images > main_url > description（全面可选链防坠毁）
+  // main_image：多源优先级，images(display_type=1) > attachments > main_url > description
   let mainImage: string | null = null;
-  if (Array.isArray(raw?.attachments) && raw.attachments.length > 0) {
-    mainImage = extractFirstImageFromAttachments(raw.attachments);
+
+  // 🔍 探针：打印原始 images 字段的类型和内容（仅前 3 个产品）
+  const rawImages = raw?.images;
+  const rawAttachments = raw?.attachments;
+  if (options?.logOutput !== false) {
+    console.log(`🔍 [Normalizer] PNK=${pnk} raw.images type=${typeof rawImages}, isArray=${Array.isArray(rawImages)}, value=`, JSON.stringify(rawImages)?.slice(0, 500));
+    console.log(`🔍 [Normalizer] PNK=${pnk} raw.attachments type=${typeof rawAttachments}, isArray=${Array.isArray(rawAttachments)}, value=`, JSON.stringify(rawAttachments)?.slice(0, 500));
   }
-  if (!mainImage && Array.isArray(raw?.images) && raw.images.length > 0) {
-    mainImage = extractFirstImageFromArray(raw.images);
+
+  // 优先从 images 提取（eMAG 官方文档 display_type===1 为主图）
+  if (rawImages != null) {
+    mainImage = extractFirstImageFromArray(rawImages);
   }
+  // 次选 attachments
+  if (!mainImage && rawAttachments != null) {
+    mainImage = extractFirstImageFromAttachments(rawAttachments);
+  }
+  // 兜底：main_url / main_image / image_url 直接字段
   if (!mainImage) {
     const mainUrl = raw?.main_url ?? raw?.main_image ?? raw?.image_url;
-    if (typeof mainUrl === 'string' && mainUrl.trim() && !isInvalidImageUrl(mainUrl) && isJpgOrPngUrl(mainUrl)) {
+    if (typeof mainUrl === 'string' && mainUrl.trim()) {
       mainImage = mainUrl.trim();
     }
   }
+  // 最终兜底：从 description HTML 提取
   if (!mainImage && typeof raw?.description === 'string' && raw.description.trim()) {
     mainImage = extractFirstImageFromDescription(raw.description);
   }

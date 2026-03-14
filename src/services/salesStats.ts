@@ -58,7 +58,7 @@ export async function getSalesStatsByShop(shopId: number, forceRefresh = false):
  * 原始 SQL 聚合：platform_orders.products_json 等价于 order_items
  * SELECT sku, SUM(CAST(quantity AS INT)) FROM platform_orders (解析 JSON) GROUP BY sku
  */
-async function aggregateSalesForShop(shopId: number): Promise<{ map: Map<string, SalesStats>; skusWithSales: string[] }> {
+async function aggregateSalesForShop(shopId: number): Promise<{ map: Map<string, SalesStats>; skusWithSales: string[] }> { // shopId 用于通用诊断日志
   const now = new Date();
   const d7 = new Date(now);
   d7.setDate(d7.getDate() - 7);
@@ -99,15 +99,15 @@ async function aggregateSalesForShop(shopId: number): Promise<{ map: Map<string,
   merge(d14Rows, 'd14');
   merge(d30Rows, 'd30');
 
-  const sampleSkus = ['cpb01', 'tngj01', 'cdx04'];
-  for (const sku of sampleSkus) {
-    const s = skuStats.get(sku);
-    const d30Match = d30Rows.find((r) => normalizeSku(r.sku) === sku);
-    const orderMatchTotal = d30Match ? Number(d30Match.total) : 0;
-    console.log(`[Sales Diagnostic] SKU: ${sku} | 订单库匹配数量: ${orderMatchTotal} | 最终计算销量: ${s?.d30 ?? 0}`);
+  // 通用诊断：打印 top3 有销量 SKU（全站通用，无硬编码）
+  const skusWithSales = [...skuStats.keys()];
+  const topSample = skusWithSales.slice(0, 3);
+  if (topSample.length > 0) {
+    console.log(`[Sales shopId=${shopId}] 30天 Top3 SKU: ${topSample.map(k => `${k}(d30=${skuStats.get(k)?.d30 ?? 0})`).join(', ')}`);
+  } else {
+    console.log(`[Sales shopId=${shopId}] 30天内无有效订单销量`);
   }
 
-  const skusWithSales = [...skuStats.keys()];
   return { map: skuStats, skusWithSales };
 }
 

@@ -103,7 +103,8 @@ model Product {
   vat               Int            @default(19)
   publishStatus     String         @default("UNPUBLISHED") @map("publish_status")
   externalProductId String?        @map("external_product_id")
-  externalSkuId     String?        @map("external_sku_id")
+  externalSkuId     String?        @map("external_sku_id")     // 1688 specId：32位 MD5 哈希（万邦 spec_id），优先用于下单
+  externalSkuIdNum  String?        @map("external_sku_id_num") // 1688 skuId：纯数字，用于 cargoParamList.skuId 兜底
   externalSynced    Boolean        @default(false) @map("external_synced")
   externalOrderId   String?        @map("external_order_id")
   stockActual       Float          @default(0) @map("stock_actual")
@@ -131,20 +132,44 @@ model Product {
   @@map("products")
 }
 
-/// 采购单
+/// 采购单（主单）
 model PurchaseOrder {
-  id          Int         @id @default(autoincrement())
-  orderNo     String      @unique @map("order_no")
+  id          Int                   @id @default(autoincrement())
+  orderNo     String                @unique @map("order_no")
   operator    String
-  totalAmount Decimal     @map("total_amount") @db.Decimal(12, 2)
-  itemCount   Int         @default(0) @map("item_count")
-  status      OrderStatus @default(PLACED)
-  createdAt   DateTime    @default(now()) @map("created_at")
+  totalAmount Decimal               @map("total_amount") @db.Decimal(12, 2)
+  itemCount   Int                   @default(0) @map("item_count")
+  status      OrderStatus           @default(PLACED)
+  createdAt   DateTime              @default(now()) @map("created_at")
   products    Product[]
+  items       PurchaseOrderItem[]   // 子单（每个 1688 卖家对应一条）
 
   @@index([createdAt(sort: Desc)])
   @@index([operator])
   @@map("purchase_orders")
+}
+
+/// 采购子单（一个主单对应多个 1688 卖家子订单）
+model PurchaseOrderItem {
+  id                  Int           @id @default(autoincrement())
+  purchaseOrderId     Int           @map("purchase_order_id")
+  offerId             String?       @map("offer_id")           // 1688 商品 offerId（即卖家维度标识）
+  productIds          String?       @map("product_ids")        // 关联的本地产品 ID 列表（JSON 数组）
+  quantity            Int           @default(1)                // 本批次合计采购数量
+  createdAt           DateTime      @default(now()) @map("created_at")
+  // ── 1688 子单回填字段（一个 offerId 对应一个 1688 子订单）────
+  alibabaOrderId      String?       @map("alibaba_order_id")      // 1688 官方订单号
+  alibabaOrderStatus  String?       @map("alibaba_order_status")  // 1688 状态: waitbuyerpay / waitsellersend / success
+  alibabaTotalAmount  Decimal?      @map("alibaba_total_amount") @db.Decimal(12, 2) // 1688 实际支付金额（含运费）
+  shippingFee         Decimal?      @map("shipping_fee") @db.Decimal(10, 2)         // 1688 运费
+  // ── 物流追踪字段 ────────────────────────────────────────────
+  logisticsCompany    String?       @map("logistics_company")
+  logisticsNo         String?       @map("logistics_no")
+  purchaseOrder       PurchaseOrder @relation(fields: [purchaseOrderId], references: [id], onDelete: Cascade)
+
+  @@index([purchaseOrderId])
+  @@index([alibabaOrderId])
+  @@map("purchase_order_items")
 }
 
 /// eMAG 多站点区域枚举（RO=罗马尼亚, BG=保加利亚, HU=匈牙利）
@@ -227,13 +252,16 @@ model StoreProduct {
   validationStatus String?  @map("validation_status")
   docErrors        String?  @map("doc_errors") // eMAG 驳回原因 (JSON 或文本)
   rejectionReason  String?  @map("rejection_reason") // 驳回原因（便于展示）
+  comprehensiveSales Float    @default(0) @map("comprehensive_sales") // 综合日销 = d7/7*0.3 + d14/14*0.3 + d30/30*0.4
   syncedAt         DateTime @default(now()) @map("synced_at")
   shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  mappedInventory Inventory? @relation(fields: [mappedInventorySku], references: [sku]) // 本地关联 SKU 兜底（图片/成本）
 
   @@unique([shopId, pnk])
   @@index([shopId])
   @@index([pnk])
   @@index([vendorSku])
+  @@index([shopId, comprehensiveSales(sort: Desc)])
   @@map("store_products")
 }
 
@@ -241,6 +269,7 @@ model StoreProduct {
 model Inventory {
   id            Int      @id @default(autoincrement())
   sku           String   @unique // 唯一标识，对应 eMAG part_number
+  storeProducts StoreProduct[] // 关联的平台产品（通过 mapped_inventory_sku）
   localImage    String?  @map("local_image") // 本地高清图 URL
   purchaseCost  Decimal? @map("purchase_cost") @db.Decimal(10, 2) // 采购单价
   weight        Decimal? @db.Decimal(10, 3) // 重量 (kg)，用于物流

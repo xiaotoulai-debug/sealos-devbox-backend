@@ -10,7 +10,7 @@
 import { prisma } from '../lib/prisma';
 import { EmagCredentials, getEmagCredentials, REGION_DOMAIN } from './emagClient';
 import { readProductOffers, findDocumentationByEans, readProductsByPnk } from './emagProduct';
-import { normalizeEmagProduct, slugifyProductName, isInvalidImageUrl } from './emagProductNormalizer';
+import { normalizeEmagProduct, slugifyProductName } from './emagProductNormalizer';
 
 const PAGE_SIZE = 100;
 const DELAY_MS = 350; // 3 req/sec (product_offer)
@@ -170,7 +170,14 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
         if (!result.rejectedSample) result.rejectedSample = { pnk: np.pnk, docErrors: np.rejectionReason || '' };
       }
 
-      const data = {
+      // 从 platform_orders 聚合的销量已在第一阶段 upsert 前由 syncCron 写好；
+      // 此处使用当前产品已同步到 DB 的 sales 字段回读并计算综合日销。
+      // 由于 Offer API 不返回销量，综合日销需在 upsert 后由独立回填脚本或定时任务写入。
+      // 同步写入时设 comprehensiveSales=0（保留字段），后续由 backfillComprehensiveSales 刷入。
+      // 🚀 落库探针：确认图片 URL 是否被提取到
+      console.log(`🚀 [eMAG 同步] PNK=${np.pnk} 准备存入数据库的图片 URL: ${mainImage ?? '(null - 无图片)'}`);
+
+      const data: Record<string, any> = {
         shopId: creds.shopId,
         pnk: np.pnk,
         vendorSku: np.vendorSku ?? undefined,
@@ -191,11 +198,20 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
         rejectionReason: np.rejectionReason,
       };
 
-      // 始终 upsert：已存在则更新 main_image、price 等，不跳过
+      // 构建 update 对象：有新图片时强制覆盖，无图片时保留 DB 已有值（不传 undefined = 跳过更新）
+      const updateData: Record<string, any> = { ...data };
+      if (mainImage) {
+        updateData.imageUrl = mainImage;
+        updateData.mainImage = mainImage;
+      } else {
+        delete updateData.imageUrl;
+        delete updateData.mainImage;
+      }
+
       await prisma.storeProduct.upsert({
         where: { shopId_pnk: { shopId: creds.shopId, pnk: np.pnk } },
         create: data,
-        update: data,
+        update: updateData,
       });
 
       if (mainImage) {
@@ -220,12 +236,6 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
         OR: [
           { mainImage: null },
           { mainImage: '' },
-          { mainImage: { contains: 'logo', mode: 'insensitive' } },
-          { mainImage: { contains: 'emag-logo', mode: 'insensitive' } },
-          { mainImage: { contains: 'placeholder', mode: 'insensitive' } },
-          { mainImage: { contains: 'emag-placeholder', mode: 'insensitive' } },
-          { mainImage: { contains: 'temporary-images', mode: 'insensitive' } },
-          { mainImage: { endsWith: '.svg' } },
         ],
       },
       select: { pnk: true, sku: true, vendorSku: true },
@@ -427,12 +437,6 @@ export async function backfillProductImages(): Promise<{ updated: number; total:
       OR: [
         { mainImage: null },
         { mainImage: '' },
-        { mainImage: { contains: 'logo', mode: 'insensitive' } },
-        { mainImage: { contains: 'emag-logo', mode: 'insensitive' } },
-        { mainImage: { contains: 'placeholder', mode: 'insensitive' } },
-        { mainImage: { contains: 'emag-placeholder', mode: 'insensitive' } },
-        { mainImage: { contains: 'temporary-images', mode: 'insensitive' } },
-        { mainImage: { endsWith: '.svg' } },
       ],
     },
     select: { id: true, pnk: true, sku: true, ean: true, shopId: true },
@@ -501,7 +505,7 @@ export async function backfillProductImages(): Promise<{ updated: number; total:
               for (const item of items) {
                 const ean = item?.ean ?? item?.EAN ?? item?.ean_code;
                 const img = item?.product_image ?? item?.productImage ?? item?.image ?? item?.main_image;
-                if (ean && typeof img === 'string' && img.trim() && !isInvalidImageUrl(img)) {
+                if (ean && typeof img === 'string' && img.trim()) {
                   const eanStr = String(ean).trim();
                   for (const prod of eanToProducts.get(eanStr) ?? []) {
                     apiImageMap.set(prod.pnk, img.trim());
@@ -534,5 +538,92 @@ export async function backfillProductImages(): Promise<{ updated: number; total:
       console.error('[backfillProductImages] shopId=' + shopId, e);
     }
   }
+  return result;
+}
+
+/**
+ * 回填综合日销 — 从 platform_orders 聚合 7/14/30 日销量，计算综合日销并写入 store_products.comprehensive_sales
+ * 公式: (d7/7 * 0.3) + (d14/14 * 0.3) + (d30/30 * 0.4)
+ * 支持全量回填（不传 shopId）或指定店铺回填（传 shopId）
+ */
+export async function backfillComprehensiveSales(shopId?: number): Promise<{ updated: number; errors: string[] }> {
+  const result = { updated: 0, errors: [] as string[] };
+
+  const now = new Date();
+  const d7Date = new Date(now); d7Date.setDate(d7Date.getDate() - 7);
+  const d14Date = new Date(now); d14Date.setDate(d14Date.getDate() - 14);
+  const d30Date = new Date(now); d30Date.setDate(d30Date.getDate() - 30);
+
+  const shopWhere = shopId != null ? `AND po.shop_id = ${shopId}` : '';
+  const skuExpr = `LOWER(TRIM(REPLACE(REPLACE(COALESCE(elem->>'sku', elem->>'ext_part_number', ''), E'\\r', ''), E'\\n', '')))`;
+  const qtyExpr = `COALESCE((elem->>'quantity')::int, 0)`;
+  const baseStatus = `po.status IN (1,2,3,4)`;
+
+  try {
+    // 聚合三个时间段的销量
+    const [d7Rows, d14Rows, d30Rows] = await Promise.all([
+      prisma.$queryRawUnsafe<Array<{ shop_id: number; sku: string; total: string }>>(
+        `SELECT po.shop_id, ${skuExpr} as sku, SUM(${qtyExpr}) as total FROM platform_orders po, jsonb_array_elements(products_json::jsonb) as elem WHERE ${baseStatus} AND po.order_time >= '${d7Date.toISOString().slice(0, 10)}' ${shopWhere} GROUP BY po.shop_id, 2`
+      ),
+      prisma.$queryRawUnsafe<Array<{ shop_id: number; sku: string; total: string }>>(
+        `SELECT po.shop_id, ${skuExpr} as sku, SUM(${qtyExpr}) as total FROM platform_orders po, jsonb_array_elements(products_json::jsonb) as elem WHERE ${baseStatus} AND po.order_time >= '${d14Date.toISOString().slice(0, 10)}' ${shopWhere} GROUP BY po.shop_id, 2`
+      ),
+      prisma.$queryRawUnsafe<Array<{ shop_id: number; sku: string; total: string }>>(
+        `SELECT po.shop_id, ${skuExpr} as sku, SUM(${qtyExpr}) as total FROM platform_orders po, jsonb_array_elements(products_json::jsonb) as elem WHERE ${baseStatus} AND po.order_time >= '${d30Date.toISOString().slice(0, 10)}' ${shopWhere} GROUP BY po.shop_id, 2`
+      ),
+    ]);
+
+    // 按 shopId+sku 建立销量 Map
+    type SalesKey = string; // `${shopId}:${sku}`
+    const salesMap = new Map<SalesKey, { d7: number; d14: number; d30: number }>();
+    const mergeRows = (rows: Array<{ shop_id: number; sku: string; total: string }>, key: 'd7' | 'd14' | 'd30') => {
+      for (const r of rows) {
+        const k: SalesKey = `${r.shop_id}:${r.sku}`;
+        const s = salesMap.get(k) ?? { d7: 0, d14: 0, d30: 0 };
+        s[key] = Number(r.total) || 0;
+        salesMap.set(k, s);
+      }
+    };
+    mergeRows(d7Rows, 'd7');
+    mergeRows(d14Rows, 'd14');
+    mergeRows(d30Rows, 'd30');
+
+    // 查出所有需要回填的产品（sku 和 vendorSku 都要尝试匹配）
+    const products = await prisma.storeProduct.findMany({
+      where: shopId != null ? { shopId } : {},
+      select: { id: true, shopId: true, sku: true, vendorSku: true },
+    });
+
+    const BATCH = 200;
+    for (let i = 0; i < products.length; i += BATCH) {
+      const batch = products.slice(i, i + BATCH);
+      await Promise.all(batch.map(async (p) => {
+        const keys = new Set(
+          [p.sku, p.vendorSku]
+            .filter(Boolean)
+            .map((s) => s!.trim().toLowerCase())
+        );
+        let d7 = 0, d14 = 0, d30 = 0;
+        for (const sku of keys) {
+          const k: SalesKey = `${p.shopId}:${sku}`;
+          const s = salesMap.get(k);
+          if (s) { d7 += s.d7; d14 += s.d14; d30 += s.d30; }
+        }
+        const compSales = parseFloat(((d7 / 7) * 0.3 + (d14 / 14) * 0.3 + (d30 / 30) * 0.4).toFixed(2));
+        await prisma.storeProduct.update({
+          where: { id: p.id },
+          data: { comprehensiveSales: compSales },
+        });
+        result.updated++;
+      }));
+    }
+
+    console.log(`[backfillComprehensiveSales] 完成，共更新 ${result.updated} 条产品综合日销`);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    result.errors.push(msg);
+    console.error('[backfillComprehensiveSales] 失败:', msg);
+  }
+
   return result;
 }
