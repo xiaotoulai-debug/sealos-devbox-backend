@@ -26,10 +26,11 @@ function isMaskedCredential(val: string | null | undefined): boolean {
   return false;
 }
 
-// GET /api/shops
+// GET /api/shops — 全量店铺列表（管理页用）；仪表盘下拉框建议用 GET /api/dashboard/shops
 router.get('/', async (_req: Request, res: Response) => {
   try {
     const shops = await prisma.shopAuthorization.findMany({ orderBy: { createdAt: 'desc' } });
+    console.log('=== DASHBOARD SHOPS ===', shops.map((s) => s.shopName + (s.region ?? '')));
     if (shops.length > 0) {
       const sample = { id: shops[0].id, shopName: shops[0].shopName, platform: shops[0].platform, region: shops[0].region };
       console.log('Shop Data:', JSON.stringify(sample, null, 2));
@@ -53,6 +54,33 @@ router.get('/', async (_req: Request, res: Response) => {
   } catch (err) {
     console.error('[GET /api/shops]', err);
     res.status(500).json({ code: 500, data: null, message: '获取店铺列表失败' });
+  }
+});
+
+// GET /api/shops/authorized — 仪表盘下拉框专用：仅 eMAG 活跃店铺，无 region 硬编码
+router.get('/authorized', async (_req: Request, res: Response) => {
+  try {
+    const shops = await prisma.shopAuthorization.findMany({
+      where: {
+        platform: { equals: 'emag', mode: 'insensitive' },
+        status: 'active',
+      },
+      orderBy: [{ shopName: 'asc' }, { region: 'asc' }],
+      select: { id: true, shopName: true, platform: true, region: true, status: true },
+    });
+    const safe = shops.map((s) => ({
+      id: s.id,
+      shopName: s.shopName,
+      platform: s.platform,
+      region: s.platform.toLowerCase() === 'emag' && s.region == null ? 'RO' : s.region,
+      status: s.status,
+    }));
+    console.log('=== DASHBOARD SHOPS ===', safe.map((s) => s.shopName + (s.region ?? '')));
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ code: 200, data: safe, message: 'success' });
+  } catch (err: any) {
+    console.error('[GET /api/shops/authorized]', err?.message ?? err);
+    res.status(500).json({ code: 500, data: null, message: '获取授权店铺列表失败' });
   }
 });
 

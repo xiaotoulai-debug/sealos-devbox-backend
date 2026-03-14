@@ -1,10 +1,41 @@
 import { Router, Request, Response } from 'express';
+import { prisma } from '../lib/prisma';
 import { authenticate } from '../middleware/auth';
 import { getFirstEmagShopId } from '../services/emagClient';
 import { getStatsFromLocalDB } from '../services/dashboardStats';
 
 const router = Router();
 router.use(authenticate);
+
+/**
+ * GET /api/dashboard/shops — 仪表盘店铺下拉框数据源
+ * 返回所有 eMAG 活跃店铺，无 RBAC 过滤（当前架构无 UserShop 表），无 region 硬编码
+ */
+router.get('/shops', async (_req: Request, res: Response) => {
+  try {
+    const shops = await prisma.shopAuthorization.findMany({
+      where: {
+        platform: { equals: 'emag', mode: 'insensitive' },
+        status: 'active',
+      },
+      orderBy: [{ shopName: 'asc' }, { region: 'asc' }],
+      select: { id: true, shopName: true, platform: true, region: true, status: true },
+    });
+    const safe = shops.map((s) => ({
+      id: s.id,
+      shopName: s.shopName,
+      platform: s.platform,
+      region: s.platform.toLowerCase() === 'emag' && s.region == null ? 'RO' : s.region,
+      status: s.status,
+    }));
+    console.log('=== DASHBOARD SHOPS ===', safe.map((s) => s.shopName + (s.region ?? '')));
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({ code: 200, data: safe, message: 'success' });
+  } catch (err: any) {
+    console.error('[GET /api/dashboard/shops]', err?.message ?? err);
+    res.status(500).json({ code: 500, data: null, message: '获取仪表盘店铺列表失败' });
+  }
+});
 
 async function resolveShopId(req: Request): Promise<number> {
   const id = Number(req.body?.shopId ?? req.query?.shopId);

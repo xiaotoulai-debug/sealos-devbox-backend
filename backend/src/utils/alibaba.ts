@@ -111,8 +111,12 @@ export async function callAlibabaAPIPost<T = unknown>(
 
   const formData = new URLSearchParams({ ...allParams, _aop_signature: signature });
 
-  console.log(`[1688 API POST] 调用: ${apiPath}`);
-  console.log(`[1688 API POST] 参数 keys: [${Object.keys(bizParams).join(', ')}]`);
+  console.log('\n\n🔥🔥🔥 === 1688 最终发包全量参数 === 🔥🔥🔥');
+  console.log('API 方法:', apiPath);
+  console.log('完整参数:', JSON.stringify(bizParams, null, 2));
+  console.log('URL:', url);
+  console.log('FormBody (脱敏 access_token):', formData.toString().replace(/access_token=[^&]+/, 'access_token=***'));
+  console.log('🔥🔥🔥 ============================== 🔥🔥🔥\n\n');
 
   try {
     const response = await axios.post(url, formData.toString(), {
@@ -126,17 +130,19 @@ export async function callAlibabaAPIPost<T = unknown>(
       const ec = body.error_code ?? body.errorCode;
       const em = body.error_message ?? body.errorMessage ?? '未知错误';
       console.error(`[1688 API POST] ${apiPath} 业务错误 → code=${ec}, msg=${em}`);
-      console.error('[1688 API POST] 完整响应体:', JSON.stringify(body, null, 2).slice(0, 2000));
+      console.log('❌❌❌ 1688 深层报错响应（完整）❌❌❌', JSON.stringify(body, null, 2));
       return { success: false, data: null, errorCode: ec, errorMessage: em, raw: body };
     }
 
     console.log(`[1688 API POST] ${apiPath} 成功, 响应摘要:`, JSON.stringify(body).slice(0, 300));
     return { success: true, data: body as T, raw: body };
   } catch (err: unknown) {
-    const axErr = err as { response?: { data?: unknown; status?: number }; message?: string };
+    const axErr = err as { response?: { data?: unknown; status?: number }; message?: string; stack?: string };
+    console.log('❌❌❌ 1688 深层报错响应（Catch 完整）❌❌❌', axErr.response ? JSON.stringify(axErr.response.data ?? axErr.response, null, 2) : err);
     console.error(`[1688 API POST] ${apiPath} 网络/HTTP异常 → status=${axErr.response?.status}, msg=${axErr.message}`);
+    if (axErr.stack) console.error('[1688 API POST] 完整堆栈:', axErr.stack);
     if (axErr.response?.data) {
-      console.error('[1688 API POST] 异常响应体:', JSON.stringify(axErr.response.data, null, 2).slice(0, 2000));
+      console.error('[1688 API POST] 异常响应体:', JSON.stringify(axErr.response.data, null, 2));
     }
     return {
       success: false, data: null,
