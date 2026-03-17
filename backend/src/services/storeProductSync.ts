@@ -7,6 +7,7 @@
  * 双引擎抓图：attachments/images + documentation/find_by_eans + product/read Catalog
  */
 
+import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { EmagCredentials, getEmagCredentials, REGION_DOMAIN } from './emagClient';
 import { readProductOffers, findDocumentationByEans, readProductsByPnk } from './emagProduct';
@@ -210,8 +211,8 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
 
       await prisma.storeProduct.upsert({
         where: { shopId_pnk: { shopId: creds.shopId, pnk: np.pnk } },
-        create: data,
-        update: updateData,
+        create: data as Prisma.StoreProductCreateInput,
+        update: updateData as Prisma.StoreProductUpdateInput,
       });
 
       if (mainImage) {

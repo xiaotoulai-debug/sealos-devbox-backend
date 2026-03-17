@@ -2,8 +2,21 @@ import { Router, Request, Response } from 'express';
 import bcrypt from 'bcryptjs';
 import jwt from 'jsonwebtoken';
 import { prisma } from '../lib/prisma';
+import { authenticate } from '../middleware/auth';
 
 const router = Router();
+
+/**
+ * 从数据库实时查询某角色的全部权限 code 列表
+ * 不依赖 JWT 快照，保证返回的是当前最新权限
+ */
+async function fetchPermissionCodes(roleId: number): Promise<string[]> {
+  const rolePerms = await prisma.rolePermission.findMany({
+    where: { roleId },
+    select: { permission: { select: { code: true } } },
+  });
+  return rolePerms.map((rp) => rp.permission.code).filter(Boolean);
+}
 
 /**
  * POST /api/auth/login
@@ -40,15 +53,7 @@ router.post('/login', async (req: Request, res: Response) => {
         status:       true,
         passwordHash: true,
         role: {
-          select: {
-            id:   true,
-            name: true,
-            permissions: {
-              select: {
-                permission: { select: { code: true } },
-              },
-            },
-          },
+          select: { id: true, name: true },
         },
       },
     });
@@ -65,8 +70,11 @@ router.post('/login', async (req: Request, res: Response) => {
       return;
     }
 
-    // 提取该角色下所有权限 code（兼容 permission 可能为空）
-    const permissions = (user.role.permissions ?? []).map((rp) => rp.permission?.code).filter(Boolean) as string[];
+    // 实时查库获取最新权限 code（不依赖 Prisma 关联快照，确保 init-permissions 后立即生效）
+    const permissions = await fetchPermissionCodes(user.role.id);
+    if (permissions.length === 0) {
+      console.warn(`[login] 用户 ${username} 的角色「${user.role.name}」当前无任何权限，请确认 RolePermission 表已初始化`);
+    }
 
     // 签发 JWT，载荷包含身份、角色与权限信息
     const token = jwt.sign(
@@ -105,6 +113,59 @@ router.post('/login', async (req: Request, res: Response) => {
     console.error('[POST /api/auth/login] 500 错误:', detail);
     if (stack) console.error(stack);
     res.status(500).json({ code: 500, data: null, message: '服务器内部错误，请稍后重试' });
+  }
+});
+
+/**
+ * GET /api/auth/me
+ * 获取当前登录用户信息（实时查库），用于前端刷新页面后恢复权限状态
+ * - 权限 code 从数据库实时读取，不受 JWT 签发时快照影响
+ * - token 过期/无效时返回 401
+ */
+router.get('/me', authenticate, async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.userId;
+
+    const user = await prisma.user.findUnique({
+      where: { id: userId },
+      select: {
+        id:       true,
+        username: true,
+        name:     true,
+        avatar:   true,
+        status:   true,
+        role: {
+          select: { id: true, name: true },
+        },
+      },
+    });
+
+    if (!user || user.status === 'INACTIVE' || !user.role) {
+      res.status(401).json({ code: 401, data: null, message: '账号已被禁用，请联系管理员' });
+      return;
+    }
+
+    // 实时查库，确保权限变更后立即生效（无需重新登录）
+    const permissions = await fetchPermissionCodes(user.role.id);
+
+    res.json({
+      code: 200,
+      data: {
+        id:       user.id,
+        username: user.username,
+        name:     user.name,
+        avatar:   user.avatar,
+        role: {
+          id:   user.role.id,
+          name: user.role.name,
+        },
+        permissions,
+      },
+      message: 'success',
+    });
+  } catch (err) {
+    console.error('[GET /api/auth/me]', err instanceof Error ? err.message : err);
+    res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
   }
 });
 

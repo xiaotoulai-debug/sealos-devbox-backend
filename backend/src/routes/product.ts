@@ -345,14 +345,29 @@ router.get('/private/generate-sku', async (req: Request, res: Response) => {
 });
 
 // ── GET /api/products/private ──────────────────────────────────
-// 拉取当前用户的私有产品库，含财务数据，按采集时间倒序
+// 拉取意向产品池：
+//   - 超级管理员（roleName 含 admin/超级管理员，或同时拥有 MANAGE_ACCOUNTS + MANAGE_ROLES）可查全员数据
+//   - 普通员工只查自己的（ownerId = 当前用户）
 router.get('/private', async (req: Request, res: Response) => {
   try {
     const page     = Math.max(1, parseInt(String(req.query.page     ?? 1),  10) || 1);
     const pageSize = Math.min(100, Math.max(1, parseInt(String(req.query.pageSize ?? 20), 10) || 20));
     const skip     = (page - 1) * pageSize;
 
-    const where = { status: 'SELECTED' as const, ownerId: req.user!.userId };
+    const user = req.user!;
+    const roleNameLower = (user.roleName ?? '').toLowerCase();
+    const isSuperAdmin =
+      roleNameLower.includes('admin') ||
+      roleNameLower.includes('超级管理员') ||
+      user.permissions.includes('*') ||
+      user.permissions.includes('ALL') ||
+      user.permissions.includes('ADMIN_FULL') ||
+      (user.permissions.includes('MANAGE_ACCOUNTS') && user.permissions.includes('MANAGE_ROLES'));
+
+    const where: Record<string, unknown> = { status: 'SELECTED' as const };
+    if (!isSuperAdmin) {
+      where.ownerId = user.userId;  // 普通员工只能查看自己的意向产品
+    }
 
     const [total, products] = await prisma.$transaction([
       prisma.product.count({ where }),
@@ -521,18 +536,15 @@ router.get('/purchasing', async (req: Request, res: Response) => {
 });
 
 // ── GET /api/products/inventory ───────────────────────────────
-// 库存 SKU 列表：查询所有已建库（sku 非空）的产品
+// 库存 SKU 列表：查询所有已建库（sku 非空）的产品，全员可见全量数据
 router.get('/inventory', async (req: Request, res: Response) => {
   try {
-    const userId = req.user!.userId;
     const pageNum  = Math.max(1, Number(req.query.page)     || 1);
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 20));
     const keyword  = typeof req.query.keyword === 'string' ? req.query.keyword.trim() : '';
 
-    const where: Record<string, unknown> = {
-      ownerId: userId,
-      sku: { not: null },
-    };
+    // 库存 SKU 属于团队公共资源，不按 ownerId 过滤，全员可查全量
+    const where: Record<string, unknown> = { sku: { not: null } };
 
     if (keyword) {
       where.OR = [

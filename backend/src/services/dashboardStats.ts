@@ -42,7 +42,7 @@ export interface DashboardStats {
   totalGmv: number;
   daily: DailyStat[];
   results: number[];           // eMAG 返回的订单 ID 列表（空即无数据，如新授权店铺）
-  dataSource: 'emag_api';      // 明确标注：仅来自 eMAG API，非本地公海产品
+  dataSource: 'emag_api' | 'platform_orders';  // emag_api=API 拉取，platform_orders=本地已同步
 }
 
 /** 兼容旧版：单日统计（无 startDate/endDate 时） */

@@ -10,7 +10,7 @@ import {
   getValidAccessToken,
 } from '../utils/alibaba';
 import { createAlibabaOrder } from '../services/alibabaOrder';
-import { fetch1688OrderDetail } from '../services/alibabaOrderSync';
+import { fetch1688OrderDetail, isFetch1688OrderError } from '../services/alibabaOrderSync';
 import { get1688Item, normalizeOneboundSkus, type Onebound1688Response } from '../adapters/onebound.adapter';
 
 const router = Router();
@@ -733,7 +733,7 @@ router.post('/sync-1688-order', async (req: Request, res: Response) => {
     // ── 第三步：调用共享函数获取 1688 订单详情（必须走 res.result.baseInfo）────────────────
     const detail = await fetch1688OrderDetail(finalAliOrderId);
 
-    if ('error' in detail && detail.error) {
+    if (isFetch1688OrderError(detail)) {
       res.json({
         code: 200, data: null, success: false,
         message: detail.message,
