@@ -1,7 +1,30 @@
 import axios from 'axios';
+import HttpsProxyAgent from 'https-proxy-agent';
 import { prisma } from '../lib/prisma';
 import { decrypt } from '../utils/shopCrypto';
 import { updateRateLimitFromHeaders, shouldDelayNextSync, setDelayMultiplier } from './emagRateLimit';
+
+// ─── 正向代理配置（EMAG_PROXY_URL 环境变量驱动，空则直连）─────────
+// 格式: http://用户名:密码@代理IP:端口
+// Sealos 环境出口 IP 动态漂移，eMAG 要求固定 IP 白名单，故需经代理转发
+const EMAG_PROXY_URL = process.env.EMAG_PROXY_URL?.trim();
+
+/** 构建 httpsAgent（带代理）或 undefined（直连）*/
+function buildProxyAgent(): ReturnType<typeof HttpsProxyAgent> | undefined {
+  if (!EMAG_PROXY_URL) return undefined;
+  try {
+    const agent = HttpsProxyAgent(EMAG_PROXY_URL);
+    const masked = EMAG_PROXY_URL.replace(/:([^@/]+)@/, ':***@');
+    console.log(`[eMAG 代理] 已启用正向代理: ${masked}`);
+    return agent;
+  } catch (e) {
+    console.error('[eMAG 代理] 代理配置解析失败，将直连:', e instanceof Error ? e.message : e);
+    return undefined;
+  }
+}
+
+/** 全局单例 Agent（避免每次请求重建，减少 TLS 握手开销）*/
+const EMAG_HTTPS_AGENT = buildProxyAgent();
 
 // ═══════════════════════════════════════════════════════════════════
 // eMAG Marketplace API v4.5.0 — 核心客户端
@@ -261,6 +284,8 @@ export async function emagApiCall<T = any>(
       headers: { 'Authorization': `Basic ${basicAuth}`, 'Content-Type': 'application/json' },
       timeout: options.timeout ?? 30000,
       validateStatus: () => true,
+      // 所有发往 eMAG 的 HTTPS 请求经正向代理转发（EMAG_PROXY_URL 为空则直连）
+      ...(EMAG_HTTPS_AGENT ? { httpsAgent: EMAG_HTTPS_AGENT } : {}),
     });
     return { data: resp.data, headers: resp.headers ?? {}, status: resp.status };
   };
