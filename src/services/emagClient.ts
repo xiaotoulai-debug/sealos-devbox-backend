@@ -1,50 +1,54 @@
-import axios, { AxiosInstance } from 'axios';
-import HttpsProxyAgent from 'https-proxy-agent';
+import axios from 'axios';
 import { prisma } from '../lib/prisma';
 import { decrypt } from '../utils/shopCrypto';
 import { updateRateLimitFromHeaders, shouldDelayNextSync, setDelayMultiplier } from './emagRateLimit';
 
 // ═══════════════════════════════════════════════════════════════════
-// eMAG 专属 axios 实例（严禁修改全局 axios.defaults）
+// 代理策略：物理隔离，仅在 emagApiCall 内部按需构建 httpsAgent
 //
-// 代理配置通过 EMAG_PROXY_URL 环境变量驱动，仅作用于此实例。
-// 项目中所有非 eMAG 的请求（auth、1688、数据库等）使用默认 axios，
-// 完全不受此配置影响，不会经过代理服务器。
+// 全局 axios.defaults  → 绝不触碰
+// http.globalAgent      → 绝不触碰
+// https.globalAgent     → 绝不触碰
+// 模块顶层             → 不做任何代理初始化（防止加载失败拖垮 Express）
+//
+// 代理仅在 emagApiCall() 的 per-request 配置中注入 httpsAgent，
+// auth/login、1688、数据库等所有其他请求完全不受影响。
 // ═══════════════════════════════════════════════════════════════════
 
-const EMAG_PROXY_URL = process.env.EMAG_PROXY_URL?.trim();
+/** 懒加载的代理 Agent 缓存（首次 eMAG 请求时才初始化，而非模块加载时）*/
+let _cachedProxyAgent: any = undefined;     // undefined=未初始化, null=无代理/初始化失败, Agent=可用
+let _proxyInitialized = false;
 
 /**
- * 创建 eMAG 专属 axios 实例
- * - 有 EMAG_PROXY_URL → httpsAgent 指向正向代理（固定出口 IP）
- * - 无 EMAG_PROXY_URL → 直连（本地开发 / 已有固定 IP 时使用）
- * 绝不触碰 axios.defaults，零全局污染
+ * 懒加载获取 eMAG 专属 httpsAgent（首次调用时才 require + 初始化）
+ * 返回 Agent 实例或 null（无代理配置/初始化失败时直连）
+ * 绝不修改全局任何对象
  */
-function createEmagAxiosInstance(): AxiosInstance {
-  const instance = axios.create({
-    timeout: 30000,
-    headers: { 'Content-Type': 'application/json' },
-  });
+function getEmagProxyAgent(): any {
+  if (_proxyInitialized) return _cachedProxyAgent;
+  _proxyInitialized = true;
 
-  if (EMAG_PROXY_URL) {
-    try {
-      const agent = HttpsProxyAgent(EMAG_PROXY_URL);
-      // 仅为此实例注入 httpsAgent，对全局 axios 零影响
-      instance.defaults.httpsAgent = agent;
-      const masked = EMAG_PROXY_URL.replace(/:([^@/]+)@/, ':***@');
-      console.log(`[eMAG 代理] 专属实例已启用正向代理: ${masked}`);
-    } catch (e) {
-      console.error('[eMAG 代理] 代理配置解析失败，将直连:', e instanceof Error ? e.message : e);
-    }
-  } else {
-    console.log('[eMAG 代理] 未配置 EMAG_PROXY_URL，直连模式');
+  const proxyUrl = process.env.EMAG_PROXY_URL?.trim();
+  if (!proxyUrl) {
+    _cachedProxyAgent = null;
+    return null;
   }
 
-  return instance;
-}
+  try {
+    // 延迟 require，模块加载阶段完全无副作用
+    const HttpsProxyAgent = require('https-proxy-agent');
+    const createAgent = typeof HttpsProxyAgent === 'function' ? HttpsProxyAgent
+      : HttpsProxyAgent.default ?? HttpsProxyAgent.HttpsProxyAgent;
+    _cachedProxyAgent = createAgent(proxyUrl);
+    const masked = proxyUrl.replace(/:([^@/]+)@/, ':***@');
+    console.log(`[eMAG 代理] 已就绪（仅用于 eMAG API 请求）: ${masked}`);
+  } catch (e) {
+    console.error('[eMAG 代理] 初始化失败，eMAG 请求将直连:', e instanceof Error ? e.message : e);
+    _cachedProxyAgent = null;
+  }
 
-/** eMAG 专属 HTTP 客户端（模块加载时初始化一次，全生命周期复用）*/
-const emagAxios: AxiosInstance = createEmagAxiosInstance();
+  return _cachedProxyAgent;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // eMAG Marketplace API v4.5.0 — 核心客户端
@@ -300,11 +304,15 @@ export async function emagApiCall<T = any>(
   console.log(`[eMAG] POST ${url}  shop=${creds.region} resource=${resource}/${action}`);
 
   const doRequest = async (): Promise<{ data: any; headers: Record<string, any>; status: number }> => {
-    // 使用 eMAG 专属 axios 实例发请求（httpsAgent 已在实例级别配置，不污染全局 axios）
-    const resp = await emagAxios.post(url, { data }, {
-      headers: { 'Authorization': `Basic ${basicAuth}` },
+    // 每次请求时获取代理 Agent（懒加载，首次调用才初始化）
+    const proxyAgent = getEmagProxyAgent();
+
+    const resp = await axios.post(url, { data }, {
+      headers: { 'Authorization': `Basic ${basicAuth}`, 'Content-Type': 'application/json' },
       timeout: options.timeout ?? 30000,
       validateStatus: () => true,
+      // 仅在此 per-request config 注入 httpsAgent，不碰 axios.defaults
+      ...(proxyAgent ? { httpsAgent: proxyAgent, proxy: false } : {}),
     });
     return { data: resp.data, headers: resp.headers ?? {}, status: resp.status };
   };
