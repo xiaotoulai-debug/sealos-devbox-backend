@@ -5,7 +5,7 @@ import { authenticate } from '../middleware/auth';
 import { getIsSyncing, tryAcquireSyncLock, releaseSyncLock } from '../lib/syncStatus';
 import { syncPlatformOrdersForShop, syncAllPlatformOrders } from '../services/platformOrderSync';
 import { statusMap } from '../services/emagOrder';
-import { syncAndUpdatePurchaseOrderItem } from '../services/alibabaOrderSync';
+import { syncAndUpdatePurchaseOrderItem, isFetch1688OrderError } from '../services/alibabaOrderSync';
 
 function toStatusText(status: number): string {
   return statusMap[status] ?? `状态${status}`;
@@ -509,7 +509,7 @@ router.get('/:id/products', async (req: Request, res: Response) => {
           // ★ 金额为 null 时自动触发 1688 内联同步（必须走 res.result.baseInfo）
           if ((totalAmount == null || shippingFee == null) && item.alibabaOrderId) {
             const synced = await syncAndUpdatePurchaseOrderItem(item.id, item.alibabaOrderId);
-            if (synced && !('error' in synced && synced.error)) {
+            if (synced && !isFetch1688OrderError(synced)) {
               totalAmount = synced.totalAmount;
               shippingFee = synced.shippingFee;
               status = synced.status;

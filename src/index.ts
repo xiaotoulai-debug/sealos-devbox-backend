@@ -19,6 +19,7 @@ import shopRouter    from './routes/shop';
 import emagRouter    from './routes/emag';
 import dashboardRouter from './routes/dashboard';
 import storeProductsRouter from './routes/storeProducts';
+import permissionRouter from './routes/permission';
 import { startSyncCrons } from './services/syncCron';
 import { backfillProductImages } from './services/storeProductSync';
 
@@ -42,7 +43,8 @@ app.use('/api/products', productRouter);   // GET  /api/products  POST /api/prod
 app.use('/api/orders',         orderRouter);  // POST /api/orders  GET /api/orders  POST /api/orders/sync
 app.use('/api/platform-orders', orderRouter); // 别名，兼容前端「平台订单」页面
 app.use('/api/users',    userRouter);      // GET POST PATCH DELETE /api/users
-app.use('/api/roles',    roleRouter);      // GET /api/roles
+app.use('/api/roles',       roleRouter);       // GET/POST/PUT/DELETE /api/roles
+app.use('/api/permissions', permissionRouter); // GET /api/permissions/tree
 app.use('/api/alibaba', alibabaRouter);  // 1688 授权 & 规格关联
 app.use('/api/procurement', alibabaRouter); // 别名，兼容前端 /api/procurement/parse-link、/bind 等
 app.use('/api/shops',   shopRouter);    // 多平台店铺授权管理

@@ -17,7 +17,6 @@
     "migrate:data": "tsx scripts/migrate-data.ts",
     "migrate:emag-region": "tsx scripts/migrate-emag-region.ts",
     "backfill:product-images": "node -r ./scripts/preload-file-polyfill.js -r tsx/cjs scripts/backfill-product-images.ts",
-    "force-complete:product-images": "node -r ./scripts/preload-file-polyfill.js -r tsx/cjs scripts/force-complete-product-images.ts",
     "cleanup:placeholder-images": "node -r ./scripts/preload-file-polyfill.js -r tsx/cjs scripts/cleanup-placeholder-images.ts",
     "backfill:product-urls": "node -r ./scripts/preload-file-polyfill.js -r tsx/cjs scripts/backfill-product-urls.ts",
     "inspect:emag-product": "node -r ./scripts/preload-file-polyfill.js -r tsx/cjs scripts/inspect-emag-product-response.ts",

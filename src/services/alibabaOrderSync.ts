@@ -22,6 +22,10 @@ export interface Fetch1688OrderError {
   raw?: unknown;
 }
 
+export function isFetch1688OrderError(r: Fetch1688OrderResult | Fetch1688OrderError): r is Fetch1688OrderError {
+  return 'error' in r && (r as Fetch1688OrderError).error === true;
+}
+
 /**
  * 调用 1688 alibaba.trade.get.buyerView（详情接口），按 orderId 查单笔详情
  * 请求参数：orderId = externalOrderId（该采购项的 1688 订单号）
@@ -101,7 +105,7 @@ export async function syncAndUpdatePurchaseOrderItem(
   alibabaOrderId: string
 ): Promise<Fetch1688OrderResult | Fetch1688OrderError> {
   const detail = await fetch1688OrderDetail(alibabaOrderId);
-  if ('error' in detail && detail.error) return detail;
+  if (isFetch1688OrderError(detail)) return detail;
 
   await prisma.purchaseOrderItem.update({
     where: { id: purchaseOrderItemId },
