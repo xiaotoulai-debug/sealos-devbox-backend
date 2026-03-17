@@ -2,20 +2,20 @@
 
 app_env=${1:-development}
 
-# Define build target
-build_target="hello_world"
-
-# Development environment commands
+# Development environment commands (开发机运行的命令)
 dev_commands() {
     echo "Running development environment commands..."
-    NODE_ENV=development node "${build_target}.js"
+    # 进入后端目录并启动开发服务
+    cd backend
+    npm run dev
 }
 
-# Production environment commands
-# ※Compiled before release
+# Production environment commands (发版后正式服运行的命令)
 prod_commands() {
     echo "Running production environment commands..."
-    NODE_ENV=production node "${build_target}.js"
+    # 进入后端目录并启动正式服务
+    cd backend
+    npm run start
 }
 
 # Check environment variables to determine the running environment

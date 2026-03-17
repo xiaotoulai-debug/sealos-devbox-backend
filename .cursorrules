@@ -48,3 +48,25 @@
 - 任何涉及 eMAG 平台的 API 抓取、解析、同步逻辑，必须严格参考 `docs/emag-marketplace-api-documentation-v4.4.7.pdf`。
 - 严禁随意猜测数据结构（如将数组猜成字符串）。所有字段映射必须与文档的 Key 严格一致。
 - 后端的责任是把 eMAG 复杂的嵌套数据（如图片数组），清洗并转换为我们 ERP 数据库的扁平标准格式（如单一的 `imageUrl` 字符串）后再吐给前端。
+
+
+## eMAG 代理架构隔离准则 (Proxy Isolation Rules)
+
+### 核心原则
+1. **严禁修改全局配置**：禁止任何修改 `axios.defaults`、`axios.interceptors` 全局实例或 `https.globalAgent` 的行为。
+2. **专属实例模式**：所有发往 eMAG API (域名包含 *.emag.ro 或相关站点) 的请求，**必须且只能**使用专属的 `emagAxios` 实例。
+3. **环境驱动**：代理配置必须通过环境变量 `process.env.EMAG_PROXY_URL` 动态驱动，严禁在代码中硬编码 IP 地址。
+
+### 流量路由规则
+- **内部请求 (Auth, Login, Database, CORS Preflight)**: 必须保持【直连】，严禁经过代理。
+- **其他第三方 API (如 1688)**: 默认保持【直连】，除非明确要求。
+- **eMAG 站点请求**: 必须经过 `EMAG_PROXY_URL` 指定的正向代理转发。
+
+### 强制代码模式
+当需要创建或修改 eMAG 相关 API 时，必须检查代码是否符合以下逻辑：
+- 检查是否存在 `axios.create({ ... })` 创建的独立实例。
+- 检查 `httpsAgent` 是否仅注入到了该独立实例中。
+- 严禁在 `auth/login` 等本地认证接口的调用路径中出现任何代理相关的逻辑。
+
+### 违反后果
+- 如果 AI 试图修改全局 axios 默认值，请立即停止并报错提醒：“违反代理隔离准则：禁止修改全局网络配置。”
