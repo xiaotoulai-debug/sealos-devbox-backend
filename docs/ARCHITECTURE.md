@@ -51,7 +51,10 @@ backend/
 │   │   │                      # GET  /api/auth/me     — 当前用户信息（实时权限码，刷新页面用）
 │   │   ├── product.ts         # 公海产品(PENDING)查询、意向产品(SELECTED)增删改查、库存SKU管理
 │   │   │                      #   ★ 意向产品数据隔离：超管看全部，普通员工只看自己(ownerId)
-│   │   │                      #   ★ 库存SKU全员可见（无 ownerId 过滤）
+│   │   │                      #   ★ 库存SKU全员可见（无 ownerId 过滤）；isDeleted=true 自动过滤
+│   │   │                      #   DELETE /api/products/inventory/:id — 智能混合删除
+│   │   │                      #     → 无关联数据：物理删除（hard），返回 deleteType='hard'
+│   │   │                      #     → 有 FK 约束(P2003)：软删除归档（soft），返回 deleteType='soft'
 │   │   ├── order.ts           # 采购单、平台订单 CRUD
 │   │   ├── user.ts            # 员工管理（增删改查）
 │   │   ├── role.ts            # 角色 CRUD（含超管保护）
@@ -66,17 +69,19 @@ backend/
 │   │   │                      #   GET /api/permissions       — 权限平铺列表（供角色回显已选权限）
 │   │   ├── shop.ts            # 店铺授权（增删改查）+ GET /api/shops/authorized（仪表盘下拉专用）
 │   │   ├── emag.ts            # eMAG 业务（类目、发布、同步触发）
-│   │   ├── storeProducts.ts   # 店铺在售产品（同步、补图、综合日销回填）
-│   │   │                      #   GET  /api/store-products   — 分页列表（联表 mappedInventory 兜底图片）
-│   │   │                      #   POST /api/store-products/sync — 手动全量同步
+│   │   ├── storeProducts.ts   # 店铺在售产品（同步、补图、综合日销回填、库存绑定）
+│   │   │                      #   GET  /api/store-products          — 分页列表（mappingStatus=mapped/unmapped/all 筛选；优先 Product 表查图片/成本）
+│   │   │                      #   POST /api/store-products/sync     — 手动全量同步
+│   │   │                      #   POST /api/store-products/map      — 绑定库存 SKU（★ SKU 字符串优先匹配，inventorySkuId 兜底；pnk+shopId 或 storeProductId 定位平台产品）
 │   │   ├── dashboard.ts       # 业绩看板（stats、shops 下拉）
+│   │   ├── translate.ts       # 翻译代理（MyMemory API 转发，ro→zh 等）
 │   │   └── alibaba.ts         # 1688 OAuth、规格解析、下单、子单同步
 │   ├── services/              # 核心业务逻辑
 │   │   ├── emagClient.ts      # eMAG API 客户端（Adapter）：BaseURL/货币/域名按 region 查表
 │   │   │                      # ★ 正向代理：所有 HTTPS 请求经 EMAG_PROXY_URL 代理转发（固定 IP 白名单）
 │   │   ├── emagProduct.ts     # product_offer/read、product/read、documentation/find_by_eans
 │   │   ├── emagProductNormalizer.ts  # 唯一 Normalizer：解析、图片提纯、输出统一结构
-│   │   ├── storeProductSync.ts       # 两段式同步编排 + Prisma include mappedInventory 本地图兜底
+│   │   ├── storeProductSync.ts       # 两段式同步编排（补全 mainImage）
 │   │   ├── alibabaOrder.ts           # 1688 下单 payload 组装与发送
 │   │   ├── alibabaOrderSync.ts       # 1688 子单详情同步（buyerView），isFetch1688OrderError 类型守卫
 │   │   ├── platformOrderSync.ts      # 平台订单同步（多店全量/增量）
@@ -179,7 +184,7 @@ erDiagram
 
 ---
 
-## 3. eMAG 核心业务流线图 — 两段式深层抓取 + 本地关联 SKU 兜底
+## 3. eMAG 核心业务流线图 — 两段式深层抓取 + 库存 SKU 绑定兜底
 
 ```mermaid
 graph TD
@@ -195,7 +200,7 @@ graph TD
     J --> K[Normalizer 再次清洗]
     K --> L[补全 main_image 回写 StoreProduct]
     L --> M[GET /api/store-products 列表接口]
-    M --> N[Prisma include mappedInventory 联表]
+    M --> N[查 Product 表获取 localImage/cost，兜底 Inventory 表]
     N --> O[图片回退: emagImage \|\| localImage]
     O --> P[统一输出 image/imageUrl/main_image]
 ```
@@ -213,10 +218,16 @@ graph TD
 | 无图提取 | `StoreProduct.findMany` | `mainImage` 为 null 或空 |
 | Catalog API | `emagProduct.readProductsByPnk` | `product/read` 批量查询完整产品详情（含 images） |
 | 补全入库 | `prisma.storeProduct.updateMany` | 回写 `mainImage`、`imageUrl` |
-| **本地关联 SKU 兜底** | `StoreProduct.mappedInventory` | 通过 `mapped_inventory_sku` 关联 `Inventory`，列表接口联表查询；图片优先级：**平台图 > 本地图** |
-| 列表接口 | `GET /api/store-products` | `include: { mappedInventory }` 联表；`finalImage = emagImage \|\| localImage`；统一输出 `image`/`imageUrl`/`main_image` |
+| **库存 SKU 绑定兜底** | `StoreProduct.mappedInventorySku` (String?) | 存储 `Product.sku` 字符串（**无 FK 约束**）；列表接口用该值去 `Product` 表查图片/成本，兜底 `Inventory` 表；图片优先级：**平台图 > 本地库存图** |
+| 列表接口 | `GET /api/store-products` | 先查 `Product` 表批量获取 `imageUrl`/`purchasePrice`，缺失时再查 `Inventory` 表；`finalImage = emagImage \|\| localImage`；统一输出 `image`/`imageUrl`/`main_image` |
 
-> **跟卖产品图片说明**：eMAG 的 `product_offer/read` 对跟卖(follow)产品不返回图片。采用【本地关联 SKU 兜底策略】：在后台将平台产品与本地库存 SKU 关联（`mapped_inventory_sku`），列表接口优先返回平台图，无图时自动回退到关联库存的 `local_image`。
+> **跟卖产品图片说明**：eMAG 的 `product_offer/read` 对跟卖(follow)产品不返回图片。采用【库存 SKU 绑定兜底策略】：通过 `POST /api/store-products/map` 手动绑定。
+>
+> **绑定接口参数解析优先级（2026-03-12 修正）**：
+> - **库存 SKU 定位**：★ 优先按 `inventorySku` 字符串查 `Product.sku`（唯一业务键，最可靠）；字符串未命中时才按 `inventorySkuId` 查 `Product.id` 兜底。原因：前端传的 `inventorySkuId` 可能与 `Product.id` 不一致。
+> - **平台产品定位**：支持 `pnk+shopId`（自动查 `StoreProduct` 联合索引）或直传 `storeProductId`。
+>
+> **架构变更说明（2026-03-12）**：`StoreProduct.mappedInventorySku` 原有 `→ Inventory.sku` 的 DB 级外键约束已移除。"库存 SKU" 主数据现统一在 `Product` 表管理，`Inventory` 表作为历史兜底数据源保留。
 
 ---
 
@@ -346,17 +357,19 @@ graph TD
 | `GET /api/permissions` | `routes/permission.ts` | 权限平铺列表（角色回显已选权限） |
 | `GET/POST/PUT/DELETE /api/users` | `routes/user.ts` | 员工管理 |
 | `GET /api/products` | `routes/product.ts` | 公海产品列表（全员可见） |
-| `GET /api/products/private` | `routes/product.ts` | 意向产品列表（★数据隔离：超管全看/员工看自己） |
+| `GET /api/products/private` | `routes/product.ts` | 意向产品列表（★数据隔离：超管全看/员工看自己；★强制过滤：`status=SELECTED AND pnk NOT LIKE 'MAN-%'`，手动导入老 SKU 不进意向池，正常 eMAG 产品建库后继续留在意向池直到 PURCHASING） |
 | `GET /api/products/inventory` | `routes/product.ts` | 库存 SKU 列表（全员可见） |
-| `GET /api/store-products` | `routes/storeProducts.ts` | 店铺平台产品分页列表（含图片兜底、排序） |
+| `GET /api/store-products` | `routes/storeProducts.ts` | 店铺平台产品分页列表（含图片兜底、排序；`mappingStatus=mapped/unmapped/all` 关联状态筛选） |
 | `POST /api/store-products/sync` | `routes/storeProducts.ts` | 手动触发全量同步 |
 | `POST /api/store-products/backfill-comprehensive-sales` | `routes/storeProducts.ts` | 综合日销全量回填 |
+| `POST /api/store-products/map` | `routes/storeProducts.ts` | 绑定平台产品与库存 SKU（★ SKU 字符串优先 → inventorySkuId 兜底；pnk+shopId 或 storeProductId 定位平台产品） |
 | `GET/POST /api/shops` | `routes/shop.ts` | 店铺授权管理 |
 | `GET /api/shops/authorized` | `routes/shop.ts` | 仪表盘下拉专用（eMAG 活跃店铺） |
 | `GET /api/dashboard/*` | `routes/dashboard.ts` | 业绩看板数据 |
 | `GET/POST /api/orders` | `routes/order.ts` | 采购单/平台订单 |
 | `POST /api/alibaba/*` | `routes/alibaba.ts` | 1688 OAuth/解析/下单/子单同步 |
 | `POST /api/emag/*` | `routes/emag.ts` | eMAG 类目同步/产品发布 |
+| `POST /api/translate` | `routes/translate.ts` | 翻译代理（MyMemory API 转发，罗马尼亚语→中文等，需登录） |
 
 ---
 
