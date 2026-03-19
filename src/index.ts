@@ -20,6 +20,7 @@ import emagRouter    from './routes/emag';
 import dashboardRouter from './routes/dashboard';
 import storeProductsRouter from './routes/storeProducts';
 import permissionRouter from './routes/permission';
+import translateRouter from './routes/translate';
 import { startSyncCrons } from './services/syncCron';
 import { backfillProductImages } from './services/storeProductSync';
 
@@ -52,6 +53,7 @@ app.use('/api/shop',    shopRouter);    // 别名，兼容前端 /api/shop/:id
 app.use('/api/emag',    emagRouter);    // eMAG 核心业务 API
 app.use('/api/dashboard', dashboardRouter); // 实时业绩看板
 app.use('/api/store-products', storeProductsRouter); // 店铺在售产品（仅 StoreProduct，不混公海）
+app.use('/api/translate', translateRouter);          // 翻译代理（MyMemory API 转发）
 
 // ── 启动时打印关键路由（确认 sync-urls 已注册）────────────────────
 function printRegisteredRoutes() {

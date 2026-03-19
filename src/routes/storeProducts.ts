@@ -180,47 +180,128 @@ router.post('/backfill-comprehensive-sales', async (req: Request, res: Response)
 /**
  * POST /api/store-products/map
  * 手动绑定平台产品与库存 SKU
- * Body: { storeProductId: number, inventorySku: string }
+ *
+ * "库存 SKU" 在本系统中指 Product 表里 sku 字段非空的记录（非 Inventory 表）。
+ * Body 支持两种方式（向前兼容）：
+ *   方式 A（推荐）: { pnk, shopId, inventorySkuId }   ← inventorySkuId = Product.id
+ *   方式 B（兼容）: { storeProductId, inventorySku }   ← 直接传内部 ID + SKU 字符串
+ *
+ * 后端会优先用 pnk+shopId 查出 storeProductId，用 inventorySkuId 查出真实 sku 字符串，再执行绑定。
  */
 router.post('/map', async (req: Request, res: Response) => {
   try {
-    const storeProductId = Number(req.body?.storeProductId ?? req.query?.storeProductId);
-    const inventorySku = String(req.body?.inventorySku ?? req.query?.inventorySku ?? '').trim();
-    if (!storeProductId || isNaN(storeProductId)) {
-      res.status(400).json({ code: 400, data: null, message: '请提供 storeProductId' });
-      return;
-    }
-    if (!inventorySku) {
-      res.status(400).json({ code: 400, data: null, message: '请提供 inventorySku' });
+    const body = req.body ?? {};
+
+    // ── Step 1：解析目标平台产品 ID（storeProductId）──────────────
+    let storeProductId: number | undefined;
+
+    if (body.storeProductId) {
+      storeProductId = Number(body.storeProductId);
+      if (isNaN(storeProductId) || storeProductId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'storeProductId 格式无效' });
+        return;
+      }
+    } else if (body.pnk && body.shopId) {
+      const pnk    = String(body.pnk).trim();
+      const shopId = Number(body.shopId);
+      if (!pnk || isNaN(shopId) || shopId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'pnk 或 shopId 格式无效' });
+        return;
+      }
+      const found = await prisma.storeProduct.findUnique({
+        where:  { shopId_pnk: { shopId, pnk } },
+        select: { id: true },
+      });
+      if (!found) {
+        res.status(404).json({
+          code: 404,
+          data: null,
+          message: `在店铺 ${shopId} 中找不到 PNK 为 "${pnk}" 的平台产品，请先同步产品数据`,
+        });
+        return;
+      }
+      storeProductId = found.id;
+    } else {
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: '请提供 storeProductId，或同时提供 pnk 和 shopId',
+      });
       return;
     }
 
-    const inv = await prisma.inventory.findUnique({
-      where: { sku: inventorySku },
-      select: { sku: true },
-    });
-    if (!inv) {
-      res.status(400).json({ code: 400, data: null, message: `库存 SKU "${inventorySku}" 不存在，请先在 Inventory 表中创建` });
+    // ── Step 2：解析并校验库存 SKU ────────────────────────────────
+    // "库存 SKU" = Product 表中 sku 非空的记录。
+    // ★ 优先用 inventorySku 字符串（SKU 编号是唯一业务键，最可靠）。
+    //   inventorySkuId（Product.id）仅在字符串未提供时作为兜底。
+    //   前端可能同时传 inventorySkuId 和 inventorySku，但两者 ID 不一定一致（前端列表的 id
+    //   可能来自搜索时的分页偏移，不保证等于 Product.id），所以字符串匹配最稳。
+    const rawSkuStr = String(body.inventorySku ?? '').trim();
+    const rawSkuId  = body.inventorySkuId ? Number(body.inventorySkuId) : NaN;
+
+    if (!rawSkuStr && isNaN(rawSkuId)) {
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: '请提供 inventorySku（SKU 编号）或 inventorySkuId（库存记录 ID）',
+      });
       return;
     }
 
+    let resolvedSku: string | null = null;
+
+    // 路径 A（优先）：按 SKU 字符串精确查 Product.sku
+    if (rawSkuStr) {
+      const product = await prisma.product.findUnique({
+        where:  { sku: rawSkuStr },
+        select: { id: true, sku: true },
+      });
+      if (product?.sku) {
+        resolvedSku = product.sku;
+      }
+    }
+
+    // 路径 B（兜底）：字符串没找到时按 inventorySkuId 查 Product.id
+    if (!resolvedSku && !isNaN(rawSkuId) && rawSkuId > 0) {
+      const product = await prisma.product.findUnique({
+        where:  { id: rawSkuId },
+        select: { id: true, sku: true },
+      });
+      if (product?.sku) {
+        resolvedSku = product.sku;
+      }
+    }
+
+    // 两条路径都没命中 → 报错
+    if (!resolvedSku) {
+      const hint = rawSkuStr ? `SKU "${rawSkuStr}"` : `ID ${rawSkuId}`;
+      res.status(404).json({
+        code: 404,
+        data: null,
+        message: `找不到 ${hint} 对应的库存 SKU 记录，请确认 SKU 是否已在库存管理中创建`,
+      });
+      return;
+    }
+
+    // ── Step 3：校验平台产品存在 ──────────────────────────────────
     const sp = await prisma.storeProduct.findUnique({
-      where: { id: storeProductId },
-      select: { id: true, shopId: true },
+      where:  { id: storeProductId },
+      select: { id: true, pnk: true, shopId: true },
     });
     if (!sp) {
       res.status(404).json({ code: 404, data: null, message: '平台产品不存在' });
       return;
     }
 
+    // ── Step 4：执行绑定 ──────────────────────────────────────────
     await prisma.storeProduct.update({
       where: { id: storeProductId },
-      data: { mappedInventorySku: inventorySku },
+      data:  { mappedInventorySku: resolvedSku },
     });
 
     res.json({
       code: 200,
-      data: { storeProductId, inventorySku },
+      data: { storeProductId, pnk: sp.pnk, shopId: sp.shopId, inventorySku: resolvedSku },
       message: '绑定成功',
     });
   } catch (err) {
@@ -279,17 +360,53 @@ router.get('/', async (req: Request, res: Response) => {
 
     console.log('=== BACKEND Prisma OrderBy ===', orderBy, { rawSortBy, rawSortOrder, hasValidSort });
 
-    const where: { shopId: number; OR?: Array<{ sku?: { contains: string; mode: 'insensitive' }; ean?: { contains: string; mode: 'insensitive' }; pnk?: { contains: string; mode: 'insensitive' } }> } = { shopId };
-    if (search) {
-      const q = { contains: search, mode: 'insensitive' as const };
+    // mappingStatus 筛选：'mapped' | 'unmapped' | 'all'（默认 all）
+    const mappingStatus = String(req.query.mappingStatus ?? 'all').trim().toLowerCase();
+
+    // Prisma 无法在一条 where 里同时表达「IS NULL OR = ''」，使用 OR 组合处理空字符串边界
+    type WhereClause = {
+      shopId: number;
+      OR?: Array<Record<string, unknown>>;
+      AND?: Array<Record<string, unknown>>;
+    };
+    const where: WhereClause = { shopId };
+
+    if (mappingStatus === 'mapped') {
+      // 已关联：mappedInventorySku 不为 null 且不为空字符串
+      where.AND = [
+        { mappedInventorySku: { not: null } },
+        { mappedInventorySku: { not: '' } },
+      ];
+    } else if (mappingStatus === 'unmapped') {
+      // 未关联：mappedInventorySku 为 null 或为空字符串
       where.OR = [
-        { sku: q },
-        { ean: q },
-        { pnk: q },
+        { mappedInventorySku: null },
+        { mappedInventorySku: '' },
       ];
     }
 
-    // 分页必须分离查数据与查总数；联表 include 关联的本地库存（mapped_inventory_sku -> Inventory）
+    if (search) {
+      const q = { contains: search, mode: 'insensitive' as const };
+      // 若已有 OR（unmapped 场景），需将搜索条件与现有 OR 通过 AND 组合
+      if (mappingStatus === 'unmapped') {
+        const existingOr = where.OR;
+        delete where.OR;
+        where.AND = [
+          { OR: existingOr } as Record<string, unknown>,
+          { OR: [{ sku: q }, { ean: q }, { pnk: q }] } as Record<string, unknown>,
+        ];
+      } else {
+        // mapped / all 场景：直接追加搜索 OR
+        const searchOr = [{ sku: q }, { ean: q }, { pnk: q }];
+        if (where.AND) {
+          where.AND.push({ OR: searchOr } as Record<string, unknown>);
+        } else {
+          where.OR = searchOr as WhereClause['OR'];
+        }
+      }
+    }
+
+    // 分页必须分离查数据与查总数；mappedInventorySku 已改为纯字符串，不再 include Inventory
     const [list, total] = await Promise.all([
       prisma.storeProduct.findMany({
         where,
@@ -298,7 +415,6 @@ router.get('/', async (req: Request, res: Response) => {
         take: limit,
         include: {
           shop: { select: { shopName: true, region: true } },
-          mappedInventory: { select: { localImage: true, purchaseCost: true, weight: true } },
         },
       }),
       prisma.storeProduct.count({ where }), // 仅 where，无 skip/take，返回符合条件的绝对总条数
@@ -319,6 +435,7 @@ router.get('/', async (req: Request, res: Response) => {
     }
     const { map: salesMap, skusWithSales } = await getSalesStatsByShop(shopId, forceRefresh);
 
+    // 收集所有需要查询成本/图片的 SKU 字符串
     const skusToFetch = new Set<string>();
     for (const p of list) {
       const mapped = (p.mappedInventorySku ?? '').trim();
@@ -329,18 +446,41 @@ router.get('/', async (req: Request, res: Response) => {
         if (fallback) skusToFetch.add(fallback);
       }
     }
+
+    // inventoryMap：优先从 Product 表查（库存 SKU 主数据），兜底从 Inventory 表查（历史数据）
     const inventoryMap = new Map<string, { localImage: string | null; purchaseCost: number; weight: number | null }>();
     if (skusToFetch.size > 0) {
-      const invList = await prisma.inventory.findMany({
-        where: { sku: { in: [...skusToFetch] } },
-        select: { sku: true, localImage: true, purchaseCost: true, weight: true },
+      const skuArr = [...skusToFetch];
+
+      // 优先：从 Product 表查（imageUrl → localImage，purchasePrice → purchaseCost）
+      const productList = await prisma.product.findMany({
+        where: { sku: { in: skuArr } },
+        select: { sku: true, imageUrl: true, purchasePrice: true, actualWeight: true },
       });
-      for (const inv of invList) {
-        inventoryMap.set(inv.sku, {
-          localImage: inv.localImage ?? null,
-          purchaseCost: Number(inv.purchaseCost ?? 0),
-          weight: inv.weight != null ? Number(inv.weight) : null,
+      for (const prod of productList) {
+        if (prod.sku) {
+          inventoryMap.set(prod.sku, {
+            localImage:   prod.imageUrl ?? null,
+            purchaseCost: Number(prod.purchasePrice ?? 0),
+            weight:       prod.actualWeight != null ? Number(prod.actualWeight) : null,
+          });
+        }
+      }
+
+      // 兜底：从 Inventory 表查（历史条目补充 Product 没有的 SKU）
+      const missingSkus = skuArr.filter((s) => !inventoryMap.has(s));
+      if (missingSkus.length > 0) {
+        const invList = await prisma.inventory.findMany({
+          where: { sku: { in: missingSkus } },
+          select: { sku: true, localImage: true, purchaseCost: true, weight: true },
         });
+        for (const inv of invList) {
+          inventoryMap.set(inv.sku, {
+            localImage:   inv.localImage ?? null,
+            purchaseCost: Number(inv.purchaseCost ?? 0),
+            weight:       inv.weight != null ? Number(inv.weight) : null,
+          });
+        }
       }
     }
 
@@ -359,7 +499,7 @@ router.get('/', async (req: Request, res: Response) => {
       const isRejected = validationStatusDisplay === '已驳回';
 
       const skuKey = (p.mappedInventorySku ?? '').trim() || (p.sku ?? p.vendorSku ?? '').trim();
-      const inv = p.mappedInventory ?? (skuKey ? inventoryMap.get(skuKey) : undefined);
+      const inv = skuKey ? inventoryMap.get(skuKey) : undefined;
 
       // 核心回退逻辑：优先平台图，平台没图用本地关联 SKU 兜底
       const emagImage = p.mainImage ?? p.imageUrl ?? null;

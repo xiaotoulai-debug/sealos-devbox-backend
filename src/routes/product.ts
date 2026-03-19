@@ -364,7 +364,16 @@ router.get('/private', async (req: Request, res: Response) => {
       user.permissions.includes('ADMIN_FULL') ||
       (user.permissions.includes('MANAGE_ACCOUNTS') && user.permissions.includes('MANAGE_ROLES'));
 
-    const where: Record<string, unknown> = { status: 'SELECTED' as const };
+    // 意向产品定义：
+    //   - status = SELECTED
+    //   - pnk 不以 "MAN-" 开头（MAN- 是手动导入老 SKU 的虚构 pnk，直接进库存，不进意向池）
+    //   - isDeleted = false
+    // 注意：正常 eMAG 产品建库后（有 sku）依然留在意向池，直到 PURCHASING 才离开
+    const where: Record<string, unknown> = {
+      status:    'SELECTED' as const,
+      isDeleted: false,
+      NOT: { pnk: { startsWith: 'MAN-' } },  // ★ 排除手动导入的老记录
+    };
     if (!isSuperAdmin) {
       where.ownerId = user.userId;  // 普通员工只能查看自己的意向产品
     }
@@ -543,8 +552,8 @@ router.get('/inventory', async (req: Request, res: Response) => {
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 20));
     const keyword  = typeof req.query.keyword === 'string' ? req.query.keyword.trim() : '';
 
-    // 库存 SKU 属于团队公共资源，不按 ownerId 过滤，全员可查全量
-    const where: Record<string, unknown> = { sku: { not: null } };
+    // 库存 SKU 属于团队公共资源，不按 ownerId 过滤，全员可查全量；排除已软删除记录
+    const where: Record<string, unknown> = { sku: { not: null }, isDeleted: false };
 
     if (keyword) {
       where.OR = [
@@ -1012,19 +1021,29 @@ router.post('/inventory-create', async (req: Request, res: Response) => {
 });
 
 // ── POST /api/products/inventory-batch-create ─────────────────
-// 批量创建库存 SKU 产品
+// 批量创建库存 SKU 产品（鉴权由顶层 router.use(authenticate) 保证）
 router.post('/inventory-batch-create', async (req: Request, res: Response) => {
   try {
-    const userId = req.user!.userId;
-    const { items } = req.body ?? {};
-    if (!Array.isArray(items) || items.length === 0) {
-      res.status(400).json({ code: 400, data: null, message: '请提供产品数据' });
+    // ① 鉴权防守：authenticate 中间件已挂载，此处做二次兜底
+    const userId = req.user?.userId;
+    if (!userId || typeof userId !== 'number') {
+      res.status(401).json({ code: 401, data: null, message: '未登录或登录已过期，请重新登录' });
       return;
     }
+
+    const { items } = req.body ?? {};
+    if (!Array.isArray(items) || items.length === 0) {
+      res.status(400).json({ code: 400, data: null, message: '请提供产品数据（items 不能为空）' });
+      return;
+    }
+
+    // 查询操作人姓名（用于 developer 字段）
     const user = await prisma.user.findUnique({ where: { id: userId } });
     const devName = user?.name ?? req.user!.username;
+
     let count = 0;
     const errors: string[] = [];
+
     for (const item of items) {
       const sku = item.sku?.trim();
       if (!sku) { errors.push('跳过空 SKU'); continue; }
@@ -1039,37 +1058,118 @@ router.post('/inventory-batch-create', async (req: Request, res: Response) => {
       try {
         await prisma.product.create({
           data: {
-            pnk:           `MAN-${Date.now()}-${count}`,
-            title:         item.chineseName?.trim() || sku,
+            pnk:              `MAN-${Date.now()}-${count}`,
+            title:            item.chineseName?.trim() || sku,
             sku,
-            chineseName:   item.chineseName?.trim() || null,
-            imageUrl:      item.imageUrl?.trim() || null,
+            chineseName:      item.chineseName?.trim() || null,
+            imageUrl:         item.imageUrl?.trim() || null,
             purchaseUrl,
-            purchasePrice: item.purchasePrice != null ? Number(item.purchasePrice) : null,
+            purchasePrice:    item.purchasePrice != null ? Number(item.purchasePrice) : null,
             externalProductId,
-            length:        item.length != null ? Number(item.length) : null,
-            width:         item.width != null ? Number(item.width) : null,
-            height:        item.height != null ? Number(item.height) : null,
-            actualWeight:  item.actualWeight != null ? Number(item.actualWeight) : null,
-            ownerId:       userId,
-            status:        'SELECTED',
-            publishStatus: 'UNPUBLISHED',
-            developer:     devName,
+            length:           item.length != null ? Number(item.length) : null,
+            width:            item.width != null ? Number(item.width) : null,
+            height:           item.height != null ? Number(item.height) : null,
+            actualWeight:     item.actualWeight != null ? Number(item.actualWeight) : null,
+            ownerId:          userId,   // 已在上方确认为有效 number
+            status:           'SELECTED',
+            publishStatus:    'UNPUBLISHED',
+            developer:        devName,
           },
         });
         count++;
       } catch (e: unknown) {
-        const pe = e as { code?: string };
-        if (pe.code === 'P2002') errors.push(`SKU "${sku}" 已存在`);
-        else throw e;
+        const pe = e as { code?: string; message?: string; name?: string };
+
+        if (pe.code === 'P2002') {
+          // 唯一约束冲突（SKU 重复）
+          errors.push(`SKU "${sku}" 已存在`);
+        } else if (pe.name === 'PrismaClientValidationError') {
+          // ② Prisma 参数校验失败：记录错误，绝不让进程崩溃
+          const detail = pe.message?.split('\n').slice(0, 2).join(' ') ?? '数据格式错误';
+          console.error(`[inventory-batch-create] SKU "${sku}" Prisma 校验失败:`, detail);
+          errors.push(`SKU "${sku}" 数据格式错误：${detail.slice(0, 80)}`);
+        } else {
+          // ③ 其他未知错误：记录日志，继续处理下一条，不中断整批
+          console.error(`[inventory-batch-create] SKU "${sku}" 未知错误:`, e);
+          errors.push(`SKU "${sku}" 写入失败（未知错误）`);
+        }
       }
     }
+
     const msg = errors.length > 0
-      ? `成功创建 ${count} 个产品，${errors.length} 个跳过（${errors.slice(0, 3).join('；')}）`
+      ? `成功创建 ${count} 个产品，${errors.length} 条跳过（${errors.slice(0, 3).join('；')}）`
       : `成功创建 ${count} 个产品`;
     res.json({ code: 200, data: { count, errors }, message: msg });
+
   } catch (err) {
+    // 外层 catch：仅捕获查询 userId/devName 时的意外异常，返回 400 而非让进程崩溃
     console.error('[POST /api/products/inventory-batch-create]', err);
+    const msg = err instanceof Error ? err.message : '服务器内部错误';
+    res.status(400).json({ code: 400, data: null, message: msg });
+  }
+});
+
+// ── DELETE /api/products/inventory/:id ────────────────────────
+// 智能混合删除：优先物理删除；若有关联业务数据（FK 约束 P2003），降级为软删除归档
+// 无论哪种结果，均返回 200，绝不导致进程崩溃或返回 503
+router.delete('/inventory/:id', async (req: Request, res: Response) => {
+  const id = Number(req.params.id);
+  if (isNaN(id) || id <= 0) {
+    res.status(400).json({ code: 400, data: null, message: '产品 ID 无效' });
+    return;
+  }
+
+  try {
+    // ① 前置校验：产品必须存在且为库存 SKU（sku 非空）
+    const product = await prisma.product.findUnique({ where: { id } });
+    if (!product) {
+      res.status(404).json({ code: 404, data: null, message: '产品不存在' });
+      return;
+    }
+    if (!product.sku) {
+      res.status(400).json({ code: 400, data: null, message: '该产品不是库存 SKU，无法从此接口删除' });
+      return;
+    }
+    if (product.isDeleted) {
+      res.status(400).json({ code: 400, data: null, message: '该产品已被归档删除' });
+      return;
+    }
+
+    // ② 尝试物理删除
+    try {
+      await prisma.product.delete({ where: { id } });
+      console.log(`[inventory-delete] 产品 id=${id} SKU=${product.sku} 已物理删除`);
+      res.json({
+        code: 200,
+        data: { id, sku: product.sku, deleteType: 'hard' },
+        message: `SKU「${product.sku}」已彻底删除`,
+      });
+      return;
+    } catch (delErr: unknown) {
+      const pe = delErr as { code?: string };
+
+      // ③ 有关联数据（FK 约束）→ 静默降级为软删除
+      if (pe.code === 'P2003' || pe.code === 'P2014') {
+        await prisma.product.update({
+          where: { id },
+          data: { isDeleted: true },
+        });
+        console.log(`[inventory-delete] 产品 id=${id} SKU=${product.sku} 有关联数据，已软删除归档 (${pe.code})`);
+        res.json({
+          code: 200,
+          data: { id, sku: product.sku, deleteType: 'soft' },
+          message: `SKU「${product.sku}」存在关联业务数据，已安全归档（不影响历史记录）`,
+        });
+        return;
+      }
+
+      // ④ 其他未知错误：记录日志，返回 400，绝不崩溃
+      console.error(`[inventory-delete] 产品 id=${id} 删除失败:`, delErr);
+      const msg = delErr instanceof Error ? delErr.message : '删除失败，请稍后重试';
+      res.status(400).json({ code: 400, data: null, message: msg });
+    }
+  } catch (err) {
+    console.error('[DELETE /api/products/inventory/:id]', err);
     res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
   }
 });

@@ -114,6 +114,7 @@ model Product {
   sales14d          Int            @default(0) @map("sales_14d")
   sales30d          Int            @default(0) @map("sales_30d")
   status            ProductStatus  @default(PENDING)
+  isDeleted         Boolean        @default(false) @map("is_deleted") // 软删除标记（有关联数据时降级使用）
   createdAt         DateTime       @default(now()) @map("created_at")
   updatedAt         DateTime       @updatedAt @map("updated_at")
   ownerId           Int?           @map("owner_id")
@@ -248,14 +249,13 @@ model StoreProduct {
   imageUrl         String?  @map("image_url")
   mainImage        String?  @map("main_image") // images[display_type=1] 主图 URL
   productUrl       String?  @map("product_url") // 前台商品链接，用于爬虫补图
-  mappedInventorySku String? @map("mapped_inventory_sku") // 手动绑定的库存 SKU
+  mappedInventorySku String? @map("mapped_inventory_sku") // 手动绑定的库存 SKU（对应 Product.sku，纯字符串存储，无 FK 约束）
   validationStatus String?  @map("validation_status")
   docErrors        String?  @map("doc_errors") // eMAG 驳回原因 (JSON 或文本)
   rejectionReason  String?  @map("rejection_reason") // 驳回原因（便于展示）
   comprehensiveSales Float    @default(0) @map("comprehensive_sales") // 综合日销 = d7/7*0.3 + d14/14*0.3 + d30/30*0.4
   syncedAt         DateTime @default(now()) @map("synced_at")
   shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
-  mappedInventory Inventory? @relation(fields: [mappedInventorySku], references: [sku]) // 本地关联 SKU 兜底（图片/成本）
 
   @@unique([shopId, pnk])
   @@index([shopId])
@@ -265,11 +265,10 @@ model StoreProduct {
   @@map("store_products")
 }
 
-/// 本地库存/SKU 映射表（用于图片反哺、成本核算、物流计算）
+/// 本地库存/SKU 映射表（历史遗留，当前业务"库存 SKU"已迁移至 Product 表管理）
 model Inventory {
   id            Int      @id @default(autoincrement())
   sku           String   @unique // 唯一标识，对应 eMAG part_number
-  storeProducts StoreProduct[] // 关联的平台产品（通过 mapped_inventory_sku）
   localImage    String?  @map("local_image") // 本地高清图 URL
   purchaseCost  Decimal? @map("purchase_cost") @db.Decimal(10, 2) // 采购单价
   weight        Decimal? @db.Decimal(10, 3) // 重量 (kg)，用于物流
