@@ -3,9 +3,10 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { authenticate } from '../middleware/auth';
 import { getIsSyncing, tryAcquireSyncLock, releaseSyncLock } from '../lib/syncStatus';
-import { syncPlatformOrdersForShop, syncAllPlatformOrders } from '../services/platformOrderSync';
-import { statusMap } from '../services/emagOrder';
+import { syncPlatformOrdersForShop, syncAllPlatformOrders, upsertOrderPublic } from '../services/platformOrderSync';
+import { statusMap, readOrdersForAllStatuses } from '../services/emagOrder';
 import { syncAndUpdatePurchaseOrderItem, isFetch1688OrderError } from '../services/alibabaOrderSync';
+import { getEmagCredentials } from '../services/emagClient';
 
 function toStatusText(status: number): string {
   return statusMap[status] ?? `状态${status}`;
@@ -15,7 +16,7 @@ function toStatusText(status: number): string {
 type PlatformOrderRow = {
   id: number;
   shopId: number;
-  emagOrderId: number;
+  emagOrderId: bigint;          // Prisma BigInt，避免 INT4 溢出（eMAG ID 已超 21 亿）
   status: number;
   orderType: number | null;
   orderTime: Date;
@@ -32,9 +33,11 @@ function mapOrderToDTO(r: PlatformOrderRow, productsOverride?: unknown[]) {
   const region = (r.shop?.region ?? 'RO') as string;
   const totalPrice = typeof r.total === 'object' ? r.total.toNumber() : Number(r.total ?? 0);
   const currency = r.currency ?? 'RON';
+  // BigInt 序列化为字符串（全局 BigInt.prototype.toJSON 已兜底，此处显式转换保证类型安全）
+  const emagOrderIdStr = String(r.emagOrderId);
   return {
-    emag_order_id: r.emagOrderId,
-    id: r.emagOrderId,
+    emag_order_id: emagOrderIdStr,
+    id: emagOrderIdStr,
     shop_id: r.shopId,
     region,
     status: statusNum,
@@ -136,6 +139,99 @@ const syncPlatformHandler = async (req: Request, res: Response) => {
 };
 
 router.post('/sync', syncPlatformHandler);
+
+// ── POST /api/orders/recover ──────────────────────────────────────
+// 紧急回捞接口：强制拉取近 N 天所有状态的变动订单并全量 upsert，绕过哨兵窗口限制
+// Body: { days?: number (默认 3), shopIds?: number[] (不传=全部店铺) }
+router.post('/recover', async (req: Request, res: Response) => {
+  try {
+    const days = Math.min(31, Math.max(1, parseInt(String(req.body?.days ?? 3), 10) || 3));
+    const rawIds = req.body?.shopIds;
+    let shopIdFilter: number[] = [];
+    if (Array.isArray(rawIds)) {
+      shopIdFilter = rawIds.map(Number).filter((n) => !isNaN(n) && n > 0);
+    } else if (rawIds != null) {
+      const n = Number(rawIds);
+      if (!isNaN(n) && n > 0) shopIdFilter = [n];
+    }
+
+    const shopWhere: any = { platform: { equals: 'emag', mode: 'insensitive' }, status: 'active' };
+    if (shopIdFilter.length > 0) shopWhere.id = { in: shopIdFilter };
+    const shops = await prisma.shopAuthorization.findMany({
+      where: shopWhere,
+      select: { id: true, shopName: true, region: true },
+    });
+    if (shops.length === 0) {
+      res.status(400).json({ code: 400, data: null, message: '没有活跃的 eMAG 店铺' });
+      return;
+    }
+
+    // 回捞起点：N 天前的 00:00:00（本地时间）
+    const start = new Date();
+    start.setDate(start.getDate() - days);
+    start.setHours(0, 0, 0, 0);
+    const modifiedAfter = `${start.getFullYear()}-${String(start.getMonth() + 1).padStart(2, '0')}-${String(start.getDate()).padStart(2, '0')} 00:00:00`;
+
+    console.log(`[recover] 开始回捞 days=${days} modifiedAfter=${modifiedAfter} shops=${shops.map((s) => s.shopName).join(',')}`);
+
+    const results: Array<{ shopId: number; shopName: string; fetched: number; upserted: number; errors: string[] }> = [];
+
+    for (const shop of shops) {
+      const shopResult = { shopId: shop.id, shopName: shop.shopName ?? String(shop.id), fetched: 0, upserted: 0, errors: [] as string[] };
+      try {
+        const creds = await getEmagCredentials(shop.id);
+        const readRes = await readOrdersForAllStatuses(creds, {
+          itemsPerPage: 100,
+          modifiedAfter,
+        });
+
+        if (readRes.isError && readRes.messages?.length) {
+          shopResult.errors.push(...readRes.messages);
+        }
+
+        const orders = Array.isArray(readRes.results) ? readRes.results : [];
+        shopResult.fetched = orders.length;
+
+        for (const o of orders) {
+          if (!o?.id) continue;
+          try {
+            await upsertOrderPublic(shop.id, o, creds.region);
+            shopResult.upserted++;
+          } catch (e) {
+            shopResult.errors.push(`order ${o.id}: ${e instanceof Error ? e.message : String(e)}`);
+          }
+        }
+      } catch (e) {
+        shopResult.errors.push(`获取凭证失败: ${e instanceof Error ? e.message : String(e)}`);
+      }
+      results.push(shopResult);
+      console.log(`[recover] shop=${shop.shopName} fetched=${shopResult.fetched} upserted=${shopResult.upserted} errors=${shopResult.errors.length}`);
+
+      // 店铺间强制 2 秒间隔，保护低带宽代理
+      if (shops.indexOf(shop) < shops.length - 1) {
+        await new Promise((r) => setTimeout(r, 2000));
+      }
+    }
+
+    const totalFetched  = results.reduce((s, r) => s + r.fetched, 0);
+    const totalUpserted = results.reduce((s, r) => s + r.upserted, 0);
+
+    res.json({
+      code: 200,
+      data: {
+        days,
+        modifiedAfter,
+        totalFetched,
+        totalUpserted,
+        shops: results,
+      },
+      message: `回捞完成：共拉取 ${totalFetched} 条，成功入库 ${totalUpserted} 条`,
+    });
+  } catch (err) {
+    console.error('[POST /api/orders/recover]', err);
+    res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
+  }
+});
 
 // ── POST /api/orders/sync-platform/:id ─────────────────────────
 // 强制同步单笔订单（更具体路由需在前）
@@ -307,13 +403,18 @@ router.get('/', async (req: Request, res: Response) => {
         where.emagOrderId = { in: orderIds };
       }
 
-      // 下单时间范围
+      // 下单时间范围（罗马尼亚 EET/EEST → UTC 偏移：冬令 -2h，夏令 -3h）
+      // 向外各扩展 3 小时，确保跨天边缘不丢单；前端展示时仍按 eMAG 本地日期即可
       const orderTimeFilter: { gte?: Date; lte?: Date } = {};
       if (startDate && /^\d{4}-\d{2}-\d{2}$/.test(startDate.slice(0, 10))) {
-        orderTimeFilter.gte = new Date(`${startDate.slice(0, 10)}T00:00:00`);
+        const base = new Date(`${startDate.slice(0, 10)}T00:00:00Z`);
+        base.setUTCHours(base.getUTCHours() - 3);
+        orderTimeFilter.gte = base;
       }
       if (endDate && /^\d{4}-\d{2}-\d{2}$/.test(endDate.slice(0, 10))) {
-        orderTimeFilter.lte = new Date(`${endDate.slice(0, 10)}T23:59:59`);
+        const base = new Date(`${endDate.slice(0, 10)}T23:59:59Z`);
+        base.setUTCHours(base.getUTCHours() + 3);
+        orderTimeFilter.lte = base;
       }
       if (Object.keys(orderTimeFilter).length > 0) {
         where.orderTime = orderTimeFilter;
@@ -390,8 +491,11 @@ router.get('/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    const orderId = Number(req.params.id);
-    if (isNaN(orderId)) {
+    let orderId: bigint;
+    try {
+      const rawId = Array.isArray(req.params.id) ? req.params.id[0] : String(req.params.id);
+      orderId = BigInt(rawId);
+    } catch {
       res.status(400).json({ code: 400, data: null, message: '订单 ID 无效' });
       return;
     }

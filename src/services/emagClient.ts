@@ -285,6 +285,21 @@ function safeErrorDetail(err: any): string {
 const MAX_RETRIES_429 = 5;
 const BACKOFF_BASE_MS = 1000;
 
+// 网络层可重试的错误码（代理超时、连接重置等）
+const RETRYABLE_NET_CODES = new Set([
+  'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND',
+  'EPIPE', 'EHOSTUNREACH', 'EAI_AGAIN', 'UND_ERR_SOCKET',
+]);
+const MAX_NET_RETRIES = 3;
+const NET_RETRY_DELAY_MS = 3000;
+
+function isRetryableNetworkError(err: any): boolean {
+  const code = err?.code ?? err?.cause?.code ?? '';
+  if (RETRYABLE_NET_CODES.has(code)) return true;
+  const msg = String(err?.message ?? '');
+  return /ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|socket hang up|stream has been aborted/i.test(msg);
+}
+
 export async function emagApiCall<T = any>(
   creds: EmagCredentials,
   resource: string,
@@ -300,21 +315,38 @@ export async function emagApiCall<T = any>(
   const basicAuth = Buffer.from(`${creds.username}:${creds.password}`).toString('base64');
   const tag = safeLogTag(creds);
 
-  // 每次请求前打印真实 URL，便于排查 BG/HU 站点 BaseURL 是否正确
   console.log(`[eMAG] POST ${url}  shop=${creds.region} resource=${resource}/${action}`);
 
   const doRequest = async (): Promise<{ data: any; headers: Record<string, any>; status: number }> => {
-    // 每次请求时获取代理 Agent（懒加载，首次调用才初始化）
     const proxyAgent = getEmagProxyAgent();
 
     const resp = await axios.post(url, { data }, {
       headers: { 'Authorization': `Basic ${basicAuth}`, 'Content-Type': 'application/json' },
       timeout: options.timeout ?? 30000,
       validateStatus: () => true,
-      // 仅在此 per-request config 注入 httpsAgent，不碰 axios.defaults
       ...(proxyAgent ? { httpsAgent: proxyAgent, proxy: false } : {}),
     });
     return { data: resp.data, headers: resp.headers ?? {}, status: resp.status };
+  };
+
+  /**
+   * 带网络层自动重试的请求执行器
+   * ETIMEDOUT / ECONNRESET / socket hang up → 等待 3 秒后重试，最多 3 次
+   */
+  const doRequestWithNetRetry = async (): Promise<{ data: any; headers: Record<string, any>; status: number }> => {
+    for (let netAttempt = 0; netAttempt < MAX_NET_RETRIES; netAttempt++) {
+      try {
+        return await doRequest();
+      } catch (netErr: any) {
+        if (isRetryableNetworkError(netErr) && netAttempt < MAX_NET_RETRIES - 1) {
+          console.warn(`${tag} ${resource}/${action} 网络错误(${netErr.code ?? netErr.message?.slice(0, 40)}) — ${NET_RETRY_DELAY_MS}ms 后重试 (${netAttempt + 1}/${MAX_NET_RETRIES})`);
+          await new Promise((r) => setTimeout(r, NET_RETRY_DELAY_MS));
+          continue;
+        }
+        throw netErr;
+      }
+    }
+    throw new Error('unreachable');
   };
 
   const startMs = Date.now();
@@ -322,7 +354,7 @@ export async function emagApiCall<T = any>(
 
   try {
     for (let attempt = 0; attempt <= MAX_RETRIES_429; attempt++) {
-      const { data: body, headers, status } = await doRequest();
+      const { data: body, headers, status } = await doRequestWithNetRetry();
       const elapsed = Date.now() - startMs;
 
       if (status === 429) {
@@ -337,7 +369,6 @@ export async function emagApiCall<T = any>(
         throw new Error(`eMAG API 429 Rate Limit，已退避重试 ${MAX_RETRIES_429} 次`);
       }
 
-      // 401/403 透传为 400，明确提示凭证问题（便于前端区分，不模糊报 500）
       if (status === 401) {
         const msg = 'API 账号或密码无效，请检查凭证';
         console.error(`\n========== [EMAG API ERROR] Shop: ${creds.region}, Status: 401 ==========`);

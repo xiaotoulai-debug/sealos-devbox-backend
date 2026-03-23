@@ -41,7 +41,7 @@ export interface DashboardStats {
   totalOrders: number;
   totalGmv: number;
   daily: DailyStat[];
-  results: number[];           // eMAG 返回的订单 ID 列表（空即无数据，如新授权店铺）
+  results: string[];           // eMAG 订单 ID 列表（BigInt 序列化为字符串，防 JS 精度丢失）
   dataSource: 'emag_api' | 'platform_orders';  // emag_api=API 拉取，platform_orders=本地已同步
 }
 
@@ -57,7 +57,7 @@ export interface DashboardStatsLegacy {
     finalized: number;
     cancelled: number;
   };
-  results: number[];
+  results: string[];
   dataSource: 'emag_api' | 'platform_orders';
 }
 
@@ -347,7 +347,7 @@ export async function getStatsFromLocalDB(
     cur.setUTCDate(cur.getUTCDate() + 1);
   }
 
-  const results = orders.map((o) => o.emagOrderId);
+  const results = orders.map((o) => String(o.emagOrderId));
 
   return {
     startDate: rangeStart,
@@ -410,7 +410,7 @@ export async function getStatsByDateRange(
 
   const totalOrders = daily.reduce((s, x) => s + x.orders, 0);
   const totalGmv = daily.reduce((s, x) => s + x.gmv, 0);
-  const results = orders.map((o) => o.id);
+  const results = orders.map((o) => String(o.id));
 
   return {
     startDate: rangeStart,

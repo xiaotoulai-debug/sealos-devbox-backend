@@ -8,6 +8,42 @@ import { getEmagCredentials } from './emagClient';
 import { readOrdersForAllStatuses, mapOrderForDisplay } from './emagOrder';
 import type { EmagOrder } from './emagOrder';
 
+/**
+ * 将 eMAG 返回的罗马尼亚本地时间字符串转为 UTC Date 对象
+ *
+ * eMAG API 返回的 date 字段为罗马尼亚本地时间（EET UTC+2 / EEST UTC+3），
+ * 但格式中不含时区标识（如 "2026-03-21 23:30:00"）。
+ * 直接 `new Date("2026-03-21T23:30:00")` 会被解析为 UTC，导致实际存储偏移 2~3 小时。
+ *
+ * 本函数通过强制追加 "+02:00"（冬令 EET）或 "+03:00"（夏令 EEST）后再构造 Date，
+ * 让 JS 正确转为 UTC 时间戳。
+ *
+ * 罗马尼亚 DST 规则：3 月最后一个周日 03:00 → +03:00，10 月最后一个周日 04:00 → +02:00
+ */
+function emagLocalToUtc(dateStr: string): Date {
+  if (!dateStr) return new Date(0);
+  const normalized = dateStr.trim().replace(' ', 'T');
+  const year = parseInt(normalized.slice(0, 4), 10);
+  const month = parseInt(normalized.slice(5, 7), 10);
+  const day = parseInt(normalized.slice(8, 10), 10);
+
+  const offset = isRomanianDST(year, month, day) ? '+03:00' : '+02:00';
+  return new Date(`${normalized}${offset}`);
+}
+
+function isRomanianDST(year: number, month: number, day: number): boolean {
+  if (month < 3 || month > 10) return false;
+  if (month > 3 && month < 10) return true;
+  // 3 月：最后一个周日之后
+  if (month === 3) {
+    const lastSunday = 31 - new Date(year, 2, 31).getDay();
+    return day >= lastSunday;
+  }
+  // 10 月：最后一个周日之前
+  const lastSunday = 31 - new Date(year, 9, 31).getDay();
+  return day < lastSunday;
+}
+
 const ITEMS_PER_PAGE = 100;  // 推荐稳定值 [cite: 1384, 1397]
 const MAX_DAYS_PER_CHUNK = 31;  // eMAG 单次查询最大天数
 const SYNC_DAYS_FULL = 365;     // 全量同步时间窗口
@@ -55,17 +91,21 @@ export interface SyncResult {
   errors: string[];
 }
 
+export async function upsertOrderPublic(shopId: number, o: EmagOrder, region?: import('./emagClient').EmagRegion): Promise<void> {
+  return upsertOrder(shopId, o, region);
+}
+
 async function upsertOrder(shopId: number, o: EmagOrder, region?: import('./emagClient').EmagRegion): Promise<void> {
   const mapped = mapOrderForDisplay(o, region);
   const orderTime = mapped.orderTime
-    ? new Date(mapped.orderTime.replace(' ', 'T'))
+    ? emagLocalToUtc(mapped.orderTime)
     : new Date(0);
 
   await prisma.platformOrder.upsert({
-    where: { shopId_emagOrderId: { shopId, emagOrderId: o.id } },
+    where: { shopId_emagOrderId: { shopId, emagOrderId: BigInt(o.id) } },
     create: {
       shopId,
-      emagOrderId: o.id,
+      emagOrderId: BigInt(o.id),
       status: mapped.status,
       statusText: mapped.status_text,
       orderTime,
@@ -157,12 +197,10 @@ export async function syncPlatformOrdersForShop(
     result.errors.push(...readRes.messages);
   }
 
+  // 直接全盘接收 eMAG 按 modified.from 返回的所有订单，不再按创建日期做二次过滤
+  // （原 inRange 过滤器会将跨天边界订单及昨日改状态订单错误丢弃，已拆除）
   const batch = Array.isArray(readRes.results) ? readRes.results : [];
-  const inRange = batch.filter((o: any) => {
-    const d = (o.date ?? o.created_at ?? '').toString().slice(0, 10);
-    return d >= from && d <= to;
-  });
-  allOrders.push(...(inRange as EmagOrder[]));
+  allOrders.push(...(batch as EmagOrder[]));
   result.pages = 1;
 
   const seen = new Set<number>();
@@ -205,8 +243,11 @@ export async function syncPlatformOrderById(shopId: number, orderId: number): Pr
   return { ok: true, total: mapped.total, status_text: mapped.status_text };
 }
 
+const SHOP_INTERVAL_MS = 2000; // 店铺间串行间隔（给代理喘息时间）
+
 /**
- * 对所有（或指定）eMAG 店铺并发执行订单同步
+ * 对所有（或指定）eMAG 店铺串行执行订单同步
+ * 串行 + 2 秒间隔，避免代理带宽不足导致 ETIMEDOUT / ECONNRESET
  * @param incremental 若 true，仅拉取过去 24 小时（Cron 用）；新店始终强制 30 天历史回溯
  * @param windowMinutes 可选，覆盖为指定分钟数（如 30=订单哨兵）
  * @param shopIdFilter 可选，限定同步的店铺 ID 列表；不传则同步全部活跃店铺
@@ -231,27 +272,28 @@ export async function syncAllPlatformOrders(
     return [];
   }
 
-  console.log(`[Sync] 开始并发同步 ${shops.length} 个店铺: ${shops.map((s) => `${s.shopName}(${s.region ?? 'RO'})`).join(', ')}`);
+  console.log(`[Sync] 开始串行同步 ${shops.length} 个店铺: ${shops.map((s) => `${s.shopName}(${s.region ?? 'RO'})`).join(', ')}`);
 
-  // 并发同步所有店铺，单个失败不影响其他
-  const settled = await Promise.allSettled(
-    shops.map((shop) => syncPlatformOrdersForShop(shop.id, incremental, windowMinutes)),
-  );
+  const results: SyncResult[] = [];
 
-  const results: SyncResult[] = settled.map((outcome, i) => {
-    if (outcome.status === 'fulfilled') {
-      const r = outcome.value;
+  for (const shop of shops) {
+    try {
+      const r = await syncPlatformOrdersForShop(shop.id, incremental, windowMinutes);
       if (r.errors.length > 0) {
         r.errors.forEach((e) => console.error(`  [Sync] shop=${r.shopId} 错误: ${e}`));
       }
-      return r;
-    } else {
-      const shopId = shops[i].id;
-      const errMsg = outcome.reason instanceof Error ? outcome.reason.message : String(outcome.reason);
-      console.error(`[Sync] shop=${shopId} 同步异常: ${errMsg}`);
-      return { shopId, totalFetched: 0, totalUpserted: 0, orderIds: [], pages: 0, errors: [errMsg] } as SyncResult;
+      results.push(r);
+    } catch (err) {
+      const errMsg = err instanceof Error ? err.message : String(err);
+      console.error(`[Sync] shop=${shop.id} 同步异常: ${errMsg}`);
+      results.push({ shopId: shop.id, totalFetched: 0, totalUpserted: 0, orderIds: [], pages: 0, errors: [errMsg] });
     }
-  });
+
+    // 店铺间强制间隔，给代理服务器喘息时间
+    if (shops.indexOf(shop) < shops.length - 1) {
+      await new Promise((r) => setTimeout(r, SHOP_INTERVAL_MS));
+    }
+  }
 
   const total = results.reduce((s, r) => s + r.totalUpserted, 0);
   console.log(`[Sync] 全部完成: ${shops.length} 个店铺, 共入库 ${total} 条订单`);

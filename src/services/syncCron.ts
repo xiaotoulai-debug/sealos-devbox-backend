@@ -1,19 +1,23 @@
 /**
- * 自动化同步定时任务 — 三级巡逻机制
- * 【订单哨兵】每 10 分钟 — 同步 eMAG 最近 30 分钟内有变动的订单
- * 【产品雷达】每 2 小时 — 检查新 SKU，补全 URL、图片、价格
- * 【库存同步】每 1 小时 — 本地库存推送到 eMAG 平台
+ * 自动化同步定时任务 — 四级巡逻机制（锁隔离）
+ *
+ * 【订单哨兵】每 10 分钟 — 同步 eMAG 最近 30 分钟内有变动的订单    (orderLock)
+ * 【日级兜底】每天凌晨 2 点 — 强制拉取过去 48 小时全状态订单        (orderLock)
+ * 【产品雷达】每 2 小时 — 检查新 SKU，补全 URL、图片、价格          (productLock)
+ * 【库存同步】每 1 小时 — 本地库存推送到 eMAG 平台                  (无锁，自带防重入)
+ *
+ * 订单与产品使用独立锁，产品雷达再慢也绝不阻塞订单哨兵。
  */
 import cron from 'node-cron';
 import { prisma } from '../lib/prisma';
-import { tryAcquireSyncLock, releaseSyncLock } from '../lib/syncStatus';
+import { tryAcquireLock, releaseLock } from '../lib/syncStatus';
 import { syncAllPlatformOrders } from './platformOrderSync';
 import { syncStoreProducts, backfillProductUrls, backfillProductImages, backfillComprehensiveSales } from './storeProductSync';
 import { syncInventoryToPlatform } from './inventorySync';
 import { getEmagCredentials } from './emagClient';
 import { shouldDelayNextSync, setDelayMultiplier, getDelayMultiplier } from './emagRateLimit';
 
-export type SyncType = 'order_sentinel' | 'product_radar' | 'inventory_sync';
+export type SyncType = 'order_sentinel' | 'order_daily_catchup' | 'product_radar' | 'inventory_sync';
 
 async function logSync(
   syncType: SyncType,
@@ -38,10 +42,14 @@ async function logSync(
 }
 
 let orderSentinelRunning = false;
+let orderDailyCatchupRunning = false;
 let productRadarRunning = false;
 let inventorySyncRunning = false;
 
-/** 【订单哨兵】每 10 分钟，同步最近 30 分钟内有变动的订单 */
+// ═══════════════════════════════════════════════════════════════════
+// 【订单哨兵】每 10 分钟，同步最近 30 分钟内有变动的订单
+// 使用 orderLock — 与产品雷达完全隔离
+// ═══════════════════════════════════════════════════════════════════
 function runOrderSentinel() {
   if (orderSentinelRunning) {
     console.log('[订单哨兵] 跳过（上次未完成）');
@@ -51,8 +59,8 @@ function runOrderSentinel() {
     console.log('[订单哨兵] 跳过（Rate Limit 剩余 < 20%，推迟下次同步）');
     return;
   }
-  if (!tryAcquireSyncLock()) {
-    console.log('[订单哨兵] 跳过（同步锁被占用，可能正在手动同步）');
+  if (!tryAcquireLock('order')) {
+    console.log('[订单哨兵] 跳过（订单锁被占用，可能正在手动同步或日级兜底）');
     return;
   }
   orderSentinelRunning = true;
@@ -75,12 +83,54 @@ function runOrderSentinel() {
       console.error('[订单哨兵] 失败:', e instanceof Error ? e.message : e);
     })
     .finally(() => {
-      releaseSyncLock();
+      releaseLock('order');
       orderSentinelRunning = false;
     });
 }
 
-/** 【产品雷达】每 2 小时，同步产品并补全 URL、图片、价格 */
+// ═══════════════════════════════════════════════════════════════════
+// 【日级兜底】每天凌晨 2 点，强制拉取过去 48 小时全状态订单
+// 作为哨兵的终极保险 — 即使哨兵白天某次被跳过，凌晨也能补回
+// ═══════════════════════════════════════════════════════════════════
+function runOrderDailyCatchup() {
+  if (orderDailyCatchupRunning) {
+    console.log('[日级兜底] 跳过（上次未完成）');
+    return;
+  }
+  if (!tryAcquireLock('order')) {
+    console.log('[日级兜底] 跳过（订单锁被占用）');
+    return;
+  }
+  orderDailyCatchupRunning = true;
+  const start = Date.now();
+  const CATCHUP_HOURS = 48;
+  console.log(`[日级兜底] 开始强制同步过去 ${CATCHUP_HOURS} 小时的全状态订单...`);
+
+  syncAllPlatformOrders(true, CATCHUP_HOURS * 60) // windowMinutes = 48 * 60 = 2880
+    .then((results) => {
+      const total = results.reduce((s, r) => s + r.totalUpserted, 0);
+      const ids = results.flatMap((r) => r.orderIds);
+      const hasErrors = results.some((r) => r.errors.length > 0);
+      const durationMs = Date.now() - start;
+      const result = hasErrors && total === 0 ? 'failed' : hasErrors ? 'partial' : 'success';
+      logSync('order_daily_catchup', total, durationMs, result, JSON.stringify({ orderIds: ids, errors: results.flatMap((r) => r.errors) }));
+      console.log(`[日级兜底] 完成 更新=${total} 订单=${ids.length}条 耗时=${Math.round(durationMs / 1000)}s`);
+    })
+    .catch((e) => {
+      const durationMs = Date.now() - start;
+      logSync('order_daily_catchup', 0, durationMs, 'failed', e instanceof Error ? e.message : String(e));
+      console.error('[日级兜底] 失败:', e instanceof Error ? e.message : e);
+    })
+    .finally(() => {
+      releaseLock('order');
+      orderDailyCatchupRunning = false;
+    });
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// 【产品雷达】每 2 小时，同步产品并补全 URL、图片、价格
+// 使用 productLock — 与订单哨兵完全隔离
+// ═══════════════════════════════════════════════════════════════════
 function runProductRadar() {
   if (productRadarRunning) {
     console.log('[产品雷达] 跳过（上次未完成）');
@@ -90,8 +140,8 @@ function runProductRadar() {
     console.log('[产品雷达] 跳过（Rate Limit 剩余 < 20%，推迟下次同步）');
     return;
   }
-  if (!tryAcquireSyncLock()) {
-    console.log('[产品雷达] 跳过（同步锁被占用，可能正在手动同步）');
+  if (!tryAcquireLock('product')) {
+    console.log('[产品雷达] 跳过（产品锁被占用，可能正在手动同步产品）');
     return;
   }
   productRadarRunning = true;
@@ -121,7 +171,6 @@ function runProductRadar() {
       totalUpdated += urlRes.updated;
       const imgRes = await backfillProductImages();
       totalUpdated += imgRes.updated;
-      // 产品雷达完成后联动更新全站综合日销（全站通用，无 shopId/region 特判）
       const salesRes = await backfillComprehensiveSales();
       totalUpdated += salesRes.updated;
       const durationMs = Date.now() - start;
@@ -132,13 +181,16 @@ function runProductRadar() {
       logSync('product_radar', totalUpdated, durationMs, 'failed', e instanceof Error ? e.message : String(e));
       console.error('[产品雷达] 失败:', e instanceof Error ? e.message : e);
     } finally {
-      releaseSyncLock();
+      releaseLock('product');
       productRadarRunning = false;
     }
   })();
 }
 
-/** 【库存同步】每 1 小时，本地库存推送到 eMAG */
+// ═══════════════════════════════════════════════════════════════════
+// 【库存同步】每 1 小时，本地库存推送到 eMAG
+// 无锁（仅自带防重入标记），与订单/产品互不影响
+// ═══════════════════════════════════════════════════════════════════
 function runInventorySync() {
   if (inventorySyncRunning) {
     console.log('[库存同步] 跳过（上次未完成）');
@@ -170,11 +222,13 @@ function runInventorySync() {
 }
 
 export function startSyncCrons(): void {
-  cron.schedule('*/10 * * * *', () => runOrderSentinel());   // 每 10 分钟
-  cron.schedule('0 */2 * * *', () => runProductRadar());    // 每 2 小时（0 分）
-  cron.schedule('5 * * * *', () => runInventorySync());     // 每 1 小时（5 分，错开订单哨兵）
+  cron.schedule('*/10 * * * *', () => runOrderSentinel());       // 每 10 分钟（订单锁）
+  cron.schedule('0 2 * * *',   () => runOrderDailyCatchup());    // 每天凌晨 2 点（订单锁，48h 兜底）
+  cron.schedule('0 */2 * * *', () => runProductRadar());         // 每 2 小时（产品锁）
+  cron.schedule('5 * * * *',   () => runInventorySync());        // 每 1 小时（无锁）
 
-  console.log('[Cron] 订单哨兵: 每 10 分钟（30min 窗口）');
-  console.log('[Cron] 产品雷达: 每 2 小时');
+  console.log('[Cron] 订单哨兵: 每 10 分钟（30min 窗口，订单锁）');
+  console.log('[Cron] 日级兜底: 每天凌晨 2:00（48h 窗口，订单锁）');
+  console.log('[Cron] 产品雷达: 每 2 小时（产品锁，与订单隔离）');
   console.log('[Cron] 库存同步: 每 1 小时');
 }
