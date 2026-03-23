@@ -11,7 +11,7 @@ import { prisma } from '../lib/prisma';
 import { authenticate } from '../middleware/auth';
 import { getEmagCredentials, resolveRegion, REGION_CURRENCY, REGION_DOMAIN } from '../services/emagClient';
 import { getSalesStatsByShop, getSalesForProduct, logZeroSalesDiagnostic } from '../services/salesStats';
-import { tryAcquireSyncLock, releaseSyncLock } from '../lib/syncStatus';
+import { tryAcquireLock, releaseLock } from '../lib/syncStatus';
 import { backfillProductUrls, backfillProductImages, syncStoreProducts, backfillComprehensiveSales } from '../services/storeProductSync';
 
 const router = Router();
@@ -23,7 +23,7 @@ router.use(authenticate);
  * Body: { shopId: number } | { shopIds: number[] }  或 Query: ?shopId=1 或 ?shopIds=1,2,3
  */
 router.post('/sync', async (req: Request, res: Response) => {
-  if (!tryAcquireSyncLock()) {
+  if (!tryAcquireLock('product')) {
     res.status(409).json({ code: 409, data: null, message: '同步进行中，请稍候' });
     return;
   }
@@ -89,7 +89,7 @@ router.post('/sync', async (req: Request, res: Response) => {
     const responseMsg = isAuthError ? 'API 账号或密码无效，请检查凭证' : msg.slice(0, 500);
     res.status(status).json({ code: status, data: null, message: responseMsg });
   } finally {
-    releaseSyncLock();
+    releaseLock('product');
   }
 });
 
@@ -448,21 +448,29 @@ router.get('/', async (req: Request, res: Response) => {
     }
 
     // inventoryMap：优先从 Product 表查（库存 SKU 主数据），兜底从 Inventory 表查（历史数据）
-    const inventoryMap = new Map<string, { localImage: string | null; purchaseCost: number; weight: number | null }>();
+    const inventoryMap = new Map<string, {
+      localImage:      string | null;
+      purchaseCost:    number;
+      weight:          number | null;
+      localProductId:  number | null;   // Product.id，供前端采购弹窗复用
+      localChineseName: string | null;  // Product.chineseName，供前端展示
+    }>();
     if (skusToFetch.size > 0) {
       const skuArr = [...skusToFetch];
 
       // 优先：从 Product 表查（imageUrl → localImage，purchasePrice → purchaseCost）
       const productList = await prisma.product.findMany({
         where: { sku: { in: skuArr } },
-        select: { sku: true, imageUrl: true, purchasePrice: true, actualWeight: true },
+        select: { id: true, sku: true, imageUrl: true, purchasePrice: true, actualWeight: true, chineseName: true },
       });
       for (const prod of productList) {
         if (prod.sku) {
           inventoryMap.set(prod.sku, {
-            localImage:   prod.imageUrl ?? null,
-            purchaseCost: Number(prod.purchasePrice ?? 0),
-            weight:       prod.actualWeight != null ? Number(prod.actualWeight) : null,
+            localImage:      prod.imageUrl ?? null,
+            purchaseCost:    Number(prod.purchasePrice ?? 0),
+            weight:          prod.actualWeight != null ? Number(prod.actualWeight) : null,
+            localProductId:  prod.id,
+            localChineseName: prod.chineseName ?? null,
           });
         }
       }
@@ -476,9 +484,11 @@ router.get('/', async (req: Request, res: Response) => {
         });
         for (const inv of invList) {
           inventoryMap.set(inv.sku, {
-            localImage:   inv.localImage ?? null,
-            purchaseCost: Number(inv.purchaseCost ?? 0),
-            weight:       inv.weight != null ? Number(inv.weight) : null,
+            localImage:      inv.localImage ?? null,
+            purchaseCost:    Number(inv.purchaseCost ?? 0),
+            weight:          inv.weight != null ? Number(inv.weight) : null,
+            localProductId:  null,   // 历史 Inventory 表无 Product.id
+            localChineseName: null,
           });
         }
       }
@@ -554,6 +564,8 @@ router.get('/', async (req: Request, res: Response) => {
         stock: stockNum,
         stock_display: isRejected && stockNum === 0 ? '待更新' : stockNum,
         purchase_cost: purchaseCost || null,
+        local_product_id:   inv?.localProductId   ?? null,
+        local_chinese_name: inv?.localChineseName ?? null,
         estimated_profit: Number(estimatedProfit.toFixed(2)),
         comprehensive_sales: compSales,   // 实时计算，与 sales_stats 强耦合，永不陈旧
         sales_stats: salesStatsObj,

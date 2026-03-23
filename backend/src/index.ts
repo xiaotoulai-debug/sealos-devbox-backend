@@ -33,6 +33,14 @@ if (!process.env.JWT_SECRET?.trim()) {
   process.exit(1);
 }
 
+// ── BigInt 全局 JSON 序列化补丁 ──────────────────────────────
+// Prisma 的 BigInt 字段（如 emagOrderId）在 JSON.stringify 时会报 TypeError。
+// 通过覆盖 BigInt.prototype.toJSON，使其自动序列化为字符串（前端 JS 精度安全）。
+// 必须在所有路由和中间件之前生效。
+(BigInt.prototype as any).toJSON = function () {
+  return this.toString();
+};
+
 // ── 中间件 ────────────────────────────────────────────────────
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json());

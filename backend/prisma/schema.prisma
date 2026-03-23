@@ -211,7 +211,7 @@ model ShopAuthorization {
 model PlatformOrder {
   id           Int      @id @default(autoincrement())
   shopId       Int      @map("shop_id")
-  emagOrderId  Int      @map("emag_order_id")
+  emagOrderId  BigInt   @map("emag_order_id")
   status       Int
   statusText   String   @map("status_text")
   orderTime    DateTime @map("order_time")

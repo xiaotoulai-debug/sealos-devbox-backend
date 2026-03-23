@@ -832,6 +832,80 @@ router.put('/batch-rollback', async (req: Request, res: Response) => {
   }
 });
 
+// ── PUT /api/products/batch-discard ──────────────────────────
+// 智能移除采购计划产品：
+//   - MAN- 开头（手工建单/库存推送伪产品）→ 物理删除，彻底抹除
+//   - 真实 eMAG 产品（正常 PNK）→ 退回公海 PENDING，保留数据供后续同步
+router.put('/batch-discard', async (req: Request, res: Response) => {
+  try {
+    const { ids } = req.body ?? {};
+    if (!Array.isArray(ids) || ids.length === 0) {
+      res.status(400).json({ code: 400, data: null, message: '请选择至少一个产品' });
+      return;
+    }
+
+    const productIds = ids.map(Number).filter((n) => !isNaN(n) && n > 0);
+    if (productIds.length === 0) {
+      res.status(400).json({ code: 400, data: null, message: '产品 ID 无效' });
+      return;
+    }
+
+    const userId = req.user!.userId;
+
+    // 先查出符合条件的产品（必须是当前用户 + PURCHASING 状态）
+    const targets = await prisma.product.findMany({
+      where: { id: { in: productIds }, status: 'PURCHASING', ownerId: userId },
+      select: { id: true, pnk: true },
+    });
+
+    if (targets.length === 0) {
+      res.json({ code: 200, data: { deleted: 0, returned: 0 }, message: '没有可操作的产品' });
+      return;
+    }
+
+    // 分流：MAN- 开头 → 物理删除；其他 → 退回公海
+    const toDelete  = targets.filter((p) => p.pnk.startsWith('MAN-')).map((p) => p.id);
+    const toReturn  = targets.filter((p) => !p.pnk.startsWith('MAN-')).map((p) => p.id);
+
+    let deletedCount = 0;
+    let returnedCount = 0;
+
+    await prisma.$transaction(async (tx) => {
+      // 物理删除手工伪产品
+      if (toDelete.length > 0) {
+        const del = await tx.product.deleteMany({ where: { id: { in: toDelete } } });
+        deletedCount = del.count;
+      }
+      // 退回公海并清空私有数据
+      if (toReturn.length > 0) {
+        const ret = await tx.product.updateMany({
+          where: { id: { in: toReturn } },
+          data: {
+            status:           'PENDING',
+            publishStatus:    'UNPUBLISHED',
+            ownerId:          null,
+            collectedAt:      null,
+            purchaseQuantity: null,
+            purchasePeriod:   null,
+            purchaseType:     null,
+            purchaseOrderId:  null,
+          },
+        });
+        returnedCount = ret.count;
+      }
+    });
+
+    res.json({
+      code: 200,
+      data: { deleted: deletedCount, returned: returnedCount },
+      message: `已彻底删除 ${deletedCount} 个手工产品，${returnedCount} 个 eMAG 产品已退回公海`,
+    });
+  } catch (err) {
+    console.error('[PUT /api/products/batch-discard]', err);
+    res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
+  }
+});
+
 // ── PUT /api/products/batch-to-purchasing ──────────────────────
 // 从库存 SKU 批量推送产品到采购计划（返单采购）
 // body: { items: [{ id, purchasePrice, purchaseQuantity }, ...] }
