@@ -18,8 +18,9 @@ model User {
   status       UserStatus @default(ACTIVE)
   createdAt    DateTime   @default(now()) @map("created_at")
   roleId       Int        @map("role_id")
-  products     Product[]
-  role         Role       @relation(fields: [roleId], references: [id])
+  products       Product[]
+  fbeShipments   FbeShipment[]
+  role           Role       @relation(fields: [roleId], references: [id])
 
   @@map("users")
 }
@@ -109,6 +110,7 @@ model Product {
   externalOrderId   String?        @map("external_order_id")
   stockActual       Float          @default(0) @map("stock_actual")
   stockInTransit    Float          @default(0) @map("stock_in_transit")
+  inTransitQuantity Int            @default(0) @map("in_transit_quantity") // ERP内部FBE在途数量（由发货单状态流转维护）
   sales1d           Int            @default(0) @map("sales_1d")
   sales7d           Int            @default(0) @map("sales_7d")
   sales14d          Int            @default(0) @map("sales_14d")
@@ -131,22 +133,40 @@ model Product {
   @@index([sku])
   @@index([externalProductId])
   @@map("products")
+
+  fbeShipmentItems  FbeShipmentItem[]
+  inventoryLogs     InventoryLog[]
+  warehouseStocks   WarehouseStock[]
 }
 
 /// 采购单（主单）
 model PurchaseOrder {
-  id          Int                   @id @default(autoincrement())
-  orderNo     String                @unique @map("order_no")
-  operator    String
-  totalAmount Decimal               @map("total_amount") @db.Decimal(12, 2)
-  itemCount   Int                   @default(0) @map("item_count")
-  status      OrderStatus           @default(PLACED)
-  createdAt   DateTime              @default(now()) @map("created_at")
-  products    Product[]
-  items       PurchaseOrderItem[]   // 子单（每个 1688 卖家对应一条）
+  id               Int                   @id @default(autoincrement())
+  orderNo          String                @unique @map("order_no")
+  operator         String
+  totalAmount      Decimal               @map("total_amount") @db.Decimal(12, 2)
+  itemCount        Int                   @default(0) @map("item_count")
+  status           OrderStatus           @default(PENDING)
+  warehouseId      Int?                  @map("warehouse_id")       // 目标入库仓
+  remark           String?
+  // ── 1688 订单信息（从子单提取上移，主单维度冗余存储便于列表展示）──
+  alibabaOrderId   String?               @map("alibaba_order_id")   // 1688 主订单号
+  supplierName     String?               @map("supplier_name")      // 供应商名称
+  // ── 物流追踪（支持线下采购手动回填）────────────────────────────
+  logisticsCompany String?               @map("logistics_company")  // 物流公司（极兔/顺丰等）
+  trackingNumber   String?               @map("tracking_number")    // 运单号
+  logisticsStatus  String?               @map("logistics_status")   // 最新物流状态文本
+  createdAt        DateTime              @default(now()) @map("created_at")
+  updatedAt        DateTime              @default(now()) @updatedAt @map("updated_at")
+  warehouse        Warehouse?            @relation(fields: [warehouseId], references: [id])
+  products         Product[]
+  items            PurchaseOrderItem[]
 
   @@index([createdAt(sort: Desc)])
   @@index([operator])
+  @@index([status])
+  @@index([warehouseId])
+  @@index([alibabaOrderId])
   @@map("purchase_orders")
 }
 
@@ -200,6 +220,7 @@ model ShopAuthorization {
   createdBy       Int?             @map("created_by")
   storeProducts   StoreProduct[]
   platformOrders  PlatformOrder[]
+  fbeShipments    FbeShipment[]
 
   @@index([platform])
   @@index([status])
@@ -372,7 +393,148 @@ enum ProductStatus {
 
 /// 采购单状态
 enum OrderStatus {
-  PLACED
-  IN_TRANSIT
-  RECEIVED
+  PENDING       // 待下单（内部建单完成，尚未调 1688）
+  PLACED        // 已下单/待付款（1688 订单已创建）
+  IN_TRANSIT    // 运输中
+  RECEIVED      // 已入库
+}
+
+/// 库存流水类型
+enum InventoryLogType {
+  PURCHASE_IN     // 采购入库（本地仓入库，stockActual +）
+  FBE_OUT         // FBE 出库（发货至 eMAG 仓，stockActual -）
+  MANUAL_ADJUST   // 人工盘点调整（可正可负）
+}
+
+/// 库存流水表（进销存核心记录）
+model InventoryLog {
+  id             Int              @id @default(autoincrement())
+  productId      Int              @map("product_id")
+  warehouseId    Int?             @map("warehouse_id")      // 关联仓库（多仓架构，老流水可为空）
+  type           InventoryLogType
+  changeQuantity Float            @map("change_quantity")   // 变动数量（正=入库，负=出库）
+  beforeQuantity Float            @map("before_quantity")   // 变动前库存
+  afterQuantity  Float            @map("after_quantity")    // 变动后库存
+  referenceId    String?          @map("reference_id")      // 关联单据号（采购单ID / FBE发货单ID）
+  remark         String?
+  createdBy      Int?             @map("created_by")
+  createdAt      DateTime         @default(now()) @map("created_at")
+  product        Product          @relation(fields: [productId], references: [id])
+  warehouse      Warehouse?       @relation(fields: [warehouseId], references: [id])
+
+  @@index([productId])
+  @@index([warehouseId])
+  @@index([type])
+  @@index([createdAt(sort: Desc)])
+  @@index([referenceId])
+  @@map("inventory_logs")
+}
+
+// ══════════════════════════════════════════════════════════════════════
+// 多仓架构（Multi-Warehouse）
+// ══════════════════════════════════════════════════════════════════════
+
+/// 仓库类型
+enum WarehouseType {
+  LOCAL        // 自建仓 / 本地仓
+  THIRD_PARTY  // 第三方仓 (如海外仓、FBA 等)
+}
+
+/// 仓库状态
+enum WarehouseStatus {
+  ACTIVE    // 启用
+  DISABLED  // 停用
+}
+
+/// 仓库表
+model Warehouse {
+  id        Int             @id @default(autoincrement())
+  name      String          @unique                         // 仓库名称（如"默认本地主仓"、"eMAG 备货仓"）
+  type      WarehouseType   @default(LOCAL)
+  status    WarehouseStatus @default(ACTIVE)
+  remark    String?
+  createdAt DateTime        @default(now()) @map("created_at")
+  updatedAt DateTime        @updatedAt @map("updated_at")
+  stocks    WarehouseStock[]
+
+  inventoryLogs  InventoryLog[]
+  fbeShipments   FbeShipment[]
+  purchaseOrders PurchaseOrder[]
+
+  @@index([status])
+  @@map("warehouses")
+}
+
+/// 仓库库存明细（Product × Warehouse 中间表，多仓库存分布）
+model WarehouseStock {
+  id              Int       @id @default(autoincrement())
+  productId       Int       @map("product_id")              // 关联本地产品 (Product.id)
+  warehouseId     Int       @map("warehouse_id")            // 关联仓库
+  stockQuantity      Float     @default(0) @map("stock_quantity")      // 该仓库中的可用库存
+  lockedQuantity     Float     @default(0) @map("locked_quantity")     // 配货锁定数量（预留）
+  inTransitQuantity  Float     @default(0) @map("in_transit_quantity") // 采购在途数量（已下单未到仓）
+  unitCost           Float     @default(0) @map("unit_cost")           // 单仓移动加权平均成本（含头程公摊）
+  sales7             Int       @default(0) @map("sales_7")             // 仓维 7 天销量
+  sales14            Int       @default(0) @map("sales_14")            // 仓维 14 天销量
+  sales30            Int       @default(0) @map("sales_30")            // 仓维 30 天销量
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  product         Product   @relation(fields: [productId], references: [id])
+  warehouse       Warehouse @relation(fields: [warehouseId], references: [id])
+
+  @@unique([productId, warehouseId])
+  @@index([warehouseId])
+  @@index([productId])
+  @@map("warehouse_stocks")
+}
+
+/// FBE 发货单状态（4 阶段标准仓储作业状态机）
+enum FbeShipmentStatus {
+  PENDING     // 待处理（已创建，尚未开始配货）
+  ALLOCATING  // 配货中（正在拣货打包，库存尚未扣减）
+  SHIPPED     // 已发货（已出库发往 eMAG 仓，stockActual - / inTransitQuantity +）
+  ARRIVED     // 已入仓（eMAG 仓收货确认，inTransitQuantity -）
+  CANCELLED   // 已取消（PENDING/ALLOCATING 可直接取消；SHIPPED 取消需先退在途库存）
+}
+
+/// FBE 发货单（ERP 内部管理 FBE 在途库存）
+model FbeShipment {
+  id             Int               @id @default(autoincrement())
+  shipmentNumber String            @unique @map("shipment_number")
+  status         FbeShipmentStatus @default(PENDING)
+  shopId             Int?              @map("shop_id")              // 目标店铺（发往哪个 eMAG 店铺仓库）
+  warehouseId        Int?              @map("warehouse_id")         // 出库仓库（多仓架构，老数据可为空）
+  totalProductValue  Float             @default(0) @map("total_product_value")   // 产品总货值（建单时快照，= Σ qty×purchasePrice）
+  overseasFreight    Float             @default(0) @map("overseas_freight")      // 海外头程费用（手动录入）
+  domesticFreight    Float             @default(0) @map("domestic_freight")      // 国内运输费用（手动录入）
+  remark             String?
+  ownerId            Int?              @map("owner_id")
+  createdAt      DateTime          @default(now()) @map("created_at")
+  updatedAt      DateTime          @updatedAt @map("updated_at")
+  shop           ShopAuthorization? @relation(fields: [shopId], references: [id])
+  warehouse      Warehouse?         @relation(fields: [warehouseId], references: [id])
+  owner          User?             @relation(fields: [ownerId], references: [id])
+  items          FbeShipmentItem[]
+
+  @@index([status])
+  @@index([shopId])
+  @@index([warehouseId])
+  @@index([ownerId])
+  @@index([createdAt(sort: Desc)])
+  @@map("fbe_shipments")
+}
+
+/// FBE 发货单明细（一单多 SKU）
+model FbeShipmentItem {
+  id               Int         @id @default(autoincrement())
+  shipmentId       Int         @map("shipment_id")
+  productId        Int         @map("product_id")
+  quantity         Int
+  receivedQuantity Int         @default(0) @map("received_quantity")
+  shipment         FbeShipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
+  product          Product     @relation(fields: [productId], references: [id])
+
+  @@index([shipmentId])
+  @@index([productId])
+  @@map("fbe_shipment_items")
 }

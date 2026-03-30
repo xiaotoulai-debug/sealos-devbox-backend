@@ -13,7 +13,7 @@ backend/
 │   ├── migrations/            # Prisma 迁移历史
 │   └── seed.ts                # 初始化角色、权限、种子数据
 ├── scripts/                   # 独立运维脚本（迁移、补全、诊断）
-│   ├── init-permissions.ts    # ★ 权限菜单初始化（upsert 17个节点+授权超管）
+│   ├── init-permissions.ts    # ★ 权限菜单初始化（upsert 20个节点+授权超管；含仓储管理/仓库列表/FBE发货单）
 │   ├── sync-store-products.ts
 │   ├── sync-platform-orders.ts
 │   ├── backfill-product-images.ts
@@ -75,7 +75,11 @@ backend/
 │   │   │                      #   POST /api/store-products/map      — 绑定库存 SKU（★ SKU 字符串优先匹配，inventorySkuId 兜底；pnk+shopId 或 storeProductId 定位平台产品）
 │   │   ├── dashboard.ts       # 业绩看板（stats、shops 下拉）
 │   │   ├── translate.ts       # 翻译代理（MyMemory API 转发，ro→zh 等）
-│   │   └── alibaba.ts         # 1688 OAuth、规格解析、下单、子单同步
+│   │   ├── fbeShipment.ts     # FBE 发货单管理（在途库存闭环，POST/GET /api/fbe-shipments，PUT /:id/status）
+│   │   ├── inventory.ts       # 进销存核心（POST batch-adjust / PUT purchase-orders receive / GET logs）
+│   │   ├── warehouse.ts       # 仓库管理（GET/POST /api/warehouses，PUT /:id — 含 skuCount 聚合、名称唯一性校验）
+│   │   ├── alibaba.ts         # 1688 OAuth、规格解析、下单、子单同步
+│   │   └── purchase.ts        # 采购管理（重构版）：create-local（一品一单）/ place-1688-order（解耦下单）
 │   ├── services/              # 核心业务逻辑
 │   │   ├── emagClient.ts      # eMAG API 客户端（Adapter）：BaseURL/货币/域名按 region 查表
 │   │   │                      # ★ 正向代理：所有 HTTPS 请求经 EMAG_PROXY_URL 代理转发（固定 IP 白名单）
@@ -219,7 +223,7 @@ graph TD
 | Catalog API | `emagProduct.readProductsByPnk` | `product/read` 批量查询完整产品详情（含 images） |
 | 补全入库 | `prisma.storeProduct.updateMany` | 回写 `mainImage`、`imageUrl` |
 | **库存 SKU 绑定兜底** | `StoreProduct.mappedInventorySku` (String?) | 存储 `Product.sku` 字符串（**无 FK 约束**）；列表接口用该值去 `Product` 表查图片/成本，兜底 `Inventory` 表；图片优先级：**平台图 > 本地库存图** |
-| 列表接口 | `GET /api/store-products` | 先查 `Product` 表批量获取 `imageUrl`/`purchasePrice`，缺失时再查 `Inventory` 表；`finalImage = emagImage \|\| localImage`；统一输出 `image`/`imageUrl`/`main_image` |
+| 列表接口 | `GET /api/store-products` | 三路图片兜底：①按 SKU 查 `Product.imageUrl`（主路径）→ ②若 Product 命中但 imageUrl 为 null，再查 `Inventory.localImage` 补图（修复漏查 Bug）→ ③按 pnk 查 Product（SKU 路径全失效时保底）；`finalImage = emagImage \|\| localImage`；统一输出 `image`/`imageUrl`/`main_image`。**`in_transit_quantity` 按当前 `shopId` 实时隔离聚合**（条件：`FbeShipmentItem.shipment.shopId === 当前店 AND status='SHIPPED'`），彻底杜绝跨店污染 |
 
 > **跟卖产品图片说明**：eMAG 的 `product_offer/read` 对跟卖(follow)产品不返回图片。采用【库存 SKU 绑定兜底策略】：通过 `POST /api/store-products/map` 手动绑定。
 >
@@ -318,7 +322,89 @@ graph TD
 
 ---
 
-## 6. 1688 下单拆单与防错位
+## 6. 采购管理（重构版 —— 建单与 1688 下单解耦）
+
+### 6.1 采购单完整生命周期
+
+```
+采购计划页（GET /api/products/purchasing）
+  │  只显示: status=PURCHASING + purchaseOrderId=null + ownerId=当前用户
+  │
+  ├── 移除产品: POST /api/products/remove-from-plan
+  │     MAN- → 物理删除  |  真实产品 → SELECTED（退意向池）
+  │
+  ├── 修改数量: PATCH /api/products/:id/plan-quantity
+  │     只操作计划中(purchaseOrderId=null)的产品
+  │
+  ▼  POST /api/purchases/create-local（warehouseId 必传，纯本地 DB，绝不调 1688）
+  │  ★ 一品一单：每个产品独立一条 PurchaseOrder + PurchaseOrderItem
+  │  ★ 产品状态 PURCHASING → ORDERED，purchaseOrderId=PO.id（进入采购管理）
+  │  ★ rollback 时：ORDERED → PURCHASING，purchaseOrderId=null（重回计划列表）
+  │  状态 → PENDING（待下单）
+  │
+  ├── POST /:id/place-1688-order  → PLACED（1688 API 自动下单）
+  ├── POST /:id/bind-1688-order   → PLACED（手动回填 1688 单号）
+  ├── POST /:id/mark-purchasing   → PLACED（线下采购标记，无需 1688 交互）
+  │
+PLACED（采购中）→ IN_TRANSIT（运输中，待后续物流同步）
+  │
+  ▼  POST /:id/stock-in { warehouseId }
+RECEIVED（已入库）
+  ★ 事务：WarehouseStock upsert(qty+=) + Product.stockActual 重聚合
+  ★ 写 PURCHASE_IN 库存流水 + 产品 status 回归 SELECTED
+```
+
+### 6.2 新增 API
+
+| 接口 | 文件 | 说明 |
+|------|------|------|
+| `GET /api/products/purchasing` | `routes/product.ts` | 采购计划列表（动态视图）：查 `status=PURCHASING AND purchaseOrderId IS NULL`；**已通过 create-local 建单的产品自动隐藏** |
+| `PUT /api/products/batch-to-purchasing` | `routes/product.ts` | 从库存SKU/平台产品批量推入采购计划；**★ 必须同时清空 `purchaseOrderId: null`**，防止二次入计划的产品因残留旧采购单ID被过滤掉 |
+| `PUT /api/products/:id/publish` | `routes/product.ts` | 意向产品确认采购（SELECTED→PURCHASING）；**★ 同上，需清空 `purchaseOrderId`** |
+| `POST /api/products/remove-from-plan` | `routes/product.ts` | **从采购计划移除产品**（body: `{ productIds: number[] }`）；只操作 `status=PURCHASING + purchaseOrderId=null` 的计划中产品；MAN- 手工产品物理删除，真实 eMAG 产品退回 SELECTED |
+| `PATCH /api/products/:id/plan-quantity` | `routes/product.ts` | **修改计划中产品的预定采购数量**（body: `{ quantity: number }`）；只允许修改 `PURCHASING + purchaseOrderId=null` 的产品，已建单的拒绝修改 |
+| `POST /api/purchases/create-local` | `routes/purchase.ts` | **采购计划→建单（warehouseId 必传）**；一品一单；建单后产品 `status→ORDERED + purchaseOrderId=PO.id`，从计划列表彻底消失进入采购管理 |
+| `GET /api/purchases` | `routes/purchase.ts` | 采购单分页列表（含子单、关联产品、仓库信息），支持 `tabStatus`/`keyword` 过滤搜索，返回 `tabCounts` 徽标计数 |
+| `GET /api/purchases/:id` | `routes/purchase.ts` | 采购单详情（深度 include items + products + warehouse） |
+| `POST /api/purchases/:id/place-1688-order` | `routes/purchase.ts` | 手动触发 1688 真实下单，仅 PENDING 状态可执行；调用 `createAlibabaOrder` → 回填订单号 → PLACED |
+| `POST /api/purchases/:id/bind-1688-order` | `routes/purchase.ts` | 手动绑定 1688 订单号（线下已下单回填），事务更新 item.alibabaOrderId + PO.status→PLACED + Product.externalOrderId |
+| `POST /api/purchases/:id/mark-purchasing` | `routes/purchase.ts` | 线下采购标记：直接 PENDING→PLACED，无需 1688 交互，可选回填外部单号 |
+| `POST /api/purchases/:id/stock-in` | `routes/purchase.ts` | **确认入库**：接收 `warehouseId`，事务内 WarehouseStock.upsert(stockQuantity += qty) + 重聚合 Product.stockActual + PURCHASE_IN 库存流水 + 主单→RECEIVED |
+| `POST /api/purchases/:id/rollback` | `routes/purchase.ts` | **高危撤销（任意状态→PENDING）**：若原为 RECEIVED，事务内逐 SKU 扣减 WarehouseStock + 重聚合 stockActual + MANUAL_ADJUST 流水；清空 items.alibabaOrderId；主单 status→PENDING + warehouseId→null；产品 status→PURCHASING + externalOrderId→null |
+| `PATCH /api/purchases/:id/warehouse` | `routes/purchase.ts` | 前置绑定目标入库仓库（RECEIVED 状态禁止修改）；校验仓库存在且 ACTIVE；更新 PO.warehouseId 并返回 warehouse 实体 |
+| `PATCH /api/purchases/:id/logistics` | `routes/purchase.ts` | 手动回填物流信息（支持线下采购）；可更新 logisticsCompany / trackingNumber / logisticsStatus / supplierName / alibabaOrderId；至少传一个字段；任意状态可操作 |
+| `POST /api/purchases/:id/sync-1688` | `routes/purchase.ts` | 一键同步 1688 订单状态、供应商名称、物流单号；调用 `alibaba.trade.get.buyerView`；无 alibabaOrderId 则 400；1688 接口失败返回 502 |
+| `GET /api/purchases/:id/logistics-trace` | `routes/purchase.ts` | 查询物流轨迹流转节点；优先使用已落库的 trackingNumber，否则先调 buyerView 获取运单号；调用 `alibaba.logistics.trace.info.get` |
+| `GET /api/alibaba/product-specs` | `routes/alibaba.ts` | 根据 offerId 拉取 1688 商品规格列表（三级降级：万邦 → 1688 官方 → 历史订单反查），返回 `{ specId, specName, price, stock }[]` |
+| `PATCH /api/alibaba/quick-map` | `routes/alibaba.ts` | 快捷单点更新产品 `externalSkuId`（specId）；32位 MD5 强校验；供下单弹窗内联选规格后即时补全映射 |
+| `GET /api/purchases/:id/products` | `routes/purchase.ts` | 采购单子表明细（前端展开行专用）；按 Product.purchaseOrderId 反向查产品 + PurchaseOrderItem 1688字段，productIds JSON 精准桥接，合并后返回完整行数据 |
+
+### 6.3 采购单 Tab 状态过滤与深度搜索
+
+`GET /api/purchases` 支持以下过滤维度：
+
+| 参数 | 说明 |
+|------|------|
+| `tabStatus` (兼容 `tab_status`/`tab`/`status`) | ALL=全部, PENDING=未下单, PURCHASING=采购中(PLACED/IN_TRANSIT), COMPLETED=已完成(RECEIVED) |
+| `keyword` (兼容 `search`) | 穿透搜索：主单号 OR 1688子单号(items.alibabaOrderId) OR 关联产品SKU(products.sku) |
+
+返回数据额外包含 `tabCounts: { ALL, PENDING, PURCHASING, COMPLETED }` 计数，供前端渲染 Tab 徽标。
+
+### 6.3.1 下单前置校验（防呆规则）
+
+`place-1688-order` 和 `mark-purchasing` 均在执行前强制检查：
+1. `PurchaseOrder.warehouseId` 不为 null（必须先通过 `PATCH /:id/warehouse` 绑定仓库）
+2. `status === PENDING`（仅未下单状态可执行）
+3. 无已存在的 `alibabaOrderId`（防重复下单）
+
+### 6.4 Schema 变更（OrderStatus 枚举 + PurchaseOrder 模型）
+
+- `OrderStatus` 新增 `PENDING` 值（待下单，内部建单完成，尚未调 1688）
+- `PurchaseOrder` 新增：`warehouseId`（目标入库仓）、`remark`、`updatedAt`
+- `PurchaseOrder` 扩充物流与供应商字段：`alibabaOrderId`（1688 主订单号）、`supplierName`（供应商名称）、`logisticsCompany`（物流公司）、`trackingNumber`（运单号）、`logisticsStatus`（物流状态文本）
+- 新建 `src/services/alibabaService.ts`：封装 `syncOrderDetail`（`alibaba.trade.get.buyerView`）与 `getLogisticsTrace`（`alibaba.logistics.trace.info.get`），解析供应商 / 物流订单 / 轨迹节点，供采购单同步接口调用
+
+### 6.5 1688 下单拆单与防错位（原有规则不变）
 
 | 规则 | 说明 |
 |------|------|
@@ -358,8 +444,8 @@ graph TD
 | `GET/POST/PUT/DELETE /api/users` | `routes/user.ts` | 员工管理 |
 | `GET /api/products` | `routes/product.ts` | 公海产品列表（全员可见） |
 | `GET /api/products/private` | `routes/product.ts` | 意向产品列表（★数据隔离：超管全看/员工看自己；★强制过滤：`status=SELECTED AND pnk NOT LIKE 'MAN-%'`，手动导入老 SKU 不进意向池，正常 eMAG 产品建库后继续留在意向池直到 PURCHASING） |
-| `GET /api/products/inventory` | `routes/product.ts` | 库存 SKU 列表（全员可见） |
-| `GET /api/store-products` | `routes/storeProducts.ts` | 店铺平台产品分页列表（含图片兜底、排序；`mappingStatus=mapped/unmapped/all` 关联状态筛选） |
+| `GET /api/products/inventory` | `routes/product.ts` | 库存 SKU 列表（全员可见，**含 warehouseStocks 多仓分布 + stockTotal 汇总**） |
+| `GET /api/store-products` | `routes/storeProducts.ts` | 店铺平台产品分页列表（含图片兜底、排序；`mappingStatus=mapped/unmapped/all` 关联状态筛选；`search` 参数对 **sku/ean/pnk/name/vendorSku 五维 OR 模糊匹配**，支持扫码枪作业） |
 | `POST /api/store-products/sync` | `routes/storeProducts.ts` | 手动触发全量同步 |
 | `POST /api/store-products/backfill-comprehensive-sales` | `routes/storeProducts.ts` | 综合日销全量回填 |
 | `POST /api/store-products/map` | `routes/storeProducts.ts` | 绑定平台产品与库存 SKU（★ SKU 字符串优先 → inventorySkuId 兜底；pnk+shopId 或 storeProductId 定位平台产品） |
@@ -370,6 +456,43 @@ graph TD
 | `POST /api/alibaba/*` | `routes/alibaba.ts` | 1688 OAuth/解析/下单/子单同步 |
 | `POST /api/emag/*` | `routes/emag.ts` | eMAG 类目同步/产品发布 |
 | `POST /api/translate` | `routes/translate.ts` | 翻译代理（MyMemory API 转发，罗马尼亚语→中文等，需登录） |
+| `POST /api/fbe-shipments` | `routes/fbeShipment.ts` | 创建 FBE 发货单（**shopId 必填**，含跨店铺防呆校验；shipmentNumber 可选自定义） |
+| `GET /api/fbe-shipments` | `routes/fbeShipment.ts` | 发货单列表（分页 + 明细 + `productCount`/`totalQuantity` 聚合字段）|
+| `PUT /api/fbe-shipments/:id` | `routes/fbeShipment.ts` | 编辑发货单（改单号/备注/明细数量，**仅 PENDING/ALLOCATING 可编辑**） |
+| `GET /api/fbe-shipments/:id` | `routes/fbeShipment.ts` | 发货单详情 |
+| `PUT /api/fbe-shipments/:id/status` | `routes/fbeShipment.ts` | **4阶段状态机（核心）**：PENDING→ALLOCATING(仅改状态)，ALLOCATING→SHIPPED(**★强校验 stockActual≥qty 否则400回滚**，-stockActual+FBE_OUT流水,+inTransitQty)，SHIPPED→ARRIVED(-inTransitQty+receivedQty)，PENDING/ALLOCATING→CANCELLED(无库存变动)，SHIPPED→CANCELLED(-inTransitQty,+stockActual归还) |
+| `PATCH /api/fbe-shipments/:id/costs` | `routes/fbeShipment.ts` | 登记/更新运费：接收 `overseasFreight`（海外头程）和 `domesticFreight`（国内运费），任意状态可更新；返回含 `totalCost = totalProductValue + overseasFreight + domesticFreight` 的汇总 |
+| `DELETE /api/fbe-shipments/:id` | `routes/fbeShipment.ts` | **超管专属删除**（`requireSuperAdmin`，非超管→403）；$transaction 内按状态回滚库存：PENDING/ALLOCATING→释放 lockedQuantity；SHIPPED→归还 stockQuantity + 扣减 inTransitQuantity + 写 MANUAL_ADJUST 流水；ARRIVED/CANCELLED→无库存操作；最后级联删除 items + 主单 |
+| `POST /api/inventory/batch-adjust` | `routes/inventory.ts` | 人工批量盘点调库，写 MANUAL_ADJUST 流水 |
+| `PUT /api/inventory/purchase-orders/:id/receive` | `routes/inventory.ts` | 采购单确认入库，**+stockActual**，写 PURCHASE_IN 流水，状态→RECEIVED |
+| `GET /api/inventory/logs` | `routes/inventory.ts` | 库存流水查询（分页，支持 productId/type/referenceId 过滤）|
+
+### FBE 在途库存流转规则（4 阶段状态机）
+
+> `FbeShipmentStatus` 枚举：`PENDING` → `ALLOCATING` → `SHIPPED` → `ARRIVED`（终态），任意阶段可 `CANCELLED`
+
+| 状态流转 | stockActual 变化 | inTransitQuantity 变化 | 库存流水 | 防呆规则 |
+|---|---|---|---|---|
+| PENDING → ALLOCATING | 无 | 无 | 无 | 仅改单据状态 |
+| ALLOCATING → SHIPPED | `- quantity` | `+ quantity` | FBE_OUT | **★ 强校验：stockActual < qty 时 400 回滚，事务保障原子性** |
+| SHIPPED → ARRIVED | 无 | `- quantity`（≥0 防负） | 无 | receivedQuantity 回填 |
+| PENDING/ALLOCATING → CANCELLED | 无 | 无 | 无 | 未出库，无需处理 |
+| SHIPPED → CANCELLED | `+ quantity` 归还 | `- quantity`（≥0 防负） | MANUAL_ADJUST | 撤销出库，归还本地库存 |
+| PENDING → CANCELLED | 无变化 | 未发出直接取消 |
+
+> `Product.inTransitQuantity`（`in_transit_quantity` INT）为 ERP 内部维护字段，与 `stockInTransit`（eMAG 平台同步值）并列独立存储。  
+> `GET /api/store-products` 透出 `in_transit_quantity` 字段，该值按当前 `shopId` 实时从 `FbeShipmentItem` 聚合（状态=SHIPPED），严格隔离跨店数据，不再使用全局 `Product.inTransitQuantity`。
+
+### 进销存闭环（InventoryLog）
+
+| 触发场景 | stockActual 变化 | 流水 type | referenceId |
+|---------|-----------------|-----------|-------------|
+| `PUT /api/inventory/purchase-orders/:id/receive` | `+ purchaseQuantity` | PURCHASE_IN | 采购单 orderNo |
+| `PUT /api/fbe-shipments/:id/status` → SHIPPED | `- quantity` | FBE_OUT | FBE 发货单 id |
+| `POST /api/inventory/batch-adjust` | `newStock - oldStock` | MANUAL_ADJUST | null |
+
+> `inventory_logs` 表完整记录每次库存变动的前后值（beforeQuantity / afterQuantity），实现可追溯的进销存台账。  
+> `applyStockChange()` 函数（`routes/inventory.ts` 导出）是唯一的库存变动原子操作，所有埋点统一调用，防止逻辑散落。
 
 ---
 
@@ -383,4 +506,23 @@ graph TD
 
 ---
 
-*文档版本：基于 backend + prisma/schema.prisma 生成，最后更新：权限菜单初始化（init-permissions.ts）+ GET /api/permissions/tree API*
+### 多仓架构（Multi-Warehouse）
+
+> 从单仓 `Product.stockActual` 升级为多仓 `Warehouse × WarehouseStock` 中间表架构。
+
+#### 数据模型
+
+| 模型 | 表名 | 说明 |
+|------|------|------|
+| `Warehouse` | `warehouses` | 仓库主表，字段: id/name/type(LOCAL/THIRD_PARTY)/status(ACTIVE/DISABLED) |
+| `WarehouseStock` | `warehouse_stocks` | Product × Warehouse 中间表，联合唯一 (productId, warehouseId)，字段: stockQuantity/lockedQuantity |
+
+#### 数据流
+
+| 场景 | 逻辑 |
+|------|------|
+| 老数据迁移 | `scripts/migrate-to-multi-warehouse.ts`：自动创建默认主仓 → upsert Product.stockActual 至 WarehouseStock |
+| 库存列表 | `GET /api/products/inventory` 返回 `warehouseStocks[]`（各仓分布）+ `stockTotal`（ACTIVE 仓汇总） |
+| 向后兼容 | `stockActual` 保留原值，前端优先使用新字段 `stockTotal`，逐步迁移 |
+
+*文档版本：基于 backend + prisma/schema.prisma 生成，最后更新：多仓架构重构（Warehouse + WarehouseStock）*

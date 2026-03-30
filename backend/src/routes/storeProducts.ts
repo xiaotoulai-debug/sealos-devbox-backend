@@ -387,17 +387,25 @@ router.get('/', async (req: Request, res: Response) => {
 
     if (search) {
       const q = { contains: search, mode: 'insensitive' as const };
+      // 四维混合搜索：sku / ean / pnk / name / vendorSku
+      // 支持仓库扫码枪输入 EAN 条码、PNK 码、供应商 SKU 等任意标识符
+      const searchOr = [
+        { sku:       q },   // 本地 SKU
+        { ean:       q },   // EAN 条码（精准/模糊均可）
+        { pnk:       q },   // eMAG part_number_key（PNK 码）
+        { name:      q },   // 平台产品名称（支持关键词搜索）
+        { vendorSku: q },   // 供应商 SKU / part_number（仓库备用扫码标识）
+      ];
       // 若已有 OR（unmapped 场景），需将搜索条件与现有 OR 通过 AND 组合
       if (mappingStatus === 'unmapped') {
         const existingOr = where.OR;
         delete where.OR;
         where.AND = [
-          { OR: existingOr } as Record<string, unknown>,
-          { OR: [{ sku: q }, { ean: q }, { pnk: q }] } as Record<string, unknown>,
+          { OR: existingOr }  as Record<string, unknown>,
+          { OR: searchOr }    as Record<string, unknown>,
         ];
       } else {
         // mapped / all 场景：直接追加搜索 OR
-        const searchOr = [{ sku: q }, { ean: q }, { pnk: q }];
         if (where.AND) {
           where.AND.push({ OR: searchOr } as Record<string, unknown>);
         } else {
@@ -447,52 +455,153 @@ router.get('/', async (req: Request, res: Response) => {
       }
     }
 
-    // inventoryMap：优先从 Product 表查（库存 SKU 主数据），兜底从 Inventory 表查（历史数据）
-    const inventoryMap = new Map<string, {
-      localImage:      string | null;
-      purchaseCost:    number;
-      weight:          number | null;
-      localProductId:  number | null;   // Product.id，供前端采购弹窗复用
-      localChineseName: string | null;  // Product.chineseName，供前端展示
-    }>();
+    // inventoryMap：三路查询保障图片兜底
+    //   路径①  按 mappedInventorySku / sku / vendorSku 查 Product 表（主路径，key = Product.sku）
+    //   路径②  按同一 SKU 列表查旧 Inventory 表（历史数据兜底，key = Inventory.sku）
+    //   路径③  按 pnk 查 Product 表（防 mappedInventorySku 为空或 SKU 对不上时的最终兜底，key = Product.pnk）
+    type InvEntry = {
+      localImage:         string | null;
+      purchaseCost:       number;
+      weight:             number | null;
+      localProductId:     number | null;
+      localChineseName:   string | null;
+      inTransitQuantity:  number;
+    };
+    const inventoryMap = new Map<string, InvEntry>();
+    // 路径③ 的 pnk → InvEntry 索引（在下方单独查询后填充）
+    const pnkMap = new Map<string, InvEntry>();
+
     if (skusToFetch.size > 0) {
       const skuArr = [...skusToFetch];
 
-      // 优先：从 Product 表查（imageUrl → localImage，purchasePrice → purchaseCost）
+      // ── 路径①：从 Product 表按 SKU 查（主路径）────────────────────
+      // 字段说明：Product.imageUrl (image_url) = 本地库存 SKU 图片
       const productList = await prisma.product.findMany({
         where: { sku: { in: skuArr } },
-        select: { id: true, sku: true, imageUrl: true, purchasePrice: true, actualWeight: true, chineseName: true },
+        select: { id: true, sku: true, pnk: true, imageUrl: true, purchasePrice: true, actualWeight: true, chineseName: true, inTransitQuantity: true },
       });
+      // 记录 Product 已命中但 imageUrl 为空的 SKU，需要再去 Inventory 补图
+      const noImageProductSkus: string[] = [];
       for (const prod of productList) {
+        const entry: InvEntry = {
+          localImage:         prod.imageUrl ?? null,   // Product.imageUrl → local_image
+          purchaseCost:       Number(prod.purchasePrice ?? 0),
+          weight:             prod.actualWeight != null ? Number(prod.actualWeight) : null,
+          localProductId:     prod.id,
+          localChineseName:   prod.chineseName ?? null,
+          inTransitQuantity:  prod.inTransitQuantity ?? 0,
+        };
         if (prod.sku) {
-          inventoryMap.set(prod.sku, {
-            localImage:      prod.imageUrl ?? null,
-            purchaseCost:    Number(prod.purchasePrice ?? 0),
-            weight:          prod.actualWeight != null ? Number(prod.actualWeight) : null,
-            localProductId:  prod.id,
-            localChineseName: prod.chineseName ?? null,
-          });
+          inventoryMap.set(prod.sku, entry);
+          if (!prod.imageUrl) noImageProductSkus.push(prod.sku); // 命中但无图，标记补查
         }
+        if (prod.pnk) pnkMap.set(prod.pnk, entry); // 同时填充 pnkMap
       }
 
-      // 兜底：从 Inventory 表查（历史条目补充 Product 没有的 SKU）
-      const missingSkus = skuArr.filter((s) => !inventoryMap.has(s));
-      if (missingSkus.length > 0) {
+      // ── 路径②：Inventory 表兜底 ─────────────────────────────────
+      // 查询范围 = ① Product 完全未命中的 SKU  +  ② Product 命中但 imageUrl 为空的 SKU
+      // 字段说明：Inventory.localImage (local_image) = 手动上传的本地高清图
+      const missingSkus     = skuArr.filter((s) => !inventoryMap.has(s));
+      const invQuerySkus    = [...new Set([...missingSkus, ...noImageProductSkus])];
+      if (invQuerySkus.length > 0) {
         const invList = await prisma.inventory.findMany({
-          where: { sku: { in: missingSkus } },
+          where: { sku: { in: invQuerySkus } },
           select: { sku: true, localImage: true, purchaseCost: true, weight: true },
         });
         for (const inv of invList) {
-          inventoryMap.set(inv.sku, {
-            localImage:      inv.localImage ?? null,
-            purchaseCost:    Number(inv.purchaseCost ?? 0),
-            weight:          inv.weight != null ? Number(inv.weight) : null,
-            localProductId:  null,   // 历史 Inventory 表无 Product.id
-            localChineseName: null,
-          });
+          const existing = inventoryMap.get(inv.sku);
+          if (existing) {
+            // Product 命中但无图：用 Inventory.localImage 回填图片，保留 Product 的其他字段
+            if (!existing.localImage && inv.localImage) {
+              existing.localImage = inv.localImage;
+            }
+          } else {
+            // Product 完全未命中：从 Inventory 建立完整条目
+            inventoryMap.set(inv.sku, {
+              localImage:         inv.localImage ?? null,
+              purchaseCost:       Number(inv.purchaseCost ?? 0),
+              weight:             inv.weight != null ? Number(inv.weight) : null,
+              localProductId:     null,
+              localChineseName:   null,
+              inTransitQuantity:  0,
+            });
+          }
         }
       }
     }
+
+    // ── 路径③：按 pnk 查 Product（兜底 SKU 路径全部失败的情况）────
+    // 只查路径①②均未命中 SKU 的那批 pnk，减少无效 DB 查询
+    const pnksToFetch = list
+      .filter((p) => {
+        const skuKey = (p.mappedInventorySku ?? '').trim() || (p.sku ?? p.vendorSku ?? '').trim();
+        return !skuKey || !inventoryMap.has(skuKey);
+      })
+      .map((p) => p.pnk)
+      .filter((pnk) => !!pnk && !pnkMap.has(pnk));
+
+    if (pnksToFetch.length > 0) {
+      const pnkProductList = await prisma.product.findMany({
+        where: { pnk: { in: pnksToFetch } },
+        select: { id: true, sku: true, pnk: true, imageUrl: true, purchasePrice: true, actualWeight: true, chineseName: true, inTransitQuantity: true },
+      });
+      for (const prod of pnkProductList) {
+        const entry: InvEntry = {
+          localImage:         prod.imageUrl ?? null,
+          purchaseCost:       Number(prod.purchasePrice ?? 0),
+          weight:             prod.actualWeight != null ? Number(prod.actualWeight) : null,
+          localProductId:     prod.id,
+          localChineseName:   prod.chineseName ?? null,
+          inTransitQuantity:  prod.inTransitQuantity ?? 0,
+        };
+        if (prod.pnk) pnkMap.set(prod.pnk, entry);
+        // 如果该 Product 有 SKU，顺便补充到 inventoryMap 以供后续 skuKey 命中
+        if (prod.sku) inventoryMap.set(prod.sku, entry);
+      }
+    }
+
+    // ── 按当前店铺隔离计算 FBE 在途库存 ─────────────────────────────
+    // Product.inTransitQuantity 是全局累积值，跨店污染；此处实时聚合：
+    //   条件：发货单 shopId === 当前 shopId，状态为 SHIPPED（已发但未入仓）
+    // 结果 key = productId（本地 Product 主键）
+    const allProductIds = [...inventoryMap.values()]
+      .map((e) => e.localProductId)
+      .filter((id): id is number => id !== null);
+    const pnkProductIds = [...pnkMap.values()]
+      .map((e) => e.localProductId)
+      .filter((id): id is number => id !== null);
+    const productIdsToCheck = [...new Set([...allProductIds, ...pnkProductIds])];
+
+    // productId → 该店在途数量
+    const shopInTransitMap = new Map<number, number>();
+    if (productIdsToCheck.length > 0) {
+      const fbeItems = await prisma.fbeShipmentItem.findMany({
+        where: {
+          productId: { in: productIdsToCheck },
+          shipment:  { shopId, status: 'SHIPPED' },   // ★ 核心隔离：仅计当前店 + 在途状态
+        },
+        select: { productId: true, quantity: true },
+      });
+      for (const item of fbeItems) {
+        shopInTransitMap.set(
+          item.productId,
+          (shopInTransitMap.get(item.productId) ?? 0) + item.quantity,
+        );
+      }
+    }
+
+    // 将店铺级在途数回写到 inventoryMap / pnkMap，覆盖全局字段
+    for (const entry of inventoryMap.values()) {
+      if (entry.localProductId !== null) {
+        entry.inTransitQuantity = shopInTransitMap.get(entry.localProductId) ?? 0;
+      }
+    }
+    for (const entry of pnkMap.values()) {
+      if (entry.localProductId !== null) {
+        entry.inTransitQuantity = shopInTransitMap.get(entry.localProductId) ?? 0;
+      }
+    }
+    // ─────────────────────────────────────────────────────────────────
 
     const shopName = list[0]?.shop?.shopName ?? '';
     const shopRegion = list[0]?.shop?.region;
@@ -509,9 +618,10 @@ router.get('/', async (req: Request, res: Response) => {
       const isRejected = validationStatusDisplay === '已驳回';
 
       const skuKey = (p.mappedInventorySku ?? '').trim() || (p.sku ?? p.vendorSku ?? '').trim();
-      const inv = skuKey ? inventoryMap.get(skuKey) : undefined;
+      // 三路查：① SKU 精确匹配 → ② pnk 兜底（mappedInventorySku 为空或 SKU 对不上时）
+      const inv = (skuKey ? inventoryMap.get(skuKey) : undefined) ?? pnkMap.get(p.pnk);
 
-      // 核心回退逻辑：优先平台图，平台没图用本地关联 SKU 兜底
+      // 图片三级回退：平台主图 → 平台副图 → 本地库存 SKU 图片
       const emagImage = p.mainImage ?? p.imageUrl ?? null;
       const localImage = inv?.localImage ?? null;
       const finalImage = emagImage || localImage || null;
@@ -564,8 +674,9 @@ router.get('/', async (req: Request, res: Response) => {
         stock: stockNum,
         stock_display: isRejected && stockNum === 0 ? '待更新' : stockNum,
         purchase_cost: purchaseCost || null,
-        local_product_id:   inv?.localProductId   ?? null,
-        local_chinese_name: inv?.localChineseName ?? null,
+        local_product_id:    inv?.localProductId    ?? null,
+        local_chinese_name:  inv?.localChineseName  ?? null,
+        in_transit_quantity: inv?.inTransitQuantity ?? 0,
         estimated_profit: Number(estimatedProfit.toFixed(2)),
         comprehensive_sales: compSales,   // 实时计算，与 sales_stats 强耦合，永不陈旧
         sales_stats: salesStatsObj,

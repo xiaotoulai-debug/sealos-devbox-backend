@@ -451,30 +451,170 @@ router.get('/', async (req: Request, res: Response) => {
     }
 
     // 采购单列表（分页）
+    // ★ 前端通过 /api/orders（无 shopId 参数）调用此分支
     const page     = Math.max(1, parseInt(String(req.query.page ?? 1), 10) || 1);
     const pageSize = Math.min(100, Math.max(1, parseInt(String(req.query.pageSize ?? 20), 10) || 20));
     const skip     = (page - 1) * pageSize;
 
+    // ── Tab 状态过滤（与 /api/purchases GET 逻辑完全一致）──────────
+    // 兼容多种前端命名：tabStatus / tab_status / tab / status
+    const rawTab = (
+      req.query.tabStatus  ?? req.body?.tabStatus  ??
+      req.query.tab_status ?? req.body?.tab_status ??
+      req.query.tab        ?? req.body?.tab        ??
+      req.query.status     ?? req.body?.status     ?? ''
+    );
+    const tabRaw = String(rawTab).toUpperCase().trim();
+
+    let statusFilter: string | { in: string[] } | undefined;
+    switch (tabRaw) {
+      case 'PENDING':
+        // 未下单：仅返回本地建单、尚未提交 1688 的单据
+        statusFilter = 'PENDING';
+        break;
+      case 'PURCHASING':
+        // 采购中：已向 1688 下单（PLACED）或运输中（IN_TRANSIT）
+        // ★ 绝对不包含 PENDING 或 RECEIVED
+        statusFilter = { in: ['PLACED', 'IN_TRANSIT'] };
+        break;
+      case 'COMPLETED':
+        // 已完成：货物已入库
+        statusFilter = { in: ['RECEIVED'] };
+        break;
+      case 'PLACED':     statusFilter = 'PLACED';     break;
+      case 'IN_TRANSIT': statusFilter = 'IN_TRANSIT'; break;
+      case 'RECEIVED':   statusFilter = 'RECEIVED';   break;
+      // ALL / 空值 / 未知 → statusFilter = undefined（不过滤，返回全部）
+    }
+
+    // ── 关键词穿透搜索 ─────────────────────────────────────────────
+    const kw = String(
+      req.query.keyword ?? req.body?.keyword ??
+      req.query.search  ?? req.body?.search  ?? '',
+    ).trim();
+
+    // ── 用显式 AND 隔离状态过滤与 OR 关键词条件，防止条件互相覆盖 ──
+    const andClauses: any[] = [];
+    if (statusFilter !== undefined) {
+      andClauses.push({ status: statusFilter });
+    }
+    if (kw) {
+      andClauses.push({
+        OR: [
+          { orderNo:  { contains: kw, mode: 'insensitive' as const } },
+          { items:    { some: { alibabaOrderId: { contains: kw, mode: 'insensitive' as const } } } },
+          { products: { some: { sku:            { contains: kw, mode: 'insensitive' as const } } } },
+        ],
+      });
+    }
+    const poWhere: any = andClauses.length > 0 ? { AND: andClauses } : {};
+
+    console.log(
+      `[GET /api/orders → 采购单分支] tabRaw="${tabRaw}" → statusFilter=${JSON.stringify(statusFilter)}`,
+      '| kw:', JSON.stringify(kw), '| poWhere:', JSON.stringify(poWhere),
+    );
+
     const [total, orders] = await prisma.$transaction([
-      prisma.purchaseOrder.count(),
+      prisma.purchaseOrder.count({ where: poWhere }),
       prisma.purchaseOrder.findMany({
+        where:   poWhere,
         orderBy: { createdAt: 'desc' },
         skip,
-        take: pageSize,
+        take:    pageSize,
+        include: {
+          items: {
+            select: {
+              id: true, offerId: true, quantity: true,
+              alibabaOrderId: true, alibabaOrderStatus: true,
+            },
+          },
+          products: {
+            select: {
+              id: true, sku: true, chineseName: true,
+              imageUrl: true, purchasePrice: true, purchaseQuantity: true,
+            },
+          },
+          warehouse: { select: { id: true, name: true } },
+        },
       }),
     ]);
 
-    const purchaseList = orders.map((o) => ({
-      id:          o.id,
-      orderNo:     o.orderNo,
-      operator:    o.operator,
-      totalAmount: Number(o.totalAmount),
-      itemCount:   o.itemCount,
-      status:      o.status,
-      createdAt:   o.createdAt,
-    }));
+    // Tab 计数（供前端渲染徽标，一次返回全部）
+    const [cntPending, cntPurchasing, cntCompleted] = await prisma.$transaction([
+      prisma.purchaseOrder.count({ where: { status: 'PENDING' } }),
+      prisma.purchaseOrder.count({ where: { status: { in: ['PLACED', 'IN_TRANSIT'] } } }),
+      prisma.purchaseOrder.count({ where: { status: 'RECEIVED' } }),
+    ]);
 
-    res.json({ code: 200, data: { list: purchaseList, total }, message: 'success' });
+    // ── 将 products 信息合并进 items，形成前端可直接渲染的子表行 ──
+    // 背景：PurchaseOrderItem 无直接 FK 到 Product，两者分离查询后在此合并。
+    // 一品一单模型下 items[i] ↔ products[i] 一一对应；多品时按下标顺序对齐。
+    const purchaseList = orders.map((o) => {
+      const rawItems    = (o as any).items    as any[] ?? [];
+      const rawProducts = (o as any).products as any[] ?? [];
+
+      // 构建产品 Map（id → product），方便精确匹配
+      const prodById = new Map<number, any>(rawProducts.map((p: any) => [p.id, p]));
+
+      // 合并：把每个 item 与对应 product 的信息融合，前端子表只需读 items[i].*
+      const mergedItems = rawItems.map((item: any, idx: number) => {
+        // 优先用 productIds JSON 字段精准关联，兜底用下标顺序对齐
+        let prod: any = null;
+        try {
+          const pids: number[] = JSON.parse(item.productIds ?? '[]');
+          if (pids.length > 0) prod = prodById.get(pids[0]);
+        } catch { /* ignore */ }
+        if (!prod) prod = rawProducts[idx] ?? null;
+
+        return {
+          // PurchaseOrderItem 字段
+          id:                 item.id,
+          offerId:            item.offerId     ?? null,
+          quantity:           item.quantity,
+          alibabaOrderId:     item.alibabaOrderId     ?? null,
+          alibabaOrderStatus: item.alibabaOrderStatus ?? null,
+          // Product 字段（合并进来，前端子表直接读）
+          productId:          prod?.id          ?? null,
+          sku:                prod?.sku          ?? null,
+          chineseName:        prod?.chineseName  ?? null,
+          imageUrl:           prod?.imageUrl     ?? null,
+          purchasePrice:      prod?.purchasePrice != null ? Number(prod.purchasePrice) : null,
+          purchaseQuantity:   prod?.purchaseQuantity ?? item.quantity,
+          purchaseUrl:        prod?.purchaseUrl  ?? null,
+        };
+      });
+
+      return {
+        id:          o.id,
+        orderNo:     o.orderNo,
+        operator:    o.operator,
+        totalAmount: Number(o.totalAmount),
+        itemCount:   o.itemCount,
+        status:      o.status,
+        remark:      (o as any).remark    ?? null,
+        createdAt:   o.createdAt,
+        items:       mergedItems,                  // ← 已合并产品信息的子表行
+        products:    rawProducts,                  // ← 原始产品数组保留（向后兼容）
+        warehouse:   (o as any).warehouse ?? null,
+      };
+    });
+
+    res.json({
+      code: 200,
+      data: {
+        list:      purchaseList,
+        total,
+        page,
+        pageSize,
+        tabCounts: {
+          ALL:        cntPending + cntPurchasing + cntCompleted,
+          PENDING:    cntPending,
+          PURCHASING: cntPurchasing,
+          COMPLETED:  cntCompleted,
+        },
+      },
+      message: 'success',
+    });
   } catch (err) {
     console.error('[GET /api/orders]', err);
     res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });

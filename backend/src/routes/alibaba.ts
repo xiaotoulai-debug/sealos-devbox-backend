@@ -400,6 +400,227 @@ async function searchProductFromOrders(
   }
 }
 
+// ── GET /api/alibaba/product-specs ───────────────────────────
+// 根据 offerId 拉取 1688 商品规格列表，返回前端可直接渲染的扁平数组。
+//
+// 响应格式（严格扁平）:
+//   { code: 200, data: [{ specId, skuId, attributes, price }] }
+//
+// 三级降级策略：
+//   1. 万邦 item_get（无需 1688 授权，最快）
+//   2. 1688 官方 alibaba.product.get
+//   3. 历史买家订单反查
+// ──────────────────────────────────────────────────────────────
+
+/**
+ * 解析万邦 properties_name 字段为人类可读的规格字符串。
+ *
+ * 万邦典型格式（分号分隔，每段 propId:valueId:propName:valueName）：
+ *   "0:0:颜色:黑色;1:1:规格:(20*30)CM"
+ *
+ * 也可能是简化的 "propName:valueName" 对。
+ *
+ * 输出示例：
+ *   "颜色:黑色; 规格:(20*30)CM"
+ */
+function parsePropertiesName(raw: string): string {
+  if (!raw || !raw.trim()) return '';
+
+  const segments = raw.split(';').map((s) => s.trim()).filter(Boolean);
+
+  const parts = segments.map((seg) => {
+    const cols = seg.split(':');
+    if (cols.length >= 4) {
+      // propId:valueId:propName:valueName（标准万邦格式）
+      // propName 在 index 2，valueName 在 index 3
+      // 注意：valueName 本身可能含冒号，如 "(20*30)CM" 不含但要兜底
+      const propName  = cols[2].trim();
+      const valueName = cols.slice(3).join(':').trim();  // 兼容 valueName 含冒号
+      if (propName) return `${propName}:${valueName}`;
+    }
+    if (cols.length === 2) {
+      // 简化格式 propName:valueName
+      return seg.trim();
+    }
+    // 兜底：原样保留
+    return seg.trim();
+  }).filter((s) => {
+    // 过滤掉纯数字组成的无意义段（如 "0:0"）
+    return !!s && !/^\d+:\d*$/.test(s);
+  });
+
+  return parts.join('; ');
+}
+
+/**
+ * 从万邦规格数组提取扁平的 SpecItem 列表
+ * 输出字段: specId / skuId / attributes / price
+ */
+function extractSpecsFromOnebound(
+  rawBody: Onebound1688Response,
+  offerId: string,
+): Array<{ specId: string; skuId: string; attributes: string; price: number }> {
+  const rawSpecs = normalizeOneboundSkus(rawBody);
+  const item     = rawBody.item;
+
+  if (rawSpecs.length > 0) {
+    return rawSpecs.map((s) => ({
+      specId:     s.specId,
+      skuId:      s.skuId,
+      attributes: parsePropertiesName(s.specName) || s.specName || '默认规格',
+      price:      s.price,
+    }));
+  }
+
+  // 无规格时：单 SKU 兜底（offerId 本身作为 specId）
+  return [{
+    specId:     offerId,
+    skuId:      offerId,
+    attributes: '默认规格（单SKU）',
+    price:      Number(item?.price) || 0,
+  }];
+}
+
+router.get('/product-specs', async (req: Request, res: Response) => {
+  try {
+    const offerId = String(req.query.offerId ?? '').trim();
+    if (!offerId || !/^\d{5,}$/.test(offerId)) {
+      res.status(400).json({
+        code: 400, data: null,
+        message: '请提供有效的 1688 offerId（纯数字，至少 5 位）',
+      });
+      return;
+    }
+
+    // ── 策略 1：万邦 API ──────────────────────────────────────
+    try {
+      const rawBody = await get1688Item(offerId);
+      const specs   = extractSpecsFromOnebound(rawBody, offerId);
+
+      console.log(
+        `[product-specs] 万邦成功 offerId=${offerId} → ${specs.length} 条规格`,
+        specs.length > 0 ? `示例: "${specs[0].attributes}"` : '',
+      );
+
+      res.json({ code: 200, data: specs, message: 'success' });
+      return;
+    } catch (e) {
+      console.warn(`[product-specs] 万邦失败 offerId=${offerId}:`, e instanceof Error ? e.message : e);
+    }
+
+    // ── 策略 2：1688 官方 alibaba.product.get ────────────────
+    const accessToken = await getValidAccessToken();
+    if (accessToken) {
+      try {
+        const officialResult = await callAlibabaAPI<Record<string, unknown>>(
+          'param2/1/com.alibaba.product/alibaba.product.get',
+          { productID: offerId, webSite: '1688' },
+          accessToken,
+        );
+        if (officialResult.success && officialResult.data) {
+          const parsed = normalizeProductGetResponse(offerId, officialResult.data);
+          const specs = parsed.specs.map((s) => ({
+            specId:     s.specId,
+            skuId:      s.specId,
+            attributes: s.specName || '默认规格',
+            price:      s.price ?? 0,
+          }));
+          console.log(`[product-specs] 官方 API 成功 offerId=${offerId} → ${specs.length} 条`);
+          res.json({ code: 200, data: specs, message: 'success' });
+          return;
+        }
+      } catch (e) {
+        console.warn(`[product-specs] 官方 API 失败:`, e instanceof Error ? e.message : e);
+      }
+
+      // ── 策略 3：历史买家订单反查 ─────────────────────────────
+      const fromOrders = await searchProductFromOrders(offerId, accessToken);
+      if (fromOrders) {
+        const specs = fromOrders.specs.map((s) => ({
+          specId:     s.specId,
+          skuId:      s.specId,
+          attributes: s.specName || '默认规格',
+          price:      s.price ?? 0,
+        }));
+        console.log(`[product-specs] 历史订单反查成功 offerId=${offerId} → ${specs.length} 条`);
+        res.json({ code: 200, data: specs, message: 'success' });
+        return;
+      }
+    }
+
+    res.status(502).json({
+      code: 502, data: null,
+      message: `无法获取 offerId=${offerId} 的规格信息，万邦和 1688 官方接口均未返回有效数据`,
+    });
+  } catch (err) {
+    console.error('[GET /api/alibaba/product-specs]', err);
+    res.status(500).json({ code: 500, data: null, message: '获取规格列表失败' });
+  }
+});
+
+// ── PATCH /api/alibaba/quick-map ─────────────────────────────
+// 快捷单点更新产品的 specId（下单弹窗内直接选规格补全）
+//
+// Body: { productId: number, externalSkuId: string, externalSkuIdNum?: string }
+// ──────────────────────────────────────────────────────────────
+router.patch('/quick-map', async (req: Request, res: Response) => {
+  try {
+    const { productId, externalSkuId, externalSkuIdNum } = req.body ?? {};
+
+    if (!productId || !externalSkuId || typeof externalSkuId !== 'string') {
+      res.status(400).json({
+        code: 400, data: null,
+        message: '缺少 productId 或 externalSkuId（32位MD5 specId）',
+      });
+      return;
+    }
+
+    const cleanSpecId = String(externalSkuId).trim();
+    if (!/^[a-fA-F0-9]{32}$/.test(cleanSpecId)) {
+      res.status(400).json({
+        code: 400, data: null,
+        message: `externalSkuId 必须是 32 位十六进制 MD5 字符串，收到: "${cleanSpecId.slice(0, 20)}..." (len=${cleanSpecId.length})`,
+      });
+      return;
+    }
+
+    const product = await prisma.product.findUnique({
+      where:  { id: Number(productId) },
+      select: { id: true, sku: true, externalProductId: true, externalSkuId: true },
+    });
+    if (!product) {
+      res.status(404).json({ code: 404, data: null, message: '产品不存在' });
+      return;
+    }
+
+    const updated = await prisma.product.update({
+      where: { id: product.id },
+      data: {
+        externalSkuId:    cleanSpecId,
+        externalSkuIdNum: externalSkuIdNum ? String(externalSkuIdNum).trim() : undefined,
+      },
+      select: {
+        id: true, sku: true,
+        externalProductId: true, externalSkuId: true, externalSkuIdNum: true,
+      },
+    });
+
+    console.log(
+      `[quick-map] 产品 #${product.id}(${product.sku}) specId 更新：` +
+      `${product.externalSkuId?.slice(0, 8) ?? 'null'} → ${cleanSpecId.slice(0, 8)}...`,
+    );
+
+    res.json({
+      code: 200,
+      data: updated,
+      message: `规格映射已更新 (specId: ${cleanSpecId.slice(0, 8)}...)`,
+    });
+  } catch (err) {
+    console.error('[PATCH /api/alibaba/quick-map]', err);
+    res.status(500).json({ code: 500, data: null, message: '更新规格映射失败' });
+  }
+});
+
 // ── POST /api/alibaba/create-order ───────────────────────────
 // 将已关联 1688 的采购产品批量下单到 1688（按 offerId 分组拆单，禁止跨店混单）
 // ★ 正确时序：先确保有 PurchaseOrder + PurchaseOrderItem，再调 1688，最后用 orderId 精准 update 子单
