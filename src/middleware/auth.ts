@@ -46,3 +46,31 @@ export function requirePermission(code: string) {
     next();
   };
 }
+
+// 超管守卫：仅允许超级管理员通过
+// 判断依据（与前端 isSuperAdmin 逻辑保持一致）：
+//   roleName 含 "admin" / "超级管理员"，或 permissions 包含 "*" / "ALL" / "ADMIN_FULL"
+export function requireSuperAdmin(req: Request, res: Response, next: NextFunction): void {
+  const user = req.user;
+  if (!user) {
+    res.status(401).json({ code: 401, data: null, message: '未登录，请先登录' });
+    return;
+  }
+  const roleNameLower = (user.roleName ?? '').toLowerCase();
+  const isSuperAdmin =
+    roleNameLower.includes('admin') ||
+    roleNameLower.includes('超级管理员') ||
+    user.permissions.includes('*') ||
+    user.permissions.includes('ALL') ||
+    user.permissions.includes('ADMIN_FULL');
+
+  if (!isSuperAdmin) {
+    res.status(403).json({
+      code: 403,
+      data: null,
+      message: '权限不足：该操作仅限超级管理员执行',
+    });
+    return;
+  }
+  next();
+}

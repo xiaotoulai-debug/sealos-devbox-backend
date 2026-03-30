@@ -1,6 +1,6 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../lib/prisma';
-import { authenticate } from '../middleware/auth';
+import { authenticate, requireSuperAdmin } from '../middleware/auth';
 import { importPublicSeaFromDisk } from '../services/importPublicSea';
 import { backfillProductUrls } from '../services/storeProductSync';
 
@@ -473,6 +473,8 @@ router.put('/:id/publish', async (req: Request, res: Response) => {
         purchaseType:     typeof purchaseType === 'string' && purchaseType.trim() ? purchaseType.trim() : 'FIRST',
         publishStatus:    'PUBLISHED',
         status:           'PURCHASING',
+        // ★ 进入采购计划时清空旧采购单关联，确保能出现在采购计划列表
+        purchaseOrderId:  null,
       },
     });
 
@@ -489,14 +491,21 @@ router.put('/:id/publish', async (req: Request, res: Response) => {
 });
 
 // ── GET /api/products/purchasing ──────────────────────────────
-// 采购清单：拉取状态为 PURCHASING 的产品
+// 采购计划列表：只显示 status=PURCHASING 且 purchaseOrderId=null 的产品
+// 状态机说明：
+//   PURCHASING + purchaseOrderId=null  → 在采购计划中（待建单）
+//   ORDERED    + purchaseOrderId!=null → 已建采购单，进入采购管理，不在计划列表显示
 router.get('/purchasing', async (req: Request, res: Response) => {
   try {
     const page     = Math.max(1, parseInt(String(req.query.page     ?? 1),  10) || 1);
     const pageSize = Math.min(100, Math.max(1, parseInt(String(req.query.pageSize ?? 20), 10) || 20));
     const skip     = (page - 1) * pageSize;
 
-    const where = { status: 'PURCHASING' as const, ownerId: req.user!.userId };
+    const where = {
+      status:          'PURCHASING' as const,
+      ownerId:         req.user!.userId,
+      purchaseOrderId: null,   // 双重保险：status+purchaseOrderId 共同确保只显示计划中的产品
+    };
 
     const [total, products] = await prisma.$transaction([
       prisma.product.count({ where }),
@@ -546,11 +555,20 @@ router.get('/purchasing', async (req: Request, res: Response) => {
 
 // ── GET /api/products/inventory ───────────────────────────────
 // 库存 SKU 列表：查询所有已建库（sku 非空）的产品，全员可见全量数据
+// 多仓兜底：每个产品的 warehouseStocks 数组长度 = 当前 ACTIVE 仓库总数，
+//           缺失记录自动补 0 占位，保证前端展开按钮始终可见。
 router.get('/inventory', async (req: Request, res: Response) => {
   try {
     const pageNum  = Math.max(1, Number(req.query.page)     || 1);
     const pageSize = Math.min(100, Math.max(1, Number(req.query.pageSize) || 20));
     const keyword  = typeof req.query.keyword === 'string' ? req.query.keyword.trim() : '';
+
+    // ① 预查所有启用仓库（用于后续补齐 0 库存占位行）
+    const activeWarehouses = await prisma.warehouse.findMany({
+      where:   { status: 'ACTIVE' },
+      orderBy: { id: 'asc' },
+      select:  { id: true, name: true, type: true },
+    });
 
     // 库存 SKU 属于团队公共资源，不按 ownerId 过滤，全员可查全量；排除已软删除记录
     const where: Record<string, unknown> = { sku: { not: null }, isDeleted: false };
@@ -568,37 +586,93 @@ router.get('/inventory', async (req: Request, res: Response) => {
         orderBy: { updatedAt: 'desc' },
         skip: (pageNum - 1) * pageSize,
         take: pageSize,
+        include: {
+          warehouseStocks: {
+            include: { warehouse: { select: { id: true, name: true, type: true, status: true } } },
+          },
+        },
       }),
       prisma.product.count({ where: where as any }),
     ]);
 
-    const list = products.map((p) => ({
-      id:             p.id,
-      pnk:            p.pnk,
-      title:          p.title,
-      brand:          p.brand,
-      sku:            p.sku,
-      chineseName:    p.chineseName   ?? null,
-      developer:      p.developer     ?? null,
-      imageUrl:       p.imageUrl,
-      price:          p.price         ? Number(p.price)         : null,
-      purchasePrice:  p.purchasePrice ? Number(p.purchasePrice) : null,
-      purchaseUrl:    p.purchaseUrl   ?? null,
-      length:         p.length        ? Number(p.length)        : null,
-      width:          p.width         ? Number(p.width)         : null,
-      height:         p.height        ? Number(p.height)        : null,
-      actualWeight:   p.actualWeight  ? Number(p.actualWeight)  : null,
-      stockActual:    p.stockActual,
-      stockInTransit: p.stockInTransit,
-      sales7d:        p.sales7d,
-      sales14d:       p.sales14d,
-      sales30d:       p.sales30d,
-      status:         p.status,
-      publishStatus:  p.publishStatus,
-      externalProductId: p.externalProductId ?? null,
-      externalSkuId:     p.externalSkuId     ?? null,
-      updatedAt:      p.updatedAt,
-    }));
+    const list = products.map((p) => {
+      // ② 多仓架构：总库存 = 各 ACTIVE 仓 stockQuantity 之和
+      const activeStocks = (p.warehouseStocks ?? []).filter((ws) => ws.warehouse.status === 'ACTIVE');
+      const totalStock = activeStocks.reduce((sum, ws) => sum + ws.stockQuantity, 0);
+
+      // ③ 已有记录 map（key = warehouseId）
+      const existingMap = new Map(
+        (p.warehouseStocks ?? []).map((ws) => [ws.warehouseId, ws]),
+      );
+
+      // 产品基础采购价（unitCost 为 0 时的兜底默认成本）
+      const basePurchasePrice = p.purchasePrice ? Number(p.purchasePrice) : 0;
+
+      // ④ 补齐缺失仓库 → 确保每个 ACTIVE 仓库都有对应行（stockQuantity = 0）
+      const fullWarehouseStocks = activeWarehouses.map((wh) => {
+        const ws = existingMap.get(wh.id);
+        if (ws) {
+          return {
+            id:                ws.id,
+            warehouseId:       ws.warehouseId,
+            warehouseName:     ws.warehouse.name,
+            warehouseType:     ws.warehouse.type,
+            stockQuantity:     ws.stockQuantity,
+            lockedQuantity:    ws.lockedQuantity,
+            inTransitQuantity: ws.inTransitQuantity,
+            // unitCost 为 0（尚未录入运费公摊）时，降级使用产品基础采购价兜底
+            unitCost:          ws.unitCost > 0 ? ws.unitCost : basePurchasePrice,
+            sales7:            ws.sales7,
+            sales14:           ws.sales14,
+            sales30:           ws.sales30,
+          };
+        }
+        // 该仓库无记录 → 0 库存占位行（id = null 前端可识别）
+        return {
+          id:                null,
+          warehouseId:       wh.id,
+          warehouseName:     wh.name,
+          warehouseType:     wh.type,
+          stockQuantity:     0,
+          lockedQuantity:    0,
+          inTransitQuantity: 0,
+          unitCost:          basePurchasePrice,   // 无记录时直接用产品采购价作为起始成本
+          sales7:            0,
+          sales14:           0,
+          sales30:           0,
+        };
+      });
+
+      return {
+        id:             p.id,
+        pnk:            p.pnk,
+        title:          p.title,
+        brand:          p.brand,
+        sku:            p.sku,
+        chineseName:    p.chineseName   ?? null,
+        developer:      p.developer     ?? null,
+        imageUrl:       p.imageUrl,
+        price:          p.price         ? Number(p.price)         : null,
+        purchasePrice:  p.purchasePrice ? Number(p.purchasePrice) : null,
+        purchaseUrl:    p.purchaseUrl   ?? null,
+        length:         p.length        ? Number(p.length)        : null,
+        width:          p.width         ? Number(p.width)         : null,
+        height:         p.height        ? Number(p.height)        : null,
+        actualWeight:   p.actualWeight  ? Number(p.actualWeight)  : null,
+        stockActual:    p.stockActual,                // 保留旧字段（向后兼容）
+        stockTotal:     totalStock,                   // 多仓汇总库存（前端优先使用此值）
+        stockInTransit: p.stockInTransit,
+        sales7d:        p.sales7d,
+        sales14d:       p.sales14d,
+        sales30d:       p.sales30d,
+        status:         p.status,
+        publishStatus:  p.publishStatus,
+        externalProductId: p.externalProductId ?? null,
+        externalSkuId:     p.externalSkuId     ?? null,
+        updatedAt:      p.updatedAt,
+        warehouseStocks: fullWarehouseStocks,         // 已补齐，长度 = ACTIVE 仓库数
+      };
+    });
 
     res.json({ code: 200, data: { list, total }, message: 'success' });
   } catch (err) {
@@ -832,11 +906,12 @@ router.put('/batch-rollback', async (req: Request, res: Response) => {
   }
 });
 
-// ── PUT /api/products/batch-discard ──────────────────────────
-// 智能移除采购计划产品：
-//   - MAN- 开头（手工建单/库存推送伪产品）→ 物理删除，彻底抹除
-//   - 真实 eMAG 产品（正常 PNK）→ 退回公海 PENDING，保留数据供后续同步
-router.put('/batch-discard', async (req: Request, res: Response) => {
+// ── POST /api/products/batch-discard  (前端调用)
+// ── PUT  /api/products/batch-discard  (兼容旧调用)
+// 从采购计划移除产品 —— 仅做状态退回，绝对禁止物理删除 Product 记录
+// Product 是主数据（Master Data），只有超管在【库存SKU】页面才可删除
+// body: { ids: number[] }
+async function batchDiscardHandler(req: Request, res: Response): Promise<void> {
   try {
     const { ids } = req.body ?? {};
     if (!Array.isArray(ids) || ids.length === 0) {
@@ -852,59 +927,39 @@ router.put('/batch-discard', async (req: Request, res: Response) => {
 
     const userId = req.user!.userId;
 
-    // 先查出符合条件的产品（必须是当前用户 + PURCHASING 状态）
-    const targets = await prisma.product.findMany({
-      where: { id: { in: productIds }, status: 'PURCHASING', ownerId: userId },
-      select: { id: true, pnk: true },
+    // 仅操作当前用户 + 采购计划状态（PURCHASING）的产品
+    const result = await prisma.product.updateMany({
+      where: {
+        id:      { in: productIds },
+        status:  'PURCHASING',
+        ownerId: userId,
+      },
+      data: {
+        // 退回意向产品池（SELECTED），清空采购计划暂存数据
+        status:           'SELECTED',
+        publishStatus:    'UNPUBLISHED',
+        purchaseQuantity: null,
+        purchasePeriod:   null,
+        purchaseType:     null,
+        purchaseOrderId:  null,
+      },
     });
 
-    if (targets.length === 0) {
-      res.json({ code: 200, data: { deleted: 0, returned: 0 }, message: '没有可操作的产品' });
-      return;
-    }
-
-    // 分流：MAN- 开头 → 物理删除；其他 → 退回公海
-    const toDelete  = targets.filter((p) => p.pnk.startsWith('MAN-')).map((p) => p.id);
-    const toReturn  = targets.filter((p) => !p.pnk.startsWith('MAN-')).map((p) => p.id);
-
-    let deletedCount = 0;
-    let returnedCount = 0;
-
-    await prisma.$transaction(async (tx) => {
-      // 物理删除手工伪产品
-      if (toDelete.length > 0) {
-        const del = await tx.product.deleteMany({ where: { id: { in: toDelete } } });
-        deletedCount = del.count;
-      }
-      // 退回公海并清空私有数据
-      if (toReturn.length > 0) {
-        const ret = await tx.product.updateMany({
-          where: { id: { in: toReturn } },
-          data: {
-            status:           'PENDING',
-            publishStatus:    'UNPUBLISHED',
-            ownerId:          null,
-            collectedAt:      null,
-            purchaseQuantity: null,
-            purchasePeriod:   null,
-            purchaseType:     null,
-            purchaseOrderId:  null,
-          },
-        });
-        returnedCount = ret.count;
-      }
-    });
-
+    console.log(`[batch-discard] userId=${userId} 移出计划 ${result.count} 个产品（状态退回 SELECTED）`);
     res.json({
-      code: 200,
-      data: { deleted: deletedCount, returned: returnedCount },
-      message: `已彻底删除 ${deletedCount} 个手工产品，${returnedCount} 个 eMAG 产品已退回公海`,
+      code:    200,
+      data:    { count: result.count },
+      message: `已将 ${result.count} 个产品从采购计划移出`,
     });
   } catch (err) {
-    console.error('[PUT /api/products/batch-discard]', err);
+    console.error('[batch-discard]', err);
     res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
   }
-});
+}
+
+// 同时注册 POST（前端实际调用）和 PUT（保留兼容）
+router.post('/batch-discard', batchDiscardHandler);
+router.put('/batch-discard', batchDiscardHandler);
 
 // ── PUT /api/products/batch-to-purchasing ──────────────────────
 // 从库存 SKU 批量推送产品到采购计划（返单采购）
@@ -943,6 +998,10 @@ router.put('/batch-to-purchasing', async (req: Request, res: Response) => {
             publishStatus:    'PUBLISHED',
             purchaseType:     'REPEAT',
             purchaseQuantity: newQty,
+            // ★ 必须清空 purchaseOrderId：产品重新进入采购计划意味着
+            //   它脱离了上一个采购单，purchaseOrderId: null 才能出现在
+            //   GET /api/products/purchasing 的采购计划列表中
+            purchaseOrderId:  null,
             ...(finalPrice != null ? { purchasePrice: finalPrice } : {}),
           },
         });
@@ -1183,6 +1242,82 @@ router.post('/inventory-batch-create', async (req: Request, res: Response) => {
   }
 });
 
+// ── DELETE /api/products/inventory ────────────────────────────
+// 批量强制删除库存 SKU（仅超级管理员可执行）
+// Body: { ids: number[] }
+// 级联清理顺序（事务内）：
+//   1. InventoryLog       — 流水记录
+//   2. FbeShipmentItem    — FBE 发货明细（若产品在 SHIPPED 中的发货单则拒绝删除）
+//   3. WarehouseStock     — 多仓库存明细
+//   4. Product (主表)     — 物理删除
+router.delete('/inventory', requireSuperAdmin, async (req: Request, res: Response) => {
+  try {
+    const { ids } = req.body as { ids: unknown };
+
+    if (!Array.isArray(ids) || ids.length === 0) {
+      res.status(400).json({ code: 400, data: null, message: 'ids 必须为非空数组' });
+      return;
+    }
+
+    const productIds: number[] = ids
+      .map((v) => Number(v))
+      .filter((v) => Number.isInteger(v) && v > 0);
+
+    if (productIds.length === 0) {
+      res.status(400).json({ code: 400, data: null, message: 'ids 中没有有效的产品 ID' });
+      return;
+    }
+
+    // ── 安全预检：拒绝删除仍在 SHIPPED（已发货/在途）FBE 发货单中的产品 ──
+    const activeShipmentItems = await prisma.fbeShipmentItem.findMany({
+      where: {
+        productId: { in: productIds },
+        shipment:  { status: { in: ['SHIPPED'] } },
+      },
+      select: { productId: true, shipment: { select: { shipmentNumber: true } } },
+    });
+    if (activeShipmentItems.length > 0) {
+      const blocked = activeShipmentItems.map(
+        (si) => `产品ID ${si.productId}（发货单 ${si.shipment.shipmentNumber}）`,
+      );
+      res.status(409).json({
+        code: 409,
+        data: null,
+        message: `以下产品仍在运输中，无法删除：${blocked.join('；')}`,
+      });
+      return;
+    }
+
+    // ── 事务级联删除 ───────────────────────────────────────────────
+    let deletedCount = 0;
+    await prisma.$transaction(async (tx) => {
+      // 1. 库存流水
+      await tx.inventoryLog.deleteMany({ where: { productId: { in: productIds } } });
+
+      // 2. FBE 发货明细（非 SHIPPED 状态，如 PENDING/ALLOCATING/ARRIVED/CANCELLED）
+      await tx.fbeShipmentItem.deleteMany({ where: { productId: { in: productIds } } });
+
+      // 3. 多仓库存明细
+      await tx.warehouseStock.deleteMany({ where: { productId: { in: productIds } } });
+
+      // 4. 主表物理删除（忽略软删除标记，强制清除）
+      const result = await tx.product.deleteMany({ where: { id: { in: productIds } } });
+      deletedCount = result.count;
+    });
+
+    console.log(`[批量删除SKU] 操作者=${req.user!.username}，删除 ${deletedCount} 条产品，ids=[${productIds.join(',')}]`);
+
+    res.json({
+      code: 200,
+      data: { deletedCount, requestedCount: productIds.length },
+      message: `已成功删除 ${deletedCount} 个 SKU 及其全部关联数据`,
+    });
+  } catch (err: unknown) {
+    console.error('[DELETE /api/products/inventory]', err);
+    res.status(500).json({ code: 500, data: null, message: '批量删除失败，请检查数据关联' });
+  }
+});
+
 // ── DELETE /api/products/inventory/:id ────────────────────────
 // 智能混合删除：优先物理删除；若有关联业务数据（FK 约束 P2003），降级为软删除归档
 // 无论哪种结果，均返回 200，绝不导致进程崩溃或返回 503
@@ -1279,6 +1414,176 @@ router.get('/inventory-export', async (req: Request, res: Response) => {
   } catch (err) {
     console.error('[GET /api/products/inventory-export]', err);
     res.status(500).json({ code: 500, data: null, message: '导出失败' });
+  }
+});
+
+// ── PATCH /api/products/:id/quick-map ────────────────────────
+// 快捷单点更新产品的 1688 规格 specId（下单弹窗内联选规格后立即补全映射）
+//
+// Body: { externalSkuId: string (32位MD5), externalSkuIdNum?: string }
+// ──────────────────────────────────────────────────────────────
+router.patch('/:id/quick-map', async (req: Request, res: Response) => {
+  try {
+    const productId = parseInt(String(req.params.id), 10);
+    if (isNaN(productId) || productId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: '产品 ID 无效' });
+      return;
+    }
+
+    const { externalSkuId, externalSkuIdNum } = req.body ?? {};
+
+    if (!externalSkuId || typeof externalSkuId !== 'string' || !externalSkuId.trim()) {
+      res.status(400).json({ code: 400, data: null, message: '缺少 externalSkuId（32位MD5 specId）' });
+      return;
+    }
+
+    const cleanSpecId = externalSkuId.trim();
+    if (!/^[a-fA-F0-9]{32}$/.test(cleanSpecId)) {
+      res.status(400).json({
+        code: 400, data: null,
+        message: `externalSkuId 必须是 32 位十六进制 MD5 字符串，收到 "${cleanSpecId.slice(0, 20)}..." (len=${cleanSpecId.length})`,
+      });
+      return;
+    }
+
+    const product = await prisma.product.findUnique({
+      where:  { id: productId },
+      select: { id: true, sku: true, externalProductId: true, externalSkuId: true },
+    });
+    if (!product) {
+      res.status(404).json({ code: 404, data: null, message: '产品不存在' });
+      return;
+    }
+
+    const updated = await prisma.product.update({
+      where: { id: productId },
+      data: {
+        externalSkuId:    cleanSpecId,
+        externalSkuIdNum: externalSkuIdNum ? String(externalSkuIdNum).trim() : undefined,
+        externalSynced:   true,   // 标记已完成 1688 映射，下单校验可通过
+      },
+      select: {
+        id: true, sku: true,
+        externalProductId: true, externalSkuId: true,
+        externalSkuIdNum: true, externalSynced: true,
+      },
+    });
+
+    console.log(
+      `[quick-map] 产品 #${productId}(${product.sku ?? 'no-sku'}) specId 已更新：` +
+      `${product.externalSkuId?.slice(0, 8) ?? 'null'} → ${cleanSpecId.slice(0, 8)}...`,
+    );
+
+    res.json({
+      code: 200,
+      data: updated,
+      message: `规格映射已更新 (specId: ${cleanSpecId.slice(0, 8)}...)`,
+    });
+  } catch (err: any) {
+    console.error('[PATCH /api/products/:id/quick-map]', err?.message ?? err);
+    res.status(500).json({ code: 500, data: null, message: '更新规格映射失败' });
+  }
+});
+
+// ── POST /api/products/remove-from-plan ───────────────────────────────────
+// 从采购计划移除产品（只操作计划中的产品，即 status=PURCHASING + purchaseOrderId=null）
+// 仅做状态退回，绝对禁止物理删除 Product 主数据
+// body: { productIds: number[] }
+// ──────────────────────────────────────────────────────────────────────────
+router.post('/remove-from-plan', async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.userId;
+    const { productIds } = req.body ?? {};
+
+    if (!Array.isArray(productIds) || productIds.length === 0) {
+      res.status(400).json({ code: 400, data: null, message: '请提供 productIds 数组' });
+      return;
+    }
+
+    const ids = productIds.map(Number).filter((n) => !isNaN(n) && n > 0);
+    if (ids.length === 0) {
+      res.status(400).json({ code: 400, data: null, message: 'productIds 无效' });
+      return;
+    }
+
+    // 仅操作「计划中」的产品：status=PURCHASING + purchaseOrderId=null + 属于当前用户
+    const result = await prisma.product.updateMany({
+      where: {
+        id:              { in: ids },
+        status:          'PURCHASING',
+        purchaseOrderId: null,
+        ownerId:         userId,
+      },
+      data: {
+        status:           'SELECTED',
+        publishStatus:    'UNPUBLISHED',
+        purchaseQuantity: null,
+        purchasePeriod:   null,
+        purchaseType:     null,
+        purchaseOrderId:  null,
+      },
+    });
+
+    if (result.count === 0) {
+      res.json({ code: 200, data: { count: 0 }, message: '没有可移除的计划产品（可能已建单或不属于当前用户）' });
+      return;
+    }
+
+    console.log(`[remove-from-plan] userId=${userId} 移出计划 ${result.count} 个产品（状态退回 SELECTED）`);
+    res.json({ code: 200, data: { count: result.count }, message: `已将 ${result.count} 个产品从采购计划移出` });
+  } catch (err: any) {
+    console.error('[POST /api/products/remove-from-plan]', err?.message ?? err);
+    res.status(500).json({ code: 500, data: null, message: '移除计划产品失败' });
+  }
+});
+
+// ── PATCH /api/products/:id/plan-quantity ─────────────────────────────────
+// 修改采购计划中单个产品的预定采购数量（只允许修改尚未建单的计划产品）
+// body: { quantity: number }
+// ──────────────────────────────────────────────────────────────────────────
+router.patch('/:id/plan-quantity', async (req: Request, res: Response) => {
+  try {
+    const userId    = req.user!.userId;
+    const productId = parseInt(String(req.params.id), 10);
+
+    if (isNaN(productId) || productId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: '产品 ID 无效' });
+      return;
+    }
+
+    const qty = parseInt(String(req.body?.quantity ?? req.body?.purchaseQuantity), 10);
+    if (isNaN(qty) || qty < 1) {
+      res.status(400).json({ code: 400, data: null, message: '采购数量必须 ≥ 1' });
+      return;
+    }
+
+    // 安全校验：只允许修改「计划中」的产品（status=PURCHASING + purchaseOrderId=null + 属于当前用户）
+    const product = await prisma.product.findFirst({
+      where: {
+        id:              productId,
+        status:          'PURCHASING',
+        purchaseOrderId: null,
+        ownerId:         userId,
+      },
+      select: { id: true, sku: true, purchaseQuantity: true },
+    });
+
+    if (!product) {
+      res.status(404).json({ code: 404, data: null, message: '产品不在采购计划中，或已建单无法修改数量' });
+      return;
+    }
+
+    const updated = await prisma.product.update({
+      where: { id: productId },
+      data:  { purchaseQuantity: qty },
+      select: { id: true, sku: true, purchaseQuantity: true },
+    });
+
+    console.log(`[plan-quantity] 产品 #${productId}(${product.sku ?? '-'}) 采购数量 ${product.purchaseQuantity ?? 0} → ${qty}`);
+    res.json({ code: 200, data: updated, message: `采购数量已更新为 ${qty}` });
+  } catch (err: any) {
+    console.error('[PATCH /api/products/:id/plan-quantity]', err?.message ?? err);
+    res.status(500).json({ code: 500, data: null, message: '更新采购数量失败' });
   }
 });
 

@@ -21,6 +21,10 @@ import dashboardRouter from './routes/dashboard';
 import storeProductsRouter from './routes/storeProducts';
 import permissionRouter from './routes/permission';
 import translateRouter from './routes/translate';
+import fbeShipmentRouter from './routes/fbeShipment';
+import inventoryRouter from './routes/inventory';
+import warehouseRouter from './routes/warehouse';
+import purchaseRouter from './routes/purchase';
 import { startSyncCrons } from './services/syncCron';
 import { backfillProductImages } from './services/storeProductSync';
 
@@ -43,8 +47,8 @@ if (!process.env.JWT_SECRET?.trim()) {
 
 // ── 中间件 ────────────────────────────────────────────────────
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true })); // 兼容 form-urlencoded 登录请求
+app.use(express.json({ limit: '10mb' }));
+app.use(express.urlencoded({ limit: '10mb', extended: true })); // 兼容 form-urlencoded 登录请求
 
 // ── 路由 ──────────────────────────────────────────────────────
 app.use('/api/auth',     authRouter);       // POST /api/auth/login
@@ -62,6 +66,10 @@ app.use('/api/emag',    emagRouter);    // eMAG 核心业务 API
 app.use('/api/dashboard', dashboardRouter); // 实时业绩看板
 app.use('/api/store-products', storeProductsRouter); // 店铺在售产品（仅 StoreProduct，不混公海）
 app.use('/api/translate', translateRouter);          // 翻译代理（MyMemory API 转发）
+app.use('/api/fbe-shipments', fbeShipmentRouter);   // FBE 发货单管理（在途库存闭环）
+app.use('/api/inventory',    inventoryRouter);      // 进销存：batch-adjust / purchase-orders receive / logs
+app.use('/api/warehouses',   warehouseRouter);     // 仓库管理：列表 / 创建 / 编辑
+app.use('/api/purchases',   purchaseRouter);     // 采购管理（重构版）：create-local（一品一单）/ place-1688-order
 
 // ── 启动时打印关键路由（确认 sync-urls 已注册）────────────────────
 function printRegisteredRoutes() {

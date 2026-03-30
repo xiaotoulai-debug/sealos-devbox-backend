@@ -52,6 +52,13 @@ const MENU_DEFINITIONS: {
   // ── 系统设置 子菜单 ────────────────────────────────────────────
   { code: 'MENU_SHOP_AUTH',         name: '店铺授权',   sortOrder: 1,  parentCode: 'MENU_SYSTEM_SETTINGS' },
   { code: 'MENU_1688_CONFIG',       name: '1688 配置',  sortOrder: 2,  parentCode: 'MENU_SYSTEM_SETTINGS' },
+
+  // ── 顶级：仓储管理 ────────────────────────────────────────────
+  { code: 'MENU_WAREHOUSE',         name: '仓储管理',   sortOrder: 7,  parentCode: null },
+
+  // ── 仓储管理 子菜单 ────────────────────────────────────────────
+  { code: 'MENU_WAREHOUSE_LIST',    name: '仓库列表',   sortOrder: 1,  parentCode: 'MENU_WAREHOUSE' },
+  { code: 'MENU_FBE_SHIPMENTS',     name: 'FBE 发货单', sortOrder: 2,  parentCode: 'MENU_WAREHOUSE' },
 ];
 
 async function main() {

@@ -222,7 +222,9 @@ router.delete('/:id', async (req: Request, res: Response) => {
 
 // ── PUT /api/roles/:id/permissions ───────────────────────────
 // 覆盖式更新角色权限（先清后写，事务保证原子性）
-// Body: { permissionIds: number[] }
+// Body: { permissionIds?: number[] }  ← 传数字 ID 数组
+//    或: { permissionCodes?: string[] } ← 传字符串 code 数组（前端推荐）
+// 两者至少传一个；都传时以 permissionCodes 优先
 // 安全：超级管理员角色的权限禁止通过此接口修改
 router.put('/:id/permissions', async (req: Request, res: Response) => {
   const id = Number(req.params.id);
@@ -231,15 +233,29 @@ router.put('/:id/permissions', async (req: Request, res: Response) => {
     return;
   }
 
-  const raw = req.body?.permissionIds;
-  if (!Array.isArray(raw)) {
-    res.status(400).json({ code: 400, data: null, message: 'permissionIds 必须是数组' });
+  const rawCodes  = req.body?.permissionCodes;
+  const rawIds    = req.body?.permissionIds;
+
+  // 调试日志：记录前端实际传入的字段（便于排查 code 不匹配）
+  console.log(
+    `[PUT /api/roles/${id}/permissions] body keys:`, Object.keys(req.body ?? {}),
+    '| permissionCodes:', Array.isArray(rawCodes) ? `array[${rawCodes.length}]` : typeof rawCodes,
+    '| permissionIds:', Array.isArray(rawIds) ? `array[${rawIds.length}]` : typeof rawIds,
+    '| sample:', Array.isArray(rawCodes) ? rawCodes.slice(0, 3) : (Array.isArray(rawIds) ? rawIds.slice(0, 3) : '-'),
+  );
+
+  // 两个字段都没传、或都不是数组 → 报错
+  const hasCodes = Array.isArray(rawCodes);
+  const hasIds   = Array.isArray(rawIds);
+
+  if (!hasCodes && !hasIds) {
+    res.status(400).json({
+      code: 400,
+      data: null,
+      message: '请传入 permissionCodes（string[]）或 permissionIds（number[]）',
+    });
     return;
   }
-
-  const permissionIds: number[] = raw
-    .map((v: unknown) => Number(v))
-    .filter((v: number) => Number.isInteger(v) && v > 0);
 
   try {
     const role = await prisma.role.findUnique({ where: { id } });
@@ -255,6 +271,56 @@ router.put('/:id/permissions', async (req: Request, res: Response) => {
         message: `「${PROTECTED_ROLE_NAME}」是系统预置角色，其权限不允许修改`,
       });
       return;
+    }
+
+    // ── 将 codes 或 ids 统一解析为最终的 permissionIds: number[] ──────
+    let permissionIds: number[] = [];
+
+    if (hasCodes) {
+      // 前端传 code 字符串数组 → 批量查库换取 id
+      const codes: string[] = (rawCodes as unknown[])
+        .map((v) => String(v).trim())
+        .filter((v) => v.length > 0);
+
+      if (codes.length > 0) {
+        const found = await prisma.permission.findMany({
+          where: { code: { in: codes } },
+          select: { id: true, code: true },
+        });
+        // 软跳过：不存在的 code 只打警告日志，不阻断保存
+        // 原因：前端权限树可能包含尚未注册的父节点/动态 code，硬拒绝会导致整个保存失败
+        const foundCodes = new Set(found.map((p) => p.code));
+        const ghostCodes = codes.filter((c) => !foundCodes.has(c));
+        if (ghostCodes.length > 0) {
+          console.warn(
+            `[PUT /api/roles/${id}/permissions] 以下 code 在 Permission 表中不存在，已跳过：`,
+            ghostCodes,
+          );
+        }
+        permissionIds = found.map((p) => p.id);
+      }
+    } else {
+      // 前端传 number[] id 数组
+      const ids: number[] = (rawIds as unknown[])
+        .map((v) => Number(v))
+        .filter((v) => Number.isInteger(v) && v > 0);
+
+      if (ids.length > 0) {
+        const found = await prisma.permission.findMany({
+          where: { id: { in: ids } },
+          select: { id: true },
+        });
+        // 软跳过：不存在的 id 只打警告日志，不阻断保存
+        const foundSet = new Set(found.map((p) => p.id));
+        const ghostIds = ids.filter((pid) => !foundSet.has(pid));
+        if (ghostIds.length > 0) {
+          console.warn(
+            `[PUT /api/roles/${id}/permissions] 以下 permissionId 不存在，已跳过：`,
+            ghostIds,
+          );
+        }
+        permissionIds = found.map((p) => p.id);
+      }
     }
 
     // 事务：先清空该角色所有权限关联，再批量写入新的
