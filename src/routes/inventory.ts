@@ -35,7 +35,16 @@ export async function applyStockChange(
     select: { stockActual: true },
   });
   const before = prod?.stockActual ?? 0;
-  const after = Math.max(0, before + opts.changeQuantity);
+  const raw    = before + opts.changeQuantity;
+  const after  = Math.max(0, raw);
+
+  if (raw < 0) {
+    console.warn(
+      `[applyStockChange] ⚠️ 防负库存保护触发 | productId=${opts.productId} type=${opts.type}` +
+      ` | before=${before} change=${opts.changeQuantity} → 计算值=${raw}，已强制截止为 0` +
+      (opts.referenceId ? ` | refId=${opts.referenceId}` : ''),
+    );
+  }
 
   await tx.product.update({
     where: { id: opts.productId },

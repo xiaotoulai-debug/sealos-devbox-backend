@@ -55,6 +55,113 @@ function mapOrderToDTO(r: PlatformOrderRow, productsOverride?: unknown[]) {
   };
 }
 
+// ─── 图片富化辅助：平台产品优先 → 本地库存兜底 ──────────────────────
+// 与 storeProducts.ts 保持完全一致的四级兜底链：
+//   订单 SKU → StoreProduct
+//     → ① StoreProduct.mainImage（eMAG 主图）
+//     → ② StoreProduct.imageUrl（eMAG 副图）
+//     → ③ Product.imageUrl（本地库存 SKU 图，优先 mappedInventorySku，次选 vendorSku）
+//     → ④ Inventory.localImage（遗留手动上传图）
+//     → null
+//
+// ★ 关键：Step2 必须优先用 mappedInventorySku（用户手动关联关系）查 Product，
+//          而非直接用 vendorSku（vendorSku 可能与本地 SKU 不同，如 TS094 → WXSPQ01）。
+async function buildOrderImageMap(
+  shopIds: number[],
+  orderSkus: string[],
+): Promise<Map<string, { imageUrl: string | null; display_image: string | null; image_status: string }>> {
+  const resultMap = new Map<string, { imageUrl: string | null; display_image: string | null; image_status: string }>();
+  if (orderSkus.length === 0) return resultMap;
+
+  // ── Step 1: 批量查 StoreProduct（含 mappedInventorySku）──────────
+  const storeProducts = await prisma.storeProduct.findMany({
+    where: {
+      shopId: { in: shopIds },
+      OR: [{ sku: { in: orderSkus } }, { vendorSku: { in: orderSkus } }],
+    },
+    select: { sku: true, vendorSku: true, mainImage: true, imageUrl: true, mappedInventorySku: true },
+  });
+
+  // ── Step 2: 构造每条 SP 的本地查询键（storeProducts.ts 同款逻辑）──
+  // 优先级：mappedInventorySku（手动关联）> vendorSku > sku
+  // 与 storeProducts.ts line 620 完全对齐：
+  //   const skuKey = (p.mappedInventorySku ?? '').trim() || (p.sku ?? p.vendorSku ?? '').trim()
+  const localQuerySkus = [
+    ...new Set(
+      storeProducts
+        .map((sp) => (sp.mappedInventorySku?.trim() || sp.vendorSku?.trim() || sp.sku?.trim() || ''))
+        .filter(Boolean),
+    ),
+  ];
+
+  const localProducts = localQuerySkus.length > 0
+    ? await prisma.product.findMany({
+        where: { sku: { in: localQuerySkus } },   // 与 storeProducts.ts 一致，不过滤 isDeleted
+        select: { sku: true, imageUrl: true },
+      })
+    : [];
+  const localImgMap = new Map<string, string | null>(
+    localProducts.map((lp) => [lp.sku!, lp.imageUrl ?? null]),
+  );
+
+  // ── Step 3: Product 无图时→ Inventory.localImage（④级遗留兜底）──
+  const noImgLocalSkus = localQuerySkus.filter((s) => !localImgMap.get(s));
+  // 同时兜底 StoreProduct 完全未匹配的 orderSku（直接用 orderSku 查 Inventory）
+  const spHitSkus = new Set(storeProducts.flatMap((sp) => [sp.sku, sp.vendorSku].filter(Boolean) as string[]));
+  const noSpOrderSkus = orderSkus.filter((s) => !spHitSkus.has(s));
+  const invQuerySkus  = [...new Set([...noImgLocalSkus, ...noSpOrderSkus])];
+
+  const invProducts = invQuerySkus.length > 0
+    ? await prisma.inventory.findMany({
+        where: { sku: { in: invQuerySkus } },
+        select: { sku: true, localImage: true },
+      })
+    : [];
+  const invImgMap = new Map<string, string | null>(
+    invProducts.map((inv) => [inv.sku, inv.localImage ?? null]),
+  );
+
+  // ── 构建最终 SKU → 图片信息 Map ──────────────────────────────────
+  // ★ 关键规则：同一 SKU 出现在多家店铺时（多店铺聚合查询），
+  //   后处理的无图记录绝不允许覆盖已存入的有图记录。
+  //   策略：只有当新图比旧图"更好"（旧无图而新有图）时才更新。
+  const setIfBetter = (key: string, info: { imageUrl: string | null; display_image: string | null; image_status: string }) => {
+    const existing = resultMap.get(key);
+    if (!existing || (!existing.imageUrl && info.imageUrl)) {
+      resultMap.set(key, info);
+    }
+  };
+
+  for (const sp of storeProducts) {
+    const localKey   = sp.mappedInventorySku?.trim() || sp.vendorSku?.trim() || sp.sku?.trim() || '';
+    const productImg = localKey ? (localImgMap.get(localKey) ?? null) : null;
+    const invImg     = localKey ? (invImgMap.get(localKey)   ?? null) : null;
+    const finalImg   = sp.mainImage || sp.imageUrl || productImg || invImg || null;
+
+    const info = {
+      imageUrl:      finalImg,
+      display_image: finalImg,
+      image_status:  finalImg ? '正常' : '待补全平台产品资料',
+    };
+    if (sp.sku)       setIfBetter(sp.sku, info);
+    if (sp.vendorSku) setIfBetter(sp.vendorSku, info);
+  }
+
+  // ── 对 StoreProduct 完全未匹配的 orderSku，直接查 Inventory 兜底 ──
+  for (const sku of noSpOrderSkus) {
+    if (!resultMap.has(sku)) {
+      const invImg = invImgMap.get(sku) ?? null;
+      resultMap.set(sku, {
+        imageUrl:      invImg,
+        display_image: invImg,
+        image_status:  invImg ? '正常' : '待补全平台产品资料',
+      });
+    }
+  }
+
+  return resultMap;
+}
+
 const router = Router();
 router.use(authenticate);
 
@@ -436,10 +543,51 @@ router.get('/', async (req: Request, res: Response) => {
         }),
       ]);
 
-      const list = rows.map((r) => mapOrderToDTO(r));
+      // ── 批量图片富化（平台产品优先 → 本地库存兜底）──────────────
+      const allOrderSkus = [
+        ...new Set(
+          rows.flatMap((r) => {
+            const prods: Array<{ sku?: string }> = r.productsJson ? JSON.parse(r.productsJson) : [];
+            return prods.map((p) => String(p.sku ?? '').trim()).filter(Boolean);
+          }),
+        ),
+      ];
+      const imageMap = await buildOrderImageMap(shopIds, allOrderSkus);
 
-      if (list.length > 0) {
-        console.log(`[平台订单] 查询样本(shopIds=${shopIds}):`, JSON.stringify(list[0], null, 2));
+      const list = rows.map((r) => {
+        const rawProds: Array<{ sku?: string; [k: string]: unknown }> =
+          r.productsJson ? JSON.parse(r.productsJson) : [];
+        const enrichedProds = rawProds.map((p) => {
+          const sku     = String(p.sku ?? '').trim();
+          const imgInfo = sku ? imageMap.get(sku) : undefined;
+          const finalImg = imgInfo?.imageUrl ?? null;
+          // 剔除原始 image_url（eMAG 原始字段，通常为空），统一由后端注入
+          const { image_url, ...rest } = p as { image_url?: string; [k: string]: unknown };
+          return {
+            ...rest,
+            // ★ 强制写入所有前端可能读取的图片字段名，确保必然命中
+            imageUrl:      finalImg,
+            image_url:     finalImg,
+            display_image: finalImg,
+            image_status:  imgInfo?.image_status ?? (sku ? '待补全平台产品资料' : '正常'),
+          };
+        });
+        return mapOrderToDTO(r, enrichedProds);
+      });
+
+      // ── 诊断日志：打印包含 TS094 的第一个订单明细，以便验证富化结果 ──
+      const ts094Order = list.find((o) =>
+        Array.isArray((o as any).products) &&
+        (o as any).products.some((p: any) => p.sku === 'TS094'),
+      );
+      if (ts094Order) {
+        const ts094Prods = (ts094Order as any).products.filter((p: any) => p.sku === 'TS094');
+        console.log(
+          `[平台订单][诊断] TS094 富化结果(shopIds=${shopIds}):`,
+          JSON.stringify(ts094Prods, null, 2),
+        );
+      } else if (list.length > 0) {
+        console.log(`[平台订单] 首条样本(shopIds=${shopIds}):`, JSON.stringify((list[0] as any).products?.slice(0, 1), null, 2));
       }
 
       res.json({
@@ -656,38 +804,25 @@ router.get('/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    // 富化产品列表：补充图片状态（仅详情接口需要）
+    // 富化产品列表：平台产品优先 → 本地库存兜底（共用 buildOrderImageMap）
     const rawProducts: Array<{ sku?: string | null; [k: string]: unknown }> =
       row.productsJson ? JSON.parse(row.productsJson) : [];
 
     const orderSkus = [...new Set(rawProducts.map((p) => String(p.sku ?? '').trim()).filter(Boolean))];
-    const storeProductMap = new Map<string, { display_image: string | null; image_status: string }>();
-
-    if (orderSkus.length > 0) {
-      const storeProducts = await prisma.storeProduct.findMany({
-        where: {
-          shopId: row.shopId,
-          OR: [{ sku: { in: orderSkus } }, { vendorSku: { in: orderSkus } }],
-        },
-        select: { sku: true, vendorSku: true, mainImage: true, imageUrl: true },
-      });
-
-      for (const sp of storeProducts) {
-        const platformImg = (sp.mainImage ?? sp.imageUrl ?? '').trim() || null;
-        const info = { display_image: platformImg, image_status: platformImg ? '正常' : '待补全平台产品资料' };
-        if (sp.sku) storeProductMap.set(sp.sku, info);
-        if (sp.vendorSku) storeProductMap.set(sp.vendorSku, info);
-      }
-    }
+    const imageMap  = await buildOrderImageMap([row.shopId], orderSkus);
 
     const enrichedProducts = rawProducts.map((p) => {
-      const sku = String(p.sku ?? '').trim();
-      const spData = sku ? storeProductMap.get(sku) : undefined;
+      const sku      = String(p.sku ?? '').trim();
+      const imgInfo  = sku ? imageMap.get(sku) : undefined;
+      const finalImg = imgInfo?.imageUrl ?? null;
       const { image_url, ...rest } = p as { image_url?: string; [k: string]: unknown };
       return {
         ...rest,
-        display_image: spData?.display_image ?? null,
-        image_status: spData?.image_status ?? (sku ? '待补全平台产品资料' : '正常'),
+        // ★ 强制写入所有前端可能读取的图片字段名
+        imageUrl:      finalImg,
+        image_url:     finalImg,
+        display_image: finalImg,
+        image_status:  imgInfo?.image_status ?? (sku ? '待补全平台产品资料' : '正常'),
       };
     });
 

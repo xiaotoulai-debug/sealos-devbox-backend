@@ -1,8 +1,7 @@
 import { Router, Request, Response } from 'express';
 import { prisma } from '../lib/prisma';
 import { authenticate } from '../middleware/auth';
-import { getFirstEmagShopId } from '../services/emagClient';
-import { getStatsFromLocalDB } from '../services/dashboardStats';
+import { getGlobalDashboardStats, getGlobalStatsV2 } from '../services/dashboardStats';
 
 const router = Router();
 router.use(authenticate);
@@ -37,57 +36,30 @@ router.get('/shops', async (_req: Request, res: Response) => {
   }
 });
 
-async function resolveShopId(req: Request): Promise<number> {
-  const id = Number(req.body?.shopId ?? req.query?.shopId);
-  if (id && !isNaN(id)) return id;
-  const first = await getFirstEmagShopId();
-  if (first) return first;
-  throw new Error('缺少 shopId 参数，且数据库中无已授权的 eMAG 店铺');
-}
+/**
+ * 全局大盘统计（新版）
+ * - 永远执行全量扫描，无视 shopId 参数
+ * - 近30天单次查询，内存派生双块数据
+ */
+async function handleStats(_req: Request, res: Response): Promise<void> {
+  const stats = await getGlobalDashboardStats();
+  const total30 = stats.storeSummaries.reduce((s, r) => s + r.last30DaysOrders, 0);
+  const total7  = stats.storeSummaries.reduce((s, r) => s + r.last7DaysOrders, 0);
+  const yday    = stats.storeSummaries.reduce((s, r) => s + r.yesterdayOrders, 0);
 
-function getDefaultDateRange(days: number): { startDate: string; endDate: string } {
-  const end = new Date();
-  const start = new Date();
-  start.setDate(start.getDate() - (days - 1));
-  return {
-    startDate: start.toISOString().slice(0, 10),
-    endDate: end.toISOString().slice(0, 10),
-  };
-}
-
-async function handleStats(req: Request, res: Response): Promise<void> {
-  const shopId = await resolveShopId(req);
-  let startDate = (req.query.startDate ?? req.body?.startDate) as string | undefined;
-  let endDate = (req.query.endDate ?? req.body?.endDate) as string | undefined;
-
-  const rangeDays = Number(req.query.range ?? req.body?.range ?? 7);
-  if (!startDate || !endDate) {
-    const def = getDefaultDateRange(Math.min(30, Math.max(7, rangeDays)));
-    startDate = startDate ?? def.startDate;
-    endDate = endDate ?? def.endDate;
-  }
-
-  const stats = await getStatsFromLocalDB(shopId, startDate, endDate);
-
-  const rangeLabel = rangeDays <= 7 ? 'Last 7 Days' : rangeDays <= 14 ? 'Last 14 Days' : 'Last 30 Days';
-  console.log(`[Dashboard Stats] Total: ${stats.totalOrders}, GMV: ${stats.totalGmv}, Range: ${rangeLabel} (${startDate} ~ ${endDate})`);
-
-  const gmv = Number(stats.totalGmv) || 0;
-
-  const trend_data = stats.daily.map((d) => ({
-    date: d.date.slice(5),
-    order_count: Number(d.orders) || 0,
-    sales_amount: Math.round((Number(d.gmv) || 0) * 100) / 100,
-  }));
-
-  console.log(`[Dashboard trend_data] length=${trend_data.length}:`, trend_data);
-
-  const data = { ...stats, gmv, trend_data };
+  // 诊断日志：方便核查后端是否正常吐数据
+  console.log(
+    `[Dashboard/stats] today=${stats.today}` +
+    ` | 近30天=${total30}单 | 近7天=${total7}单 | 昨日=${yday}单` +
+    ` | 店铺数=${stats.storeSummaries.length}` +
+    ` | 趋势条数=${stats.dailyTrends.length}`,
+  );
+  console.log('[Dashboard/stats] storeSummaries 字段名示例:', Object.keys(stats.storeSummaries[0] ?? {}));
 
   res.json({
-    code: 200,
-    data,
-    message: stats.results.length === 0 ? 'success（该时间范围内暂无订单）' : 'success',
+    code:    200,
+    data:    stats,
+    message: total30 === 0 ? 'success（近30天暂无订单）' : 'success',
   });
 }
 
@@ -109,6 +81,41 @@ router.post('/stats', async (req: Request, res: Response) => {
     await handleStats(req, res);
   } catch (err: any) {
     console.error('[POST /api/dashboard/stats]', err.message);
+    res.status(500).json({ code: 500, data: null, message: err.message });
+  }
+});
+
+/**
+ * GET /api/dashboard/global-stats?startDate=2026-03-25&endDate=2026-03-31
+ *
+ * 一站式全局大盘聚合接口（新版，取代所有零碎接口）
+ *
+ * 查库策略：Promise.all 并行 2 查
+ *   Q1 shopAuthorization.findMany  — 店铺元数据（~10 行）
+ *   Q2 $queryRaw GROUP BY          — DB 层直接聚合，无拉原始行
+ *
+ * 响应包含：
+ *   globalSummary  — 全局总览（区间内总单量 + 昨日/7天/30天汇总）
+ *   storeSummaries — 各店汇总表（camelCase + snake_case 双命名）
+ *   dailyTrends    — 走势明细（含零值，前端多折线图直用）
+ */
+router.get('/global-stats', async (req: Request, res: Response) => {
+  try {
+    const startDate = req.query.startDate as string | undefined;
+    const endDate   = req.query.endDate   as string | undefined;
+
+    const data = await getGlobalStatsV2(startDate, endDate);
+
+    res.setHeader('Cache-Control', 'no-store');
+    res.json({
+      code:    200,
+      data,
+      message: data.globalSummary.month30 === 0
+        ? 'success（近30天暂无订单）'
+        : 'success',
+    });
+  } catch (err: any) {
+    console.error('[GET /api/dashboard/global-stats]', err.message, err.stack?.slice(0, 300));
     res.status(500).json({ code: 500, data: null, message: err.message });
   }
 });

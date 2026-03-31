@@ -249,11 +249,16 @@ router.post('/', async (req: Request, res: Response) => {
       if (validWarehouseId !== null) {
         for (const item of items) {
           const productId = skuToProductId.get(item.sku.trim())!;
-          await tx.warehouseStock.upsert({
-            where:  { productId_warehouseId: { productId, warehouseId: validWarehouseId } },
-            create: { productId, warehouseId: validWarehouseId, stockQuantity: 0, lockedQuantity: item.quantity },
-            update: { lockedQuantity: { increment: item.quantity } },
-          });
+          try {
+            await tx.warehouseStock.upsert({
+              where:  { productId_warehouseId: { productId, warehouseId: validWarehouseId } },
+              create: { productId, warehouseId: validWarehouseId, stockQuantity: 0, lockedQuantity: item.quantity },
+              update: { lockedQuantity: { increment: item.quantity } },
+            });
+          } catch (lockErr: any) {
+            console.error(`[FBE] 创建发货单锁仓失败 | SKU [${item.sku}]:`, lockErr?.message ?? lockErr);
+            throw new Error(`SKU [${item.sku}] 锁定仓库库存失败：${lockErr?.message ?? lockErr}`);
+          }
         }
       }
 
@@ -262,12 +267,12 @@ router.post('/', async (req: Request, res: Response) => {
 
     res.json({ code: 200, data: shipment, message: '发货单创建成功' });
   } catch (err: any) {
-    const msg: string = err?.message ?? '服务器内部错误';
+    const msg: string = err?.message ?? '未知错误';
+    console.error('[FBE] 创建发货单失败:', err);
     if (msg.startsWith('库存不足')) {
       res.status(400).json({ code: 400, data: null, message: msg });
     } else {
-      console.error('[FBE] 创建发货单失败:', msg);
-      res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
+      res.status(500).json({ code: 500, data: null, message: `发货单创建失败：${msg}` });
     }
   }
 });
@@ -621,37 +626,66 @@ router.put('/:id/status', async (req: Request, res: Response) => {
           }
 
           // b. 扣减 WarehouseStock + 释放本次锁定 + 同步 Product.stockActual + 写流水
+          //
+          // ★ 架构说明：多仓模式下不使用 applyStockChange()，因为该函数会在 product.update
+          //   之后再次读取 stockActual（已被修改），导致 InventoryLog.beforeQuantity 记录的是
+          //   中间态而非出库前的真实库存，产生审计账单污染。此处直接写 inventoryLog。
+          //
+          // 出库前快照：在任何 warehouseStock.update 之前统一读取 stockActual，
+          // 确保 beforeQuantity 反映真实的出库前状态。
+          const beforeStockMap = new Map(
+            (await tx.product.findMany({
+              where:  { id: { in: productIds } },
+              select: { id: true, stockActual: true },
+            })).map((p) => [p.id, p.stockActual ?? 0]),
+          );
+
           let totalQty = 0;
           for (const item of current.items) {
-            // 扣减仓库库存，同时释放锁定量
-            await tx.warehouseStock.update({
-              where: { productId_warehouseId: { productId: item.productId, warehouseId: whId } },
-              data: {
-                stockQuantity:  { decrement: item.quantity },
-                lockedQuantity: { decrement: item.quantity },  // 释放 PENDING 时锁定的量
-              },
-            });
-            // 重新汇总全仓 → 同步 Product.stockActual
-            const allWs = await tx.warehouseStock.findMany({
-              where:  { productId: item.productId },
-              select: { stockQuantity: true },
-            });
-            const totalStock = allWs.reduce((s, w) => s + w.stockQuantity, 0);
-            await tx.product.update({
-              where: { id: item.productId },
-              data:  { stockActual: totalStock, inTransitQuantity: { increment: item.quantity } },
-            });
-            // 写 FBE_OUT 流水
-            await applyStockChange(tx, {
-              productId:      item.productId,
-              warehouseId:    whId,
-              changeQuantity: -item.quantity,
-              type:           'FBE_OUT',
-              referenceId:    String(id),
-              remark:         `FBE 发货单 ${current.shipmentNumber} 出库（仓库 #${whId}）`,
-              createdBy:      userId,
-            });
-            totalQty += item.quantity;
+            const sku = prodSkuMap.get(item.productId) ?? `#${item.productId}`;
+            try {
+              const beforeStock = beforeStockMap.get(item.productId) ?? 0;
+
+              // 扣减仓库库存，同时释放锁定量
+              await tx.warehouseStock.update({
+                where: { productId_warehouseId: { productId: item.productId, warehouseId: whId } },
+                data: {
+                  stockQuantity:  { decrement: item.quantity },
+                  lockedQuantity: { decrement: item.quantity },
+                },
+              });
+
+              // 重新汇总全仓 → 同步 Product.stockActual
+              const allWs = await tx.warehouseStock.findMany({
+                where:  { productId: item.productId },
+                select: { stockQuantity: true },
+              });
+              const totalStock = allWs.reduce((s, w) => s + w.stockQuantity, 0);
+              await tx.product.update({
+                where: { id: item.productId },
+                data:  { stockActual: totalStock, inTransitQuantity: { increment: item.quantity } },
+              });
+
+              // 直接写 FBE_OUT 流水（beforeStock = 出库前快照，不受中间态污染）
+              await tx.inventoryLog.create({
+                data: {
+                  productId:      item.productId,
+                  warehouseId:    whId,
+                  type:           'FBE_OUT',
+                  changeQuantity: -item.quantity,
+                  beforeQuantity: beforeStock,
+                  afterQuantity:  totalStock,
+                  referenceId:    String(id),
+                  remark:         `FBE 发货单 ${current.shipmentNumber} 出库（仓库 #${whId}）`,
+                  createdBy:      userId,
+                },
+              });
+
+              totalQty += item.quantity;
+            } catch (itemErr: any) {
+              console.error(`[FBE] #${id} SHIPPED 出库失败 | SKU [${sku}]:`, itemErr?.message ?? itemErr);
+              throw new Error(`发货单 ${current.shipmentNumber} 出库失败：SKU [${sku}] 处理异常 — ${itemErr?.message ?? itemErr}`);
+            }
           }
           console.log(
             `[FBE] #${id}(${current.shipmentNumber}) ALLOCATING→SHIPPED（多仓 warehouseId=${whId}），` +
@@ -679,19 +713,26 @@ router.put('/:id/status', async (req: Request, res: Response) => {
 
           let totalQty = 0;
           for (const item of current.items) {
-            await applyStockChange(tx, {
-              productId:      item.productId,
-              changeQuantity: -item.quantity,
-              type:           'FBE_OUT',
-              referenceId:    String(id),
-              remark:         `FBE 发货单 ${current.shipmentNumber} 出库`,
-              createdBy:      userId,
-            });
-            await tx.product.update({
-              where: { id: item.productId },
-              data:  { inTransitQuantity: { increment: item.quantity } },
-            });
-            totalQty += item.quantity;
+            const prod2 = stockMap.get(item.productId);
+            const sku2  = prod2?.sku ?? `#${item.productId}`;
+            try {
+              await applyStockChange(tx, {
+                productId:      item.productId,
+                changeQuantity: -item.quantity,
+                type:           'FBE_OUT',
+                referenceId:    String(id),
+                remark:         `FBE 发货单 ${current.shipmentNumber} 出库`,
+                createdBy:      userId,
+              });
+              await tx.product.update({
+                where: { id: item.productId },
+                data:  { inTransitQuantity: { increment: item.quantity } },
+              });
+              totalQty += item.quantity;
+            } catch (itemErr: any) {
+              console.error(`[FBE] #${id} SHIPPED 出库失败（兼容模式）| SKU [${sku2}]:`, itemErr?.message ?? itemErr);
+              throw new Error(`发货单 ${current.shipmentNumber} 出库失败：SKU [${sku2}] 处理异常 — ${itemErr?.message ?? itemErr}`);
+            }
           }
           console.log(`[FBE] #${id}(${current.shipmentNumber}) ALLOCATING→SHIPPED（兼容模式），合计出库 ${totalQty}`);
         }
@@ -781,13 +822,12 @@ router.put('/:id/status', async (req: Request, res: Response) => {
 
     res.json({ code: 200, data: updated, message: `发货单 ${current.shipmentNumber} 状态已更新为 ${newStatus}` });
   } catch (err: any) {
-    const msg: string = err?.message ?? '服务器内部错误';
-    // 库存不足是业务错误，400 返回给前端
-    if (msg.startsWith('库存不足')) {
+    const msg: string = err?.message ?? '未知错误';
+    console.error('[FBE] 更新发货单状态失败:', err);
+    if (msg.startsWith('库存不足') || msg.startsWith('库存锁定量不足')) {
       res.status(400).json({ code: 400, data: null, message: msg });
     } else {
-      console.error('[FBE] 更新发货单状态失败:', msg);
-      res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
+      res.status(500).json({ code: 500, data: null, message: `发货单状态更新失败：${msg}` });
     }
   }
 });

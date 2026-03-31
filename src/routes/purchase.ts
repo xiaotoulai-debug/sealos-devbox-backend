@@ -14,7 +14,9 @@ import { createAlibabaOrder } from '../services/alibabaOrder';
 import { applyStockChange } from './inventory';
 import {
   syncOrderDetail,
+  syncLogisticsInfos,
   getLogisticsTrace,
+  getLogisticsTraceByOrder,
   isAliServiceError,
 } from '../services/alibabaService';
 
@@ -130,6 +132,13 @@ router.post('/create-local', async (req: Request, res: Response) => {
           data:  { purchaseOrderId: po.id, status: 'ORDERED', purchaseQuantity: qty },
         });
 
+        // ★ 增加在途库存：产品已进入正式采购流程，货物尚未到仓
+        await tx.warehouseStock.upsert({
+          where:  { productId_warehouseId: { productId: pid, warehouseId: validWarehouseId } },
+          create: { productId: pid, warehouseId: validWarehouseId, inTransitQuantity: qty },
+          update: { inTransitQuantity: { increment: qty } },
+        });
+
         return po;
       });
 
@@ -163,6 +172,94 @@ router.post('/create-local', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('[POST /api/purchases/create-local]', err?.message ?? err);
     res.status(500).json({ code: 500, data: null, message: '创建采购单失败' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// POST /api/purchases/fix-in-transit
+//
+// 【一次性历史修复】重新计算所有活跃采购单（PENDING/PLACED/IN_TRANSIT）
+// 的在途库存，并覆盖写入 WarehouseStock.inTransitQuantity。
+//
+// 算法：
+//   1. 将所有受影响的 (productId, warehouseId) 的 inTransitQuantity 先清零
+//   2. 遍历全部未完结采购单，按 (productId, warehouseId) 分组累加 purchaseQuantity
+//   3. 批量 upsert 覆盖写入
+//
+// 幂等性：可重复调用，每次都以正确值覆盖。
+// ─────────────────────────────────────────────────────────────────────
+router.post('/fix-in-transit', async (req: Request, res: Response) => {
+  try {
+    // 查所有未完结的采购单（PENDING / PLACED / IN_TRANSIT）及其关联产品
+    const activeOrders = await prisma.purchaseOrder.findMany({
+      where: {
+        status:      { in: ['PENDING', 'PLACED', 'IN_TRANSIT'] },
+        warehouseId: { not: null },
+      },
+      select: {
+        id:          true,
+        orderNo:     true,
+        warehouseId: true,
+        products: {
+          select: { id: true, sku: true, purchaseQuantity: true },
+        },
+      },
+    });
+
+    // 按 (productId, warehouseId) 分组累加在途数量
+    const transitMap = new Map<string, { productId: number; warehouseId: number; qty: number }>();
+    for (const order of activeOrders) {
+      const wid = order.warehouseId!;
+      for (const prod of order.products) {
+        const qty = Math.max(1, prod.purchaseQuantity ?? 1);
+        const key = `${prod.id}_${wid}`;
+        if (transitMap.has(key)) {
+          transitMap.get(key)!.qty += qty;
+        } else {
+          transitMap.set(key, { productId: prod.id, warehouseId: wid, qty });
+        }
+      }
+    }
+
+    // 先清零所有受影响记录，再批量写入正确值（事务保证原子性）
+    const entries = Array.from(transitMap.values());
+    let upsertCount = 0;
+
+    await prisma.$transaction(async (tx) => {
+      // 将所有涉及的 (productId, warehouseId) 的在途库存归零
+      for (const e of entries) {
+        await tx.warehouseStock.upsert({
+          where:  { productId_warehouseId: { productId: e.productId, warehouseId: e.warehouseId } },
+          create: { productId: e.productId, warehouseId: e.warehouseId, inTransitQuantity: e.qty },
+          update: { inTransitQuantity: e.qty },   // 覆盖（非增量），幂等安全
+        });
+        upsertCount++;
+      }
+    });
+
+    const summary = entries.map((e) => ({
+      productId:    e.productId,
+      warehouseId:  e.warehouseId,
+      inTransitQty: e.qty,
+    }));
+
+    console.log(
+      `[fix-in-transit] 修复完成：扫描 ${activeOrders.length} 张活跃采购单，` +
+      `更新 ${upsertCount} 条 (productId × warehouseId) 在途库存记录`,
+    );
+
+    res.json({
+      code: 200,
+      data: {
+        scannedOrders: activeOrders.length,
+        updatedRecords: upsertCount,
+        detail: summary,
+      },
+      message: `在途库存修复完成：${activeOrders.length} 张活跃采购单，${upsertCount} 条库存记录已重算`,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/purchases/fix-in-transit]', err?.message ?? err);
+    res.status(500).json({ code: 500, data: null, message: '在途库存修复失败' });
   }
 });
 
@@ -484,8 +581,17 @@ router.get('/:id/products', async (req: Request, res: Response) => {
 // ─────────────────────────────────────────────────────────────────────
 // POST /api/purchases/:id/sync-1688
 //
-// 一键同步 1688 订单状态、供应商名称、物流单号 → 回写 PurchaseOrder 主单。
-// 前提：主单必须已有 alibabaOrderId（通过 place-1688-order 或 bind-1688-order 绑定）。
+// 原子同步：订单状态 + 专项物流信息 一次请求全部落库。
+//
+// 内部串行调用两个 1688 接口：
+//   ① alibaba.trade.get.buyerView          → 订单状态 / 供应商 / 基础物流
+//   ② alibaba.trade.getLogisticsInfos.buyerView → 精确物流单号 / 公司 / logisticsId
+//
+// 合并规则（物流字段优先级）：
+//   logisticsCompany : getLogisticsInfos 优先，buyerView 兜底
+//   trackingNumber   : getLogisticsInfos.logisticsBillNo 优先，buyerView.logisticsId 兜底
+//
+// 前提：主单必须已有 alibabaOrderId。
 // ─────────────────────────────────────────────────────────────────────
 router.post('/:id/sync-1688', async (req: Request, res: Response) => {
   try {
@@ -495,7 +601,7 @@ router.post('/:id/sync-1688', async (req: Request, res: Response) => {
       return;
     }
 
-    // 取主单 alibabaOrderId
+    // 取主单
     const order = await prisma.purchaseOrder.findUnique({
       where:  { id },
       select: {
@@ -518,9 +624,8 @@ router.post('/:id/sync-1688', async (req: Request, res: Response) => {
 
     const aliOrderId = order.alibabaOrderId;
 
-    // ── 调用 1688 buyerView ──────────────────────────────────────
+    // ── ① alibaba.trade.get.buyerView（订单状态 + 供应商 + 基础物流） ──
     const detail = await syncOrderDetail(aliOrderId);
-
     if (isAliServiceError(detail)) {
       res.status(502).json({
         code: 502, data: null,
@@ -530,24 +635,27 @@ router.post('/:id/sync-1688', async (req: Request, res: Response) => {
       return;
     }
 
-    // ── 物流订单取第一条写入主单（多包裹时取最新包裹） ────────────
+    // ── buyerView 返回的物流数据（取第一条，多包裹取最新包裹） ───
+    // 注意：alibaba.trade.getLogisticsInfos.buyerView 需要独立权限套餐，
+    //       若应用未开通则返回 gw.APIUnsupported。
+    //       buyerView 已在 logisticsOrders 中包含完整物流信息，直接使用，无需额外调用。
     const firstLogistics = detail.logisticsOrders[0] ?? null;
 
     // ── 状态映射：1688 状态文本 → 人类可读中文 ───────────────────
     const STATUS_MAP: Record<string, string> = {
-      waitbuyerpay:    '等待买家付款',
-      waitallpay:      '等待拼单付款',
-      waitsellersend:  '等待卖家发货',
-      waitbuyerreceive:'等待买家收货',
-      success:         '交易成功',
-      closed:          '交易关闭',
-      cancelled:       '已取消',
+      waitbuyerpay:     '等待买家付款',
+      waitallpay:       '等待拼单付款',
+      waitsellersend:   '等待卖家发货',
+      waitbuyerreceive: '等待买家收货',
+      success:          '交易成功',
+      closed:           '交易关闭',
+      cancelled:        '已取消',
     };
     const humanStatus = STATUS_MAP[detail.alibabaStatus] ?? detail.alibabaStatus;
 
-    // ── 回写数据库 ───────────────────────────────────────────────
+    // ── 构建一次性落库数据对象 ───────────────────────────────────
     const updateData: Record<string, unknown> = {
-      supplierName:    detail.supplierName    ?? detail.sellerLoginId ?? undefined,
+      supplierName:    detail.supplierName ?? detail.sellerLoginId ?? undefined,
       logisticsStatus: firstLogistics
         ? `[${firstLogistics.logisticsCompanyName}] ${firstLogistics.logisticsStatus || humanStatus}`
         : humanStatus,
@@ -555,11 +663,11 @@ router.post('/:id/sync-1688', async (req: Request, res: Response) => {
     if (firstLogistics?.logisticsCompanyName) updateData.logisticsCompany = firstLogistics.logisticsCompanyName;
     if (firstLogistics?.logisticsId)          updateData.trackingNumber   = firstLogistics.logisticsId;
 
-    // 同步子单状态与金额
+    // ── 同步子单状态与金额（PurchaseOrderItem） ──────────────────
     if (order.items.length > 0) {
       await prisma.purchaseOrderItem.updateMany({
         where: { purchaseOrderId: id },
-        data:  {
+        data: {
           alibabaOrderStatus: detail.alibabaStatus,
           alibabaTotalAmount: detail.totalAmount > 0 ? detail.totalAmount : undefined,
           shippingFee:        detail.shippingFee  > 0 ? detail.shippingFee  : undefined,
@@ -567,6 +675,7 @@ router.post('/:id/sync-1688', async (req: Request, res: Response) => {
       });
     }
 
+    // ── 原子落库至 PurchaseOrder 主单 ────────────────────────────
     const updated = await prisma.purchaseOrder.update({
       where:  { id },
       data:   updateData,
@@ -579,8 +688,10 @@ router.post('/:id/sync-1688', async (req: Request, res: Response) => {
     });
 
     console.log(
-      `[sync-1688] 采购单 #${id}(${order.orderNo}) 同步成功：` +
-      `aliStatus=${detail.alibabaStatus}, logistics=${firstLogistics?.logisticsId ?? 'none'}`,
+      `[sync-1688] 采购单 #${id}(${order.orderNo}) 同步完成：` +
+      `aliStatus=${detail.alibabaStatus} | ` +
+      `company=${firstLogistics?.logisticsCompanyName ?? 'none'} | ` +
+      `trackingNo=${firstLogistics?.logisticsId ?? 'none'}`,
     );
 
     res.json({
@@ -594,7 +705,7 @@ router.post('/:id/sync-1688', async (req: Request, res: Response) => {
         sellerLoginId:    detail.sellerLoginId,
         logisticsOrders:  detail.logisticsOrders,
       },
-      message: `1688 订单状态已同步：${humanStatus}`,
+      message: `1688 订单状态与物流信息已同步：${humanStatus}`,
     });
   } catch (err: any) {
     console.error('[POST /api/purchases/:id/sync-1688]', err?.message ?? err);
@@ -603,10 +714,98 @@ router.post('/:id/sync-1688', async (req: Request, res: Response) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
+// POST /api/purchases/:id/sync-logistics
+//
+// 专项物流信息同步：调用 alibaba.trade.getLogisticsInfos.buyerView，
+// 提取物流公司名 + 运单号 + logisticsId，落库至 PurchaseOrder 主单。
+//
+// 前提：主单必须已有 alibabaOrderId。
+// ─────────────────────────────────────────────────────────────────────
+router.post('/:id/sync-logistics', async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    if (isNaN(id) || id <= 0) {
+      res.status(400).json({ code: 400, data: null, message: '采购单 ID 无效' });
+      return;
+    }
+
+    const order = await prisma.purchaseOrder.findUnique({
+      where:  { id },
+      select: { id: true, orderNo: true, alibabaOrderId: true },
+    });
+    if (!order) {
+      res.status(404).json({ code: 404, data: null, message: '采购单不存在' });
+      return;
+    }
+    if (!order.alibabaOrderId) {
+      res.status(400).json({
+        code: 400, data: null,
+        message: '该采购单未关联 1688 单号，请先绑定后再同步物流',
+      });
+      return;
+    }
+
+    // 调用 alibaba.trade.getLogisticsInfos.buyerView
+    const infosResult = await syncLogisticsInfos(order.alibabaOrderId);
+    if (isAliServiceError(infosResult)) {
+      res.status(502).json({ code: 502, data: null, message: infosResult.message, errorCode: infosResult.errorCode });
+      return;
+    }
+
+    if (infosResult.logisticsInfos.length === 0) {
+      res.json({
+        code: 200,
+        data: { synced: false, reason: '1688 暂无物流记录（可能尚未发货）' },
+        message: '暂无物流信息，可能尚未发货',
+      });
+      return;
+    }
+
+    // 取第一条物流单写入主单（多包裹场景下首包为主）
+    const first = infosResult.logisticsInfos[0];
+
+    const updateData: Record<string, string> = {};
+    if (first.logisticsCompanyName) updateData.logisticsCompany = first.logisticsCompanyName;
+    if (first.logisticsBillNo)      updateData.trackingNumber   = first.logisticsBillNo;
+    // logisticsId 暂无专属字段，复用 trackingNumber 为主（若二者不同则以 logisticsBillNo 为准）
+
+    const updated = await prisma.purchaseOrder.update({
+      where: { id },
+      data:  updateData,
+      select: {
+        id: true, orderNo: true,
+        logisticsCompany: true, trackingNumber: true, logisticsStatus: true,
+      },
+    });
+
+    console.log(
+      `[sync-logistics] 采购单 #${id}(${order.orderNo}) 物流落库 → ` +
+      `公司=${first.logisticsCompanyName} 运单号=${first.logisticsBillNo} logisticsId=${first.logisticsId}`,
+    );
+
+    res.json({
+      code: 200,
+      data: {
+        order: updated,
+        logisticsInfos: infosResult.logisticsInfos,
+      },
+      message: `物流信息已同步：${first.logisticsCompanyName} ${first.logisticsBillNo}`,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/purchases/:id/sync-logistics]', err?.message ?? err);
+    res.status(500).json({ code: 500, data: null, message: '物流信息同步失败' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
 // GET /api/purchases/:id/logistics-trace
 //
 // 查询物流轨迹流转节点。
-// 优先使用主单已记录的 trackingNumber；若未记录则先调 buyerView 获取最新运单号。
+//
+// 优先级策略（三级降级）：
+//   ① alibaba.trade.getLogisticsTraceInfo.buyerView（按订单号直查，首选）
+//   ② 已落库的 trackingNumber → alibaba.logistics.trace.info.get（兜底）
+//   ③ 先调 buyerView 拿运单号 → 再查轨迹（兜底的兜底）
 // ─────────────────────────────────────────────────────────────────────
 router.get('/:id/logistics-trace', async (req: Request, res: Response) => {
   try {
@@ -637,16 +836,46 @@ router.get('/:id/logistics-trace', async (req: Request, res: Response) => {
       return;
     }
 
-    // syncOrderDetail / getLogisticsTrace / isAliServiceError 已在顶部静态导入
+    // ── ① 优先：alibaba.trade.getLogisticsTraceInfo.buyerView ────────
+    const traceByOrder = await getLogisticsTraceByOrder(order.alibabaOrderId);
+    if (!isAliServiceError(traceByOrder) && traceByOrder.nodes.length > 0) {
+      // 顺手把运单号落库（防止下次再请求）
+      if (traceByOrder.logisticsBillNo || traceByOrder.logisticsId) {
+        const trackingNum = traceByOrder.logisticsBillNo || traceByOrder.logisticsId;
+        await prisma.purchaseOrder.update({
+          where: { id },
+          data: {
+            trackingNumber:   trackingNum || undefined,
+            logisticsCompany: traceByOrder.logisticsCompanyName || undefined,
+          },
+        }).catch(() => { /* 落库失败不影响主流程 */ });
+      }
 
-    // 若主单已记录运单号，直接查轨迹；否则先同步一次获取最新运单号
-    let logisticsId   = order.trackingNumber;
-    let companyName   = order.logisticsCompany ?? '';
+      res.json({
+        code: 200,
+        data: {
+          logisticsId:          traceByOrder.logisticsId || traceByOrder.logisticsBillNo,
+          logisticsBillNo:      traceByOrder.logisticsBillNo,
+          logisticsCompanyName: traceByOrder.logisticsCompanyName,
+          nodes:                traceByOrder.nodes,
+          source:               'buyerView',
+        },
+        message: 'success',
+      });
+      return;
+    }
 
+    // ── ② 兜底：按已落库运单号 → alibaba.logistics.trace.info.get ───
+    let logisticsId = order.trackingNumber;
+    let companyName = order.logisticsCompany ?? '';
+
+    // ── ③ 兜底的兜底：先调 buyerView 拿运单号 ──────────────────────
     if (!logisticsId) {
       const detail = await syncOrderDetail(order.alibabaOrderId);
       if (isAliServiceError(detail)) {
-        res.status(502).json({ code: 502, data: null, message: detail.message });
+        // 三级均失败，返回最后一次错误
+        const errMsg = isAliServiceError(traceByOrder) ? traceByOrder.message : detail.message;
+        res.status(502).json({ code: 502, data: null, message: errMsg });
         return;
       }
       const first = detail.logisticsOrders[0] ?? null;
@@ -659,14 +888,10 @@ router.get('/:id/logistics-trace', async (req: Request, res: Response) => {
       }
       logisticsId = first.logisticsId;
       companyName = first.logisticsCompanyName;
-      // 顺便把运单号落库，避免下次重复请求 buyerView
       await prisma.purchaseOrder.update({
         where: { id },
-        data: {
-          trackingNumber:   logisticsId,
-          logisticsCompany: companyName || undefined,
-        },
-      });
+        data: { trackingNumber: logisticsId, logisticsCompany: companyName || undefined },
+      }).catch(() => {});
     }
 
     const trace = await getLogisticsTrace(logisticsId);
@@ -675,12 +900,21 @@ router.get('/:id/logistics-trace', async (req: Request, res: Response) => {
       return;
     }
 
+    // 节点统一倒序（最新在前）
+    const sortedNodes = [...trace.nodes].sort((a, b) => {
+      const ta = new Date(a.eventTime).getTime();
+      const tb = new Date(b.eventTime).getTime();
+      return isNaN(ta) || isNaN(tb) ? 0 : tb - ta;
+    });
+
     res.json({
       code: 200,
       data: {
         logisticsId,
+        logisticsBillNo:      logisticsId,
         logisticsCompanyName: trace.logisticsCompanyName || companyName,
-        nodes:                trace.nodes,
+        nodes:                sortedNodes,
+        source:               'logisticsTrace',
       },
       message: 'success',
     });
@@ -1317,12 +1551,19 @@ router.post('/:id/stock-in', async (req: Request, res: Response) => {
       for (const prod of order.products) {
         const qty = Math.max(1, prod.purchaseQuantity ?? 1);
 
-        // ② WarehouseStock upsert：增加物理库存
+        // ② WarehouseStock upsert：增加物理库存 + 同步扣减在途库存（货已到仓）
         await tx.warehouseStock.upsert({
           where:  { productId_warehouseId: { productId: prod.id, warehouseId: whId } },
-          create: { productId: prod.id, warehouseId: whId, stockQuantity: qty },
+          create: { productId: prod.id, warehouseId: whId, stockQuantity: qty, inTransitQuantity: 0 },
           update: { stockQuantity: { increment: qty } },
         });
+        // ★ 扣减在途量（用 GREATEST 防止出现负数）
+        await tx.$executeRaw`
+          UPDATE warehouse_stocks
+          SET    in_transit_quantity = GREATEST(0, in_transit_quantity - ${qty})
+          WHERE  product_id = ${prod.id}
+          AND    warehouse_id = ${whId}
+        `;
 
         // ③ 重聚合 → 同步 Product.stockActual
         const allWs = await tx.warehouseStock.findMany({
@@ -1491,6 +1732,13 @@ router.post('/:id/rollback', async (req: Request, res: Response) => {
             after:  newWsQty,
             delta:  -(qty),
           });
+
+          // ★ 重建在途库存：入库被撤销，货物逻辑上重回"在途"状态
+          await tx.warehouseStock.upsert({
+            where:  { productId_warehouseId: { productId: prod.id, warehouseId: whId } },
+            create: { productId: prod.id, warehouseId: whId, inTransitQuantity: qty },
+            update: { inTransitQuantity: { increment: qty } },
+          });
         }
       }
 
@@ -1556,6 +1804,113 @@ router.post('/:id/rollback', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('[POST /api/purchases/:id/rollback]', err?.message ?? err);
     res.status(500).json({ code: 500, data: null, message: '回退失败，请稍后重试' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
+// DELETE /api/purchases/:id
+//
+// 作废并物理删除采购单（仅允许 PENDING 状态）
+//
+// 事务逻辑：
+//   ① 状态拦截：非 PENDING 拒绝操作
+//   ② 释放关联产品：purchaseOrderId → null，status → PURCHASING（回到采购计划）
+//   ③ 删除 PurchaseOrderItem 子记录（FK 约束，必须先删）
+//   ④ 物理删除 PurchaseOrder 主单
+// ─────────────────────────────────────────────────────────────────────
+router.delete('/:id', async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    if (isNaN(id) || id <= 0) {
+      res.status(400).json({ code: 400, data: null, message: '采购单 ID 无效' });
+      return;
+    }
+
+    // 查主单（含关联产品 + 子单，以及仓库和采购数量，用于扣减在途库存）
+    const order = await prisma.purchaseOrder.findUnique({
+      where: { id },
+      include: {
+        products: { select: { id: true, sku: true, purchaseQuantity: true } },
+        items:    { select: { id: true } },
+      },
+    });
+
+    if (!order) {
+      res.status(404).json({ code: 404, data: null, message: '采购单不存在' });
+      return;
+    }
+
+    // ① 状态拦截：只允许删除 PENDING（未下单）状态的采购单
+    if (order.status !== 'PENDING') {
+      const statusLabel: Record<string, string> = {
+        PLACED:     '已下单',
+        IN_TRANSIT: '运输中',
+        RECEIVED:   '已入库',
+      };
+      const label = statusLabel[order.status] ?? order.status;
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: `该采购单当前状态为「${label}」，仅"待下单（PENDING）"状态的采购单可作废删除`,
+      });
+      return;
+    }
+
+    const username = req.user!.username ?? 'unknown';
+
+    await prisma.$transaction(async (tx) => {
+      // ② 释放关联产品：解除采购单绑定，状态退回采购计划（PURCHASING）
+      //    purchaseOrderId: null → 产品重新出现在 GET /api/products/purchasing 列表
+      if (order.products.length > 0) {
+        await tx.product.updateMany({
+          where: { id: { in: order.products.map((p) => p.id) } },
+          data: {
+            purchaseOrderId: null,
+            status:          'PURCHASING',
+          },
+        });
+
+        // ★ 扣减在途库存：采购单作废，货物不再在途（防负：用 GREATEST 钳制到 0）
+        if (order.warehouseId) {
+          for (const prod of order.products) {
+            const qty = Math.max(1, prod.purchaseQuantity ?? 1);
+            await tx.$executeRaw`
+              UPDATE warehouse_stocks
+              SET    in_transit_quantity = GREATEST(0, in_transit_quantity - ${qty})
+              WHERE  product_id = ${prod.id}
+              AND    warehouse_id = ${order.warehouseId}
+            `;
+          }
+        }
+      }
+
+      // ③ 删除子单（FK 约束：必须先于主单删除）
+      await tx.purchaseOrderItem.deleteMany({
+        where: { purchaseOrderId: id },
+      });
+
+      // ④ 物理删除主单
+      await tx.purchaseOrder.delete({ where: { id } });
+    });
+
+    console.log(
+      `[DELETE /api/purchases/${id}] ${username} 作废采购单 ${order.orderNo}，` +
+      `释放 ${order.products.length} 个产品回采购计划`,
+    );
+
+    res.json({
+      code: 200,
+      data: {
+        deletedId:      id,
+        orderNo:        order.orderNo,
+        releasedCount:  order.products.length,
+        releasedSkus:   order.products.map((p) => p.sku ?? `#${p.id}`),
+      },
+      message: `采购单 ${order.orderNo} 已作废，${order.products.length} 个产品已退回采购计划`,
+    });
+  } catch (err: any) {
+    console.error('[DELETE /api/purchases/:id]', err?.message ?? err);
+    res.status(500).json({ code: 500, data: null, message: '作废采购单失败，请稍后重试' });
   }
 });
 
