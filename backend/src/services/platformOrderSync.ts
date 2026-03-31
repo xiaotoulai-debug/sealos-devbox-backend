@@ -188,13 +188,21 @@ export async function syncPlatformOrdersForShop(
 
   const allOrders: EmagOrder[] = [];
   const modifiedAfter = toDateTimeStr(start);
-  const readRes = await readOrdersForAllStatuses(creds, {
-    itemsPerPage: ITEMS_PER_PAGE,
-    modifiedAfter,
-  });
 
-  if (readRes.isError && readRes.messages?.length) {
-    result.errors.push(...readRes.messages);
+  // ★ readOrdersForAllStatuses 遇到任何分页失败会抛出明确错误（防漏单铁律）
+  //   此处用 try/catch 将错误写入 result.errors 并立即返回，
+  //   绝不允许用部分数据假装同步成功
+  let readRes: Awaited<ReturnType<typeof readOrdersForAllStatuses>>;
+  try {
+    readRes = await readOrdersForAllStatuses(creds, {
+      itemsPerPage: ITEMS_PER_PAGE,
+      modifiedAfter,
+    });
+  } catch (fetchErr: any) {
+    const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
+    console.error(`[Sync] shopId=${shopId} 拉取订单失败（已中止，不入库）：${errMsg}`);
+    result.errors.push(errMsg);
+    return result;   // ← 立即返回空结果，绝不用已拉取的部分数据做假 200
   }
 
   // 直接全盘接收 eMAG 按 modified.from 返回的所有订单，不再按创建日期做二次过滤
@@ -243,13 +251,22 @@ export async function syncPlatformOrderById(shopId: number, orderId: number): Pr
   return { ok: true, total: mapped.total, status_text: mapped.status_text };
 }
 
-const SHOP_INTERVAL_MS = 2000; // 店铺间串行间隔（给代理喘息时间）
-
 /**
- * 对所有（或指定）eMAG 店铺串行执行订单同步
- * 串行 + 2 秒间隔，避免代理带宽不足导致 ETIMEDOUT / ECONNRESET
- * @param incremental 若 true，仅拉取过去 24 小时（Cron 用）；新店始终强制 30 天历史回溯
- * @param windowMinutes 可选，覆盖为指定分钟数（如 30=订单哨兵）
+ * 对所有（或指定）eMAG 店铺【并发】执行订单同步
+ *
+ * 架构设计：
+ *   - 使用 Promise.allSettled 并发启动所有店铺的同步任务
+ *   - 底层 emagClient 已内置全局并发上限(5) + 令牌桶限流(12 req/s)，无需手动串行
+ *   - 任意店铺失败（rejected）不会阻塞其他店铺，也不会让整个调度崩溃
+ *   - 失败店铺记录到 result.errors，最终汇总日志明确区分成功/失败数量
+ *
+ * 并发安全：底层 emagApiCall 已有：
+ *   ① TokenBucketThrottle: 订单 12 req/s、其他 3 req/s
+ *   ② MAX_CONCURRENT = 5 全局并发上限
+ *   ③ 网络超时 60s + 指数退避重试 3 次
+ *
+ * @param incremental 若 true，仅拉取过去 24 小时；新店始终强制 30 天历史回溯
+ * @param windowMinutes 可选，覆盖增量窗口为指定分钟数（如 30=订单哨兵）
  * @param shopIdFilter 可选，限定同步的店铺 ID 列表；不传则同步全部活跃店铺
  */
 export async function syncAllPlatformOrders(
@@ -272,30 +289,70 @@ export async function syncAllPlatformOrders(
     return [];
   }
 
-  console.log(`[Sync] 开始串行同步 ${shops.length} 个店铺: ${shops.map((s) => `${s.shopName}(${s.region ?? 'RO'})`).join(', ')}`);
+  console.log(
+    `[Sync] 开始并发同步 ${shops.length} 个店铺: ` +
+    shops.map((s) => `${s.shopName}(${s.region ?? 'RO'})`).join(', '),
+  );
 
+  // ── Promise.allSettled：并发启动全部店铺，互不阻塞 ─────────────────
+  const settled = await Promise.allSettled(
+    shops.map((shop) => syncPlatformOrdersForShop(shop.id, incremental, windowMinutes)),
+  );
+
+  // ── 汇总结果：fulfilled → 成功，rejected → 隔离失败不传染 ──────────
   const results: SyncResult[] = [];
+  let successCount = 0;
+  let failCount    = 0;
 
-  for (const shop of shops) {
-    try {
-      const r = await syncPlatformOrdersForShop(shop.id, incremental, windowMinutes);
-      if (r.errors.length > 0) {
-        r.errors.forEach((e) => console.error(`  [Sync] shop=${r.shopId} 错误: ${e}`));
-      }
+  settled.forEach((outcome, idx) => {
+    const shop = shops[idx];
+
+    if (outcome.status === 'fulfilled') {
+      const r = outcome.value;
       results.push(r);
-    } catch (err) {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      console.error(`[Sync] shop=${shop.id} 同步异常: ${errMsg}`);
-      results.push({ shopId: shop.id, totalFetched: 0, totalUpserted: 0, orderIds: [], pages: 0, errors: [errMsg] });
-    }
 
-    // 店铺间强制间隔，给代理服务器喘息时间
-    if (shops.indexOf(shop) < shops.length - 1) {
-      await new Promise((r) => setTimeout(r, SHOP_INTERVAL_MS));
+      if (r.errors.length > 0) {
+        // 有局部错误（如某些状态页超时），但仍入库了部分数据 → partial
+        console.warn(
+          `[Sync] ⚠️  shop=${shop.id}(${shop.shopName}) partial: ` +
+          `入库=${r.totalUpserted} 局部错误=${r.errors.length}条`,
+        );
+        r.errors.forEach((e) => console.warn(`   └─ ${e}`));
+        failCount++;
+      } else {
+        console.log(
+          `[Sync] ✅ shop=${shop.id}(${shop.shopName}) 成功: ` +
+          `入库=${r.totalUpserted} 拉取=${r.totalFetched}`,
+        );
+        successCount++;
+      }
+    } else {
+      // Promise 被 reject：记录明确错误，不影响其他店铺
+      const errMsg = outcome.reason instanceof Error
+        ? outcome.reason.message
+        : String(outcome.reason);
+      console.error(
+        `[Sync] ❌ shop=${shop.id}(${shop.shopName}) 失败（已隔离）: ${errMsg}`,
+      );
+      results.push({
+        shopId:        shop.id,
+        totalFetched:  0,
+        totalUpserted: 0,
+        orderIds:      [],
+        pages:         0,
+        errors:        [errMsg],
+      });
+      failCount++;
     }
-  }
+  });
 
-  const total = results.reduce((s, r) => s + r.totalUpserted, 0);
-  console.log(`[Sync] 全部完成: ${shops.length} 个店铺, 共入库 ${total} 条订单`);
+  // ── 汇总日志 ─────────────────────────────────────────────────────────
+  const totalUpserted = results.reduce((s, r) => s + r.totalUpserted, 0);
+  console.log(
+    `[Sync] 全部完成: ${shops.length} 个店铺 ` +
+    `(成功=${successCount} 失败/partial=${failCount}), ` +
+    `共入库 ${totalUpserted} 条订单`,
+  );
+
   return results;
 }

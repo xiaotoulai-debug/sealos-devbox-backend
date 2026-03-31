@@ -16,8 +16,9 @@ import { syncStoreProducts, backfillProductUrls, backfillProductImages, backfill
 import { syncInventoryToPlatform } from './inventorySync';
 import { getEmagCredentials } from './emagClient';
 import { shouldDelayNextSync, setDelayMultiplier, getDelayMultiplier } from './emagRateLimit';
+import { syncPurchaseOrderFromAlibaba } from './alibabaService';
 
-export type SyncType = 'order_sentinel' | 'order_daily_catchup' | 'product_radar' | 'inventory_sync';
+export type SyncType = 'order_sentinel' | 'order_daily_catchup' | 'product_radar' | 'inventory_sync' | 'alibaba_purchase_sync';
 
 async function logSync(
   syncType: SyncType,
@@ -221,14 +222,99 @@ function runInventorySync() {
     });
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// 【1688 采购同步】每 6 小时，自动同步活跃采购单状态与物流
+// 活跃状态：PLACED（已下单）/ IN_TRANSIT（运输中）
+// 排除 PENDING（未提交）/ RECEIVED（已入库）/ CANCELLED
+// 无锁，自带防重入标记；串行 for...of 防止 1688 限流
+// ═══════════════════════════════════════════════════════════════════
+let alibabaPurchaseSyncRunning = false;
+
+function runAlibabaPurchaseSync() {
+  if (alibabaPurchaseSyncRunning) {
+    console.log('[1688采购同步] 跳过（上次未完成）');
+    return;
+  }
+  alibabaPurchaseSyncRunning = true;
+  const start = Date.now();
+
+  (async () => {
+    let successCount = 0;
+    let failCount    = 0;
+
+    try {
+      // 精准筛选：有 1688 订单号 + 仍处于活跃流转状态
+      const orders = await prisma.purchaseOrder.findMany({
+        where: {
+          alibabaOrderId: { not: null },
+          status: { in: ['PLACED', 'IN_TRANSIT'] },
+        },
+        select: { id: true, orderNo: true, alibabaOrderId: true },
+      });
+
+      console.log(`[1688采购同步] 开始：共 ${orders.length} 个活跃采购单待同步`);
+      if (orders.length === 0) {
+        await logSync('alibaba_purchase_sync', 0, Date.now() - start, 'success', '无活跃采购单，跳过');
+        return;
+      }
+
+      // 串行执行：每单独立 try/catch，单条失败不中断全局任务
+      for (const order of orders) {
+        try {
+          const result = await syncPurchaseOrderFromAlibaba(
+            order.id,
+            order.alibabaOrderId!,
+            order.orderNo,
+          );
+          if (result.success) {
+            successCount++;
+            console.log(
+              `[1688采购同步] ✅ ${order.orderNo} ` +
+              `aliStatus=${result.alibabaStatus} | ` +
+              `company=${result.logisticsCompany ?? 'none'} | ` +
+              `trackingNo=${result.trackingNumber ?? 'none'}`,
+            );
+          } else {
+            failCount++;
+            console.warn(`[1688采购同步] ⚠️  ${order.orderNo} 失败: ${result.error}`);
+          }
+        } catch (e) {
+          failCount++;
+          console.error(`[1688采购同步] ❌ ${order.orderNo} 异常:`, e instanceof Error ? e.message : e);
+        }
+      }
+
+      const durationMs = Date.now() - start;
+      const syncResult = failCount === 0 ? 'success' : successCount === 0 ? 'failed' : 'partial';
+      await logSync(
+        'alibaba_purchase_sync',
+        successCount,
+        durationMs,
+        syncResult,
+        JSON.stringify({ total: orders.length, success: successCount, fail: failCount }),
+      );
+      console.log(`[1688采购同步] 完成：成功 ${successCount} 个，失败 ${failCount} 个，耗时 ${durationMs}ms`);
+
+    } catch (e) {
+      const durationMs = Date.now() - start;
+      await logSync('alibaba_purchase_sync', successCount, durationMs, 'failed', e instanceof Error ? e.message : String(e));
+      console.error('[1688采购同步] 任务级异常:', e instanceof Error ? e.message : e);
+    } finally {
+      alibabaPurchaseSyncRunning = false;
+    }
+  })();
+}
+
 export function startSyncCrons(): void {
-  cron.schedule('*/10 * * * *', () => runOrderSentinel());       // 每 10 分钟（订单锁）
-  cron.schedule('0 2 * * *',   () => runOrderDailyCatchup());    // 每天凌晨 2 点（订单锁，48h 兜底）
-  cron.schedule('0 */2 * * *', () => runProductRadar());         // 每 2 小时（产品锁）
-  cron.schedule('5 * * * *',   () => runInventorySync());        // 每 1 小时（无锁）
+  cron.schedule('*/10 * * * *', () => runOrderSentinel());          // 每 10 分钟（订单锁）
+  cron.schedule('0 2 * * *',   () => runOrderDailyCatchup());       // 每天凌晨 2 点（订单锁，48h 兜底）
+  cron.schedule('0 */2 * * *', () => runProductRadar());            // 每 2 小时（产品锁）
+  cron.schedule('5 * * * *',   () => runInventorySync());           // 每 1 小时（无锁）
+  cron.schedule('0 */6 * * *', () => runAlibabaPurchaseSync());     // 每 6 小时（1688 采购同步）
 
   console.log('[Cron] 订单哨兵: 每 10 分钟（30min 窗口，订单锁）');
   console.log('[Cron] 日级兜底: 每天凌晨 2:00（48h 窗口，订单锁）');
   console.log('[Cron] 产品雷达: 每 2 小时（产品锁，与订单隔离）');
   console.log('[Cron] 库存同步: 每 1 小时');
+  console.log('[Cron] 1688采购同步: 每 6 小时（PLACED/IN_TRANSIT 活跃单，串行防限流）');
 }

@@ -285,19 +285,40 @@ function safeErrorDetail(err: any): string {
 const MAX_RETRIES_429 = 5;
 const BACKOFF_BASE_MS = 1000;
 
-// 网络层可重试的错误码（代理超时、连接重置等）
+// ─── 网络层重试配置 ───────────────────────────────────────────────
+// 可重试的错误码（代理超时/连接重置/5xx 均在此列）
 const RETRYABLE_NET_CODES = new Set([
-  'ETIMEDOUT', 'ECONNRESET', 'ECONNREFUSED', 'ENOTFOUND',
-  'EPIPE', 'EHOSTUNREACH', 'EAI_AGAIN', 'UND_ERR_SOCKET',
+  'ECONNABORTED',   // axios 超时（最常见：带宽不足时）
+  'ETIMEDOUT',      // 连接/读取超时
+  'ECONNRESET',     // 连接被对端重置
+  'ECONNREFUSED',   // 连接被拒绝
+  'ENOTFOUND',      // DNS 解析失败
+  'EPIPE',          // 管道写入失败
+  'EHOSTUNREACH',   // 主机不可达
+  'EAI_AGAIN',      // DNS 临时失败
+  'UND_ERR_SOCKET', // undici socket 错误
 ]);
+
+/** 最大网络层重试次数 */
 const MAX_NET_RETRIES = 3;
-const NET_RETRY_DELAY_MS = 3000;
+
+/** 指数退避基准延迟（ms）：第 1 次 1s，第 2 次 2s，第 3 次 4s */
+const NET_RETRY_BASE_MS = 1000;
+
+/** 默认请求超时：60s（跨国代理 1Mbps 带宽下适当放宽） */
+const DEFAULT_TIMEOUT_MS = 60_000;
 
 function isRetryableNetworkError(err: any): boolean {
   const code = err?.code ?? err?.cause?.code ?? '';
   if (RETRYABLE_NET_CODES.has(code)) return true;
   const msg = String(err?.message ?? '');
-  return /ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|socket hang up|stream has been aborted/i.test(msg);
+  // 覆盖 axios ECONNABORTED 有时以 timeout 文字抛出的情况
+  return /ETIMEDOUT|ECONNRESET|ECONNREFUSED|ENOTFOUND|ECONNABORTED|socket hang up|stream has been aborted|timeout of \d+ms exceeded/i.test(msg);
+}
+
+/** 5xx 服务端错误也应重试（eMAG 网关偶发 502/503/504） */
+function isRetryableHttpStatus(status: number): boolean {
+  return status >= 500 && status <= 599;
 }
 
 export async function emagApiCall<T = any>(
@@ -314,6 +335,7 @@ export async function emagApiCall<T = any>(
   const url = `${creds.baseUrl}/${resource}/${action}`;
   const basicAuth = Buffer.from(`${creds.username}:${creds.password}`).toString('base64');
   const tag = safeLogTag(creds);
+  const timeoutMs = options.timeout ?? DEFAULT_TIMEOUT_MS;
 
   console.log(`[eMAG] POST ${url}  shop=${creds.region} resource=${resource}/${action}`);
 
@@ -322,7 +344,7 @@ export async function emagApiCall<T = any>(
 
     const resp = await axios.post(url, { data }, {
       headers: { 'Authorization': `Basic ${basicAuth}`, 'Content-Type': 'application/json' },
-      timeout: options.timeout ?? 30000,
+      timeout: timeoutMs,
       validateStatus: () => true,
       ...(proxyAgent ? { httpsAgent: proxyAgent, proxy: false } : {}),
     });
@@ -330,23 +352,60 @@ export async function emagApiCall<T = any>(
   };
 
   /**
-   * 带网络层自动重试的请求执行器
-   * ETIMEDOUT / ECONNRESET / socket hang up → 等待 3 秒后重试，最多 3 次
+   * 带网络层自动重试的请求执行器（指数退避）
+   *
+   * 可重试条件（任意一项）：
+   *   ① 网络异常码：ECONNABORTED / ETIMEDOUT / ECONNRESET ...
+   *   ② HTTP 5xx 服务端错误（eMAG 网关临时故障）
+   *
+   * 延迟策略：第 1 次 1s → 第 2 次 2s → 第 3 次 4s（指数退避）
+   * 超过最大重试次数时抛出明确错误，绝不静默吞掉。
    */
   const doRequestWithNetRetry = async (): Promise<{ data: any; headers: Record<string, any>; status: number }> => {
-    for (let netAttempt = 0; netAttempt < MAX_NET_RETRIES; netAttempt++) {
+    let lastError: any = null;
+
+    for (let attempt = 0; attempt < MAX_NET_RETRIES; attempt++) {
       try {
-        return await doRequest();
-      } catch (netErr: any) {
-        if (isRetryableNetworkError(netErr) && netAttempt < MAX_NET_RETRIES - 1) {
-          console.warn(`${tag} ${resource}/${action} 网络错误(${netErr.code ?? netErr.message?.slice(0, 40)}) — ${NET_RETRY_DELAY_MS}ms 后重试 (${netAttempt + 1}/${MAX_NET_RETRIES})`);
-          await new Promise((r) => setTimeout(r, NET_RETRY_DELAY_MS));
+        const result = await doRequest();
+
+        // HTTP 5xx：当作可重试错误处理
+        if (isRetryableHttpStatus(result.status) && attempt < MAX_NET_RETRIES - 1) {
+          const delayMs = NET_RETRY_BASE_MS * Math.pow(2, attempt);
+          console.warn(
+            `${tag} ${resource}/${action} HTTP ${result.status} 服务端错误 — ` +
+            `${delayMs}ms 后重试 (${attempt + 1}/${MAX_NET_RETRIES})`,
+          );
+          await new Promise((r) => setTimeout(r, delayMs));
           continue;
         }
-        throw netErr;
+
+        return result;
+      } catch (netErr: any) {
+        lastError = netErr;
+        if (isRetryableNetworkError(netErr) && attempt < MAX_NET_RETRIES - 1) {
+          const delayMs = NET_RETRY_BASE_MS * Math.pow(2, attempt);
+          console.warn(
+            `${tag} ${resource}/${action} 网络错误(${netErr.code ?? netErr.message?.slice(0, 50)}) — ` +
+            `指数退避 ${delayMs}ms 后重试 (${attempt + 1}/${MAX_NET_RETRIES})`,
+          );
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
+        // 不可重试的网络错误 or 已达最大重试次数
+        const friendlyMsg = isRetryableNetworkError(netErr)
+          ? `eMAG 订单同步失败：网络连接超时，已重试 ${MAX_NET_RETRIES} 次，请检查代理服务器带宽 (${netErr.code ?? netErr.message?.slice(0, 60)})`
+          : `eMAG API 请求失败：${netErr.message?.slice(0, 200)}`;
+        const wrappedErr = new Error(friendlyMsg) as Error & { originalError: any };
+        wrappedErr.originalError = netErr;
+        throw wrappedErr;
       }
     }
-    throw new Error('unreachable');
+
+    // 所有 attempt 耗尽（5xx 连续失败路径）
+    const friendlyMsg = `eMAG 订单同步失败：服务器持续返回 5xx 错误，已重试 ${MAX_NET_RETRIES} 次，请稍后再试`;
+    const wrappedErr = new Error(friendlyMsg) as Error & { originalError: any };
+    wrappedErr.originalError = lastError;
+    throw wrappedErr;
   };
 
   const startMs = Date.now();

@@ -209,6 +209,11 @@ export async function readOrders(
 /**
  * 按全状态分页拉取订单（status 1,2,3,4,5 各查一遍，合并去重）
  * 用于平台订单同步，确保不漏单
+ *
+ * ★ 严格错误策略（防漏单铁律）：
+ *   - 任何分页请求（API isError 或网络异常）都会立即抛出异常
+ *   - 绝不允许在部分拉取失败的情况下返回 200 假象
+ *   - 调用方必须用 try/catch 处理，并向上层正确传递错误
  */
 export async function readOrdersForAllStatuses(
   creds: EmagCredentials,
@@ -216,30 +221,37 @@ export async function readOrdersForAllStatuses(
 ): Promise<EmagApiResponse<EmagOrder[]>> {
   const statuses = opts.statuses ?? [...ALL_ORDER_STATUSES];
   const allOrders = new Map<number, EmagOrder>();
-  const errors: string[] = [];
+  const itemsPerPage = opts.itemsPerPage ?? 100;
 
   for (const status of statuses) {
     let page = 1;
     while (true) {
-      const res = await readOrders(creds, { ...opts, status, currentPage: page, itemsPerPage: opts.itemsPerPage ?? 100 });
+      const res = await readOrders(creds, { ...opts, status, currentPage: page, itemsPerPage });
+
+      // ★ 严禁静默吞错：API 返回 isError 时立即抛出，让同步任务感知并上报
       if (res.isError) {
-        errors.push(`status=${status} page=${page}: ${res.messages?.join(';') ?? 'API 错误'}`);
-        break;
+        const errMsg = res.messages?.join('; ') ?? 'eMAG API 返回错误（isError=true）';
+        throw new Error(
+          `eMAG 订单同步失败（status=${status} page=${page}）：${errMsg}`,
+        );
       }
+
       const batch = Array.isArray(res.results) ? res.results : [];
       for (const o of batch) {
         if (o?.id != null) allOrders.set(o.id, o);
       }
-      if (batch.length < (opts.itemsPerPage ?? 100)) break;
+
+      // 本页条数 < 每页上限 → 已是最后一页
+      if (batch.length < itemsPerPage) break;
       page++;
+      // 安全熔断：eMAG 单次查询最大 100 页
       if (page > 100) break;
-      await new Promise((r) => setTimeout(r, 100)); // 限速
+      await new Promise((r) => setTimeout(r, 100)); // 限速：避免过快触发 429
     }
   }
 
   return {
-    isError: errors.length > 0 && allOrders.size === 0,
-    messages: errors.length > 0 ? errors : undefined,
+    isError: false,
     results: [...allOrders.values()],
   };
 }

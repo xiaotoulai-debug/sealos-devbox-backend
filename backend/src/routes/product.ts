@@ -501,11 +501,25 @@ router.get('/purchasing', async (req: Request, res: Response) => {
     const pageSize = Math.min(100, Math.max(1, parseInt(String(req.query.pageSize ?? 20), 10) || 20));
     const skip     = (page - 1) * pageSize;
 
-    const where = {
+    const user = req.user!;
+    const roleNameLower = (user.roleName ?? '').toLowerCase();
+    const isSuperAdmin =
+      roleNameLower.includes('admin') ||
+      roleNameLower.includes('超级管理员') ||
+      user.permissions.includes('*') ||
+      user.permissions.includes('ALL') ||
+      user.permissions.includes('ADMIN_FULL') ||
+      (user.permissions.includes('MANAGE_ACCOUNTS') && user.permissions.includes('MANAGE_ROLES'));
+
+    // 超管拥有全局视角，不添加 ownerId 过滤，可查看所有子账号的采购计划
+    // 普通员工只能查看自己（ownerId = 当前用户）推入的采购计划
+    const where: Record<string, unknown> = {
       status:          'PURCHASING' as const,
-      ownerId:         req.user!.userId,
-      purchaseOrderId: null,   // 双重保险：status+purchaseOrderId 共同确保只显示计划中的产品
+      purchaseOrderId: null,
     };
+    if (!isSuperAdmin) {
+      where.ownerId = user.userId;
+    }
 
     const [total, products] = await prisma.$transaction([
       prisma.product.count({ where }),
@@ -891,8 +905,29 @@ router.put('/batch-rollback', async (req: Request, res: Response) => {
 
     const productIds = ids.map(Number).filter((n) => !isNaN(n));
 
+    const user = req.user!;
+    const roleNameLower = (user.roleName ?? '').toLowerCase();
+    const isSuperAdmin =
+      roleNameLower.includes('admin') ||
+      roleNameLower.includes('超级管理员') ||
+      user.permissions.includes('*') ||
+      user.permissions.includes('ALL') ||
+      user.permissions.includes('ADMIN_FULL') ||
+      (user.permissions.includes('MANAGE_ACCOUNTS') && user.permissions.includes('MANAGE_ROLES'));
+
+    // ★ 铁律防线：purchaseOrderId: null 确保绝不碰已建单产品
+    // 超管可退回任何人的计划条目，普通员工只能退自己的
+    const whereCondition: Record<string, unknown> = {
+      id:              { in: productIds },
+      status:          'PURCHASING',
+      purchaseOrderId: null,
+    };
+    if (!isSuperAdmin) {
+      whereCondition.ownerId = user.userId;
+    }
+
     const result = await prisma.product.updateMany({
-      where: { id: { in: productIds }, status: 'PURCHASING', ownerId: req.user!.userId },
+      where: whereCondition as any,
       data: {
         status:        'SELECTED',
         publishStatus: 'UNPUBLISHED',
@@ -925,15 +960,30 @@ async function batchDiscardHandler(req: Request, res: Response): Promise<void> {
       return;
     }
 
-    const userId = req.user!.userId;
+    const user = req.user!;
+    const userId = user.userId;
+    const roleNameLower = (user.roleName ?? '').toLowerCase();
+    const isSuperAdmin =
+      roleNameLower.includes('admin') ||
+      roleNameLower.includes('超级管理员') ||
+      user.permissions.includes('*') ||
+      user.permissions.includes('ALL') ||
+      user.permissions.includes('ADMIN_FULL') ||
+      (user.permissions.includes('MANAGE_ACCOUNTS') && user.permissions.includes('MANAGE_ROLES'));
 
-    // 仅操作当前用户 + 采购计划状态（PURCHASING）的产品
+    // ★ 铁律防线：purchaseOrderId: null 是绝对硬卡，确保永远不会误清已建单产品的关联关系
+    // 超管可操作全公司所有计划条目，普通员工只能操作自己的
+    const whereCondition: Record<string, unknown> = {
+      id:              { in: productIds },
+      status:          'PURCHASING',
+      purchaseOrderId: null,
+    };
+    if (!isSuperAdmin) {
+      whereCondition.ownerId = userId;
+    }
+
     const result = await prisma.product.updateMany({
-      where: {
-        id:      { in: productIds },
-        status:  'PURCHASING',
-        ownerId: userId,
-      },
+      where: whereCondition as any,
       data: {
         // 退回意向产品池（SELECTED），清空采购计划暂存数据
         status:           'SELECTED',
@@ -945,7 +995,7 @@ async function batchDiscardHandler(req: Request, res: Response): Promise<void> {
       },
     });
 
-    console.log(`[batch-discard] userId=${userId} 移出计划 ${result.count} 个产品（状态退回 SELECTED）`);
+    console.log(`[batch-discard] userId=${userId} isSuperAdmin=${isSuperAdmin} 移出计划 ${result.count} 个产品（状态退回 SELECTED）`);
     res.json({
       code:    200,
       data:    { count: result.count },
@@ -982,10 +1032,12 @@ router.put('/batch-to-purchasing', async (req: Request, res: Response) => {
         const qty   = Math.max(0, Number(item.purchaseQuantity) || 0);
         const price = item.purchasePrice != null ? Number(item.purchasePrice) : null;
 
-        const product = await tx.product.findFirst({ where: { id, ownerId: userId, sku: { not: null } } });
+        // 库存 SKU 是公司共有资产，不按 ownerId 过滤；
+        // 任何员工都可以将任意 SKU 推入自己的采购计划
+        const product = await tx.product.findFirst({ where: { id, sku: { not: null }, isDeleted: false } });
         if (!product) continue;
 
-        const isAlreadyPurchasing = product.status === 'PURCHASING';
+        const isAlreadyPurchasing = product.status === 'PURCHASING' && product.ownerId === userId;
         const newQty = isAlreadyPurchasing
           ? (product.purchaseQuantity ?? 0) + qty
           : qty;
@@ -998,6 +1050,8 @@ router.put('/batch-to-purchasing', async (req: Request, res: Response) => {
             publishStatus:    'PUBLISHED',
             purchaseType:     'REPEAT',
             purchaseQuantity: newQty,
+            // ★ 必须设置 ownerId 为当前操作人，确保查询接口能按操作人过滤到此条记录
+            ownerId:          userId,
             // ★ 必须清空 purchaseOrderId：产品重新进入采购计划意味着
             //   它脱离了上一个采购单，purchaseOrderId: null 才能出现在
             //   GET /api/products/purchasing 的采购计划列表中

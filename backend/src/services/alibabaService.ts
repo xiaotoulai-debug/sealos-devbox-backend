@@ -5,11 +5,14 @@
  * 本模块只负责解析 buyerView 详情 + logistics trace 两类接口的返回值。
  *
  * ─── API 对应关系 ────────────────────────────────────────────────
- *  syncOrderDetail    → alibaba.trade.get.buyerView
- *  getLogisticsTrace  → alibaba.logistics.trace.info.get
+ *  syncOrderDetail        → alibaba.trade.get.buyerView
+ *  syncLogisticsInfos     → alibaba.trade.getLogisticsInfos.buyerView（专项物流单列表）
+ *  getLogisticsTrace      → alibaba.logistics.trace.info.get（按运单号查轨迹）
+ *  getLogisticsTraceByOrder → alibaba.trade.getLogisticsTraceInfo.buyerView（按订单号查轨迹，首选）
  */
 
 import { callAlibabaAPIPost, getValidAccessToken } from '../utils/alibaba';
+import { prisma } from '../lib/prisma';
 
 // ─── 通用错误结构 ─────────────────────────────────────────────────
 
@@ -109,17 +112,20 @@ export async function syncOrderDetail(
     String(baseInfo.sellerCompanyName ?? baseInfo.sellerNickname ?? '').trim() || null;
 
   // ── 物流订单解析 ─────────────────────────────────────────────
-  // 典型路径：result.logisticsOrders[]
-  //   每条包含：logisticsId / logisticsCompanyName / logisticsStatus
+  // ★ 1688 buyerView 实际路径：result.nativeLogistics.logisticsItems[]
+  //   每条包含：logisticsCompanyName / logisticsBillNo / logisticsCode / status
+  //   注意：result.logisticsOrders 不存在，历史代码读错了字段！
+  const nativeLogistics = (resultObj?.nativeLogistics as Record<string, unknown>) ?? {};
   const rawLogisticsOrders =
-    (resultObj?.logisticsOrders as unknown[] | undefined) ?? [];
+    (nativeLogistics?.logisticsItems as unknown[] | undefined) ?? [];
 
   const logisticsOrders = rawLogisticsOrders.map((lo) => {
     const l = (lo ?? {}) as Record<string, unknown>;
     return {
-      logisticsId:          String(l.logisticsId          ?? l.logisticsBillNo ?? l.mailNo ?? ''),
+      // logisticsBillNo = 快递单号（运单号），logisticsCode = 平台物流码（备用）
+      logisticsId:          String(l.logisticsBillNo ?? l.logisticsCode ?? l.mailNo ?? ''),
       logisticsCompanyName: String(l.logisticsCompanyName ?? l.logisticsCompany ?? ''),
-      logisticsStatus:      String(l.logisticsStatus      ?? l.status           ?? ''),
+      logisticsStatus:      String(l.status ?? l.logisticsStatus ?? ''),
     };
   }).filter((l) => !!l.logisticsId);   // 过滤掉还没运单号的空记录
 
@@ -150,6 +156,163 @@ export interface LogisticsTraceResult {
   logisticsCompanyName: string;
   nodes: LogisticsTraceNode[];
 }
+
+// ─── 专项物流单列表 (alibaba.trade.getLogisticsInfos.buyerView) ──
+
+export interface LogisticsInfo {
+  /** 1688 物流单主键（查轨迹必须） */
+  logisticsId: string;
+  /** 运单号（快递单号） */
+  logisticsBillNo: string;
+  /** 物流公司名称 */
+  logisticsCompanyName: string;
+  /** 发货时间（原始字符串） */
+  gmtSend: string | null;
+  /** 当前物流状态文本 */
+  logisticsStatus: string;
+}
+
+export interface LogisticsInfosResult {
+  logisticsInfos: LogisticsInfo[];
+  rawResult: Record<string, unknown>;
+}
+
+/**
+ * 调用 `alibaba.trade.getLogisticsInfos.buyerView` 获取订单的物流单列表。
+ * 提取：logisticsId / logisticsBillNo / logisticsCompanyName / gmtSend / logisticsStatus
+ */
+export async function syncLogisticsInfos(
+  alibabaOrderId: string,
+): Promise<LogisticsInfosResult | AliServiceError> {
+  const accessToken = await getValidAccessToken();
+  if (!accessToken) {
+    return { error: true, message: '1688 授权已过期，请重新绑定账号', errorCode: 'NO_TOKEN' };
+  }
+
+  // ★ 注意：alibaba.trade.getLogisticsInfos.buyerView 在部分应用权限套餐下返回
+  //   gw.APIUnsupported（HTTP 400）。当该接口不可用时，调用方应降级到
+  //   alibaba.trade.get.buyerView 中的 logisticsOrders 字段。
+  const apiPath = 'param2/1/com.alibaba.trade/alibaba.trade.getLogisticsInfos.buyerView';
+
+  const result = await callAlibabaAPIPost<Record<string, unknown>>(
+    apiPath,
+    { orderId: alibabaOrderId, webSite: '1688' },
+    accessToken,
+  );
+
+  if (!result.success) {
+    // gw.APIUnsupported 表示当前应用未开通此 API 权限，直接返回错误供调用方降级
+    console.warn(`[syncLogisticsInfos] 接口不可用 errorCode=${result.errorCode}（${result.errorMessage}）`);
+    return {
+      error: true,
+      message: `1688 getLogisticsInfos 接口请求失败：${result.errorMessage ?? '未知错误'}`,
+      errorCode: result.errorCode,
+      raw: result.raw,
+    };
+  }
+
+  const raw = (result.raw ?? {}) as Record<string, unknown>;
+
+  // 典型响应: { result: [ { logisticsId, logisticsBillNo, logisticsCompanyName, ... } ] }
+  // 或直接: { result: { ... } }（单条时 1688 可能不包装成数组）
+  let rawList: unknown[] = [];
+  const rawResult = (raw?.result ?? raw) as unknown;
+  if (Array.isArray(rawResult)) {
+    rawList = rawResult;
+  } else if (rawResult && typeof rawResult === 'object') {
+    rawList = [rawResult];
+  }
+
+  const logisticsInfos: LogisticsInfo[] = rawList
+    .map((item) => {
+      const i = (item ?? {}) as Record<string, unknown>;
+      return {
+        logisticsId:          String(i.logisticsId          ?? i.logisticsOrderId ?? '').trim(),
+        logisticsBillNo:      String(i.logisticsBillNo      ?? i.mailNo           ?? '').trim(),
+        logisticsCompanyName: String(i.logisticsCompanyName ?? i.logisticsCompany ?? '').trim(),
+        gmtSend:              i.gmtSend ? String(i.gmtSend) : null,
+        logisticsStatus:      String(i.logisticsStatus      ?? i.status           ?? '').trim(),
+      };
+    })
+    .filter((i) => !!i.logisticsId || !!i.logisticsBillNo);
+
+  return { logisticsInfos, rawResult: raw };
+}
+
+// ─── 按订单号查物流轨迹 (alibaba.trade.getLogisticsTraceInfo.buyerView) ─
+
+export interface LogisticsTraceByOrderResult {
+  logisticsId: string;
+  logisticsBillNo: string;
+  logisticsCompanyName: string;
+  /** 节点按时间倒序排列（最新在前） */
+  nodes: LogisticsTraceNode[];
+}
+
+/**
+ * 调用 `alibaba.trade.getLogisticsTraceInfo.buyerView` 按 1688 订单号直查轨迹。
+ * 无需提前获取运单号，适合在采购单同步时一步到位。
+ *
+ * @param alibabaOrderId  1688 订单号
+ */
+export async function getLogisticsTraceByOrder(
+  alibabaOrderId: string,
+): Promise<LogisticsTraceByOrderResult | AliServiceError> {
+  const accessToken = await getValidAccessToken();
+  if (!accessToken) {
+    return { error: true, message: '1688 授权已过期，请重新绑定账号', errorCode: 'NO_TOKEN' };
+  }
+
+  const apiPath = 'param2/1/com.alibaba.trade/alibaba.trade.getLogisticsTraceInfo.buyerView';
+  const result = await callAlibabaAPIPost<Record<string, unknown>>(
+    apiPath,
+    { orderId: alibabaOrderId, webSite: '1688' },
+    accessToken,
+  );
+
+  if (!result.success) {
+    return {
+      error: true,
+      message: `1688 getLogisticsTraceInfo 接口请求失败：${result.errorMessage ?? '未知错误'}`,
+      errorCode: result.errorCode,
+      raw: result.raw,
+    };
+  }
+
+  const raw = (result.raw ?? {}) as Record<string, unknown>;
+
+  // 典型响应:
+  // { result: { logisticsCompanyName, logisticsBillNo, logisticsId, traceNodeList: [{acceptTime, remark}] } }
+  const resultObj = (raw?.result as Record<string, unknown>) ?? raw;
+
+  const logisticsId          = String(resultObj?.logisticsId      ?? resultObj?.logisticsOrderId ?? '').trim();
+  const logisticsBillNo      = String(resultObj?.logisticsBillNo  ?? resultObj?.mailNo           ?? '').trim();
+  const logisticsCompanyName = String(resultObj?.logisticsCompanyName ?? resultObj?.logisticsCompany ?? '').trim();
+
+  const rawNodes = (resultObj?.traceNodeList as unknown[] | undefined) ?? [];
+
+  const nodes: LogisticsTraceNode[] = rawNodes
+    .map((n) => {
+      const node = (n ?? {}) as Record<string, unknown>;
+      return {
+        // buyerView 接口字段：acceptTime + remark；兼容旧字段 time/desc
+        eventTime:   String(node.acceptTime ?? node.time        ?? node.eventTime   ?? '').trim(),
+        description: String(node.remark     ?? node.desc        ?? node.description ?? '').trim(),
+        location:    String(node.address    ?? node.location    ?? node.city        ?? '').trim() || null,
+      };
+    })
+    .filter((n) => !!n.eventTime || !!n.description)
+    // 最新节点排前（倒序）
+    .sort((a, b) => {
+      const ta = new Date(a.eventTime).getTime();
+      const tb = new Date(b.eventTime).getTime();
+      return isNaN(ta) || isNaN(tb) ? 0 : tb - ta;
+    });
+
+  return { logisticsId, logisticsBillNo, logisticsCompanyName, nodes };
+}
+
+// ─────────────────────────────────────────────────────────────────
 
 /**
  * 调用 `alibaba.logistics.trace.info.get` 获取物流轨迹流转节点。
@@ -205,5 +368,86 @@ export async function getLogisticsTrace(
     logisticsId,
     logisticsCompanyName: companyName,
     nodes,
+  };
+}
+
+// ─── 1688 采购单自动同步（Cron 专用） ─────────────────────────────
+
+/** 1688 状态 → 可读中文（与 purchase 路由保持一致） */
+const ALIBABA_STATUS_MAP: Record<string, string> = {
+  waitbuyerpay:     '等待买家付款',
+  waitallpay:       '等待拼单付款',
+  waitsellersend:   '等待卖家发货',
+  waitbuyerreceive: '等待买家收货',
+  success:          '交易成功',
+  closed:           '交易关闭',
+  cancelled:        '已取消',
+};
+
+export interface PurchaseSyncResult {
+  orderId:         number;
+  orderNo:         string;
+  success:         boolean;
+  alibabaStatus?:  string;
+  logisticsCompany?: string | null;
+  trackingNumber?:   string | null;
+  error?:          string;
+}
+
+/**
+ * 同步单条采购单的 1688 状态与物流信息，并直接落库。
+ * 供定时任务（Cron）与手动同步路由共同复用，保证逻辑唯一来源。
+ *
+ * @param orderId       本地 PurchaseOrder.id
+ * @param alibabaOrderId  1688 订单号
+ * @param orderNo       订单号（日志用）
+ */
+export async function syncPurchaseOrderFromAlibaba(
+  orderId: number,
+  alibabaOrderId: string,
+  orderNo: string,
+): Promise<PurchaseSyncResult> {
+  // ① 调用 buyerView 获取状态 + nativeLogistics 物流
+  const detail = await syncOrderDetail(alibabaOrderId);
+  if (isAliServiceError(detail)) {
+    return { orderId, orderNo, success: false, error: detail.message };
+  }
+
+  const firstLogistics = detail.logisticsOrders[0] ?? null;
+  const humanStatus    = ALIBABA_STATUS_MAP[detail.alibabaStatus] ?? detail.alibabaStatus;
+
+  // ② 构建落库数据
+  const updateData: Record<string, unknown> = {
+    supplierName:    detail.supplierName ?? detail.sellerLoginId ?? undefined,
+    logisticsStatus: firstLogistics
+      ? `[${firstLogistics.logisticsCompanyName}] ${firstLogistics.logisticsStatus || humanStatus}`
+      : humanStatus,
+  };
+  if (firstLogistics?.logisticsCompanyName) updateData.logisticsCompany = firstLogistics.logisticsCompanyName;
+  if (firstLogistics?.logisticsId)          updateData.trackingNumber   = firstLogistics.logisticsId;
+
+  // ③ 同步子单状态与金额
+  await prisma.purchaseOrderItem.updateMany({
+    where: { purchaseOrderId: orderId },
+    data: {
+      alibabaOrderStatus: detail.alibabaStatus,
+      ...(detail.totalAmount > 0 ? { alibabaTotalAmount: detail.totalAmount } : {}),
+      ...(detail.shippingFee  > 0 ? { shippingFee:        detail.shippingFee  } : {}),
+    },
+  });
+
+  // ④ 原子落库主单
+  await prisma.purchaseOrder.update({
+    where: { id: orderId },
+    data:  updateData,
+  });
+
+  return {
+    orderId,
+    orderNo,
+    success:         true,
+    alibabaStatus:   detail.alibabaStatus,
+    logisticsCompany: (updateData.logisticsCompany as string | undefined) ?? null,
+    trackingNumber:   (updateData.trackingNumber   as string | undefined) ?? null,
   };
 }
