@@ -394,11 +394,46 @@ router.get('/', async (req: Request, res: Response) => {
       prisma.purchaseOrder.count({ where: { status: 'RECEIVED' } }),
     ]);
 
+    // ── 兜底补查：收集 items.productIds 中引用但 products 关联缺失的产品 ──
+    //
+    // 场景：Product.purchaseOrderId 是单 FK，若同一产品被多次建单，
+    // 后建的订单会覆盖 FK，导致先建订单的 products 关联断裂。
+    // 这里通过 productIds JSON 做二次查找，确保前端始终能拿到明细。
+    const missingPidSet = new Set<number>();
+    for (const o of rawList) {
+      const relatedIds = new Set(((o as any).products as any[] ?? []).map((p: any) => p.id));
+      for (const item of ((o as any).items as any[] ?? [])) {
+        try {
+          const pids: number[] = JSON.parse(item.productIds ?? '[]');
+          for (const pid of pids) {
+            if (!relatedIds.has(pid)) missingPidSet.add(pid);
+          }
+        } catch { /* ignore */ }
+      }
+    }
+    let fallbackProdMap = new Map<number, any>();
+    if (missingPidSet.size > 0) {
+      const fallbackProds = await prisma.product.findMany({
+        where: { id: { in: Array.from(missingPidSet) } },
+        select: {
+          id: true, sku: true, chineseName: true, imageUrl: true,
+          purchasePrice: true, purchaseQuantity: true, purchaseUrl: true,
+          externalProductId: true, externalSkuId: true, externalSkuIdNum: true,
+          externalSynced: true, externalOrderId: true,
+        },
+      });
+      fallbackProdMap = new Map(fallbackProds.map((p) => [p.id, p]));
+    }
+
     // ── 合并 products 信息进 items，前端子表直接读 items[i].* ─────
     const list = rawList.map((o) => {
       const rawItems    = (o as any).items    as any[] ?? [];
       const rawProducts = (o as any).products as any[] ?? [];
       const prodById    = new Map<number, any>(rawProducts.map((p: any) => [p.id, p]));
+      // 将兜底查到的产品也合入此 map
+      for (const [pid, prod] of fallbackProdMap) {
+        if (!prodById.has(pid)) prodById.set(pid, prod);
+      }
 
       const mergedItems = rawItems.map((item: any, idx: number) => {
         let prod: any = null;
@@ -451,7 +486,7 @@ router.get('/', async (req: Request, res: Response) => {
         logisticsStatus: (o as any).logisticsStatus   ?? null,
         createdAt:       o.createdAt,
         items:           mergedItems,    // ← 已合并产品信息，前端子表直接用
-        products:        rawProducts,    // ← 原始产品数组保留（向后兼容）
+        products:        Array.from(prodById.values()),  // ← 含兜底补查，向后兼容
         warehouse:       (o as any).warehouse ?? null,
       };
     });
@@ -497,7 +532,7 @@ router.get('/:id/products', async (req: Request, res: Response) => {
     }
 
     // ① 查关联产品（通过 Product.purchaseOrderId 反向关联）
-    const products = await prisma.product.findMany({
+    let products = await prisma.product.findMany({
       where:   { purchaseOrderId: id },
       orderBy: { updatedAt: 'desc' },
       select: {
@@ -536,7 +571,35 @@ router.get('/:id/products', async (req: Request, res: Response) => {
       } catch { /* ignore malformed JSON */ }
     }
 
-    // ④ 合并：每个 product 行追加对应的 1688 item 字段
+    // ③.5 兜底补查：当 Product.purchaseOrderId FK 被后建订单覆盖导致 products 为空时，
+    //       通过 items.productIds JSON 直接按 ID 查补，确保展开行永不空白。
+    if (products.length === 0 && itemByProductId.size > 0) {
+      const fallbackIds = Array.from(itemByProductId.keys());
+      const fallbackProds = await prisma.product.findMany({
+        where: { id: { in: fallbackIds } },
+        select: {
+          id: true, pnk: true, sku: true, chineseName: true,
+          imageUrl: true, purchaseUrl: true,
+          purchasePrice: true, purchaseQuantity: true,
+          externalProductId: true, externalSkuId: true, externalSkuIdNum: true,
+          externalSynced: true, externalOrderId: true,
+          status: true,
+        },
+      });
+      products = fallbackProds as typeof products;
+      console.log(
+        `[GET /purchases/${id}/products] ⚠️ FK断裂兜底：products原为空，` +
+        `通过 itemByProductId 补查到 ${products.length} 个产品 → ids: ${fallbackIds.join(',')}`,
+      );
+    }
+
+    // ④ debug：打印关键采购单的数据结构，供验证
+    console.log(
+      `[GET /purchases/${id}/products] products=${products.length} items=${orderItems.length}` +
+      (products.length > 0 ? ` | skus: ${products.map((p) => p.sku).join(',')}` : ' | ⚠️ products仍为空！'),
+    );
+
+    // ⑤ 合并：每个 product 行追加对应的 1688 item 字段
     const list = products.map((p) => {
       const item = itemByProductId.get(p.id);
       return {
@@ -571,6 +634,7 @@ router.get('/:id/products', async (req: Request, res: Response) => {
       };
     });
 
+    console.log(`[GET /purchases/${id}/products] ✅ 最终返回 list.length=${list.length}`);
     res.json({ code: 200, data: list, message: 'success' });
   } catch (err: any) {
     console.error('[GET /api/purchases/:id/products]', err?.message ?? err);
