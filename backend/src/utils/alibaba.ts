@@ -138,17 +138,22 @@ export async function callAlibabaAPIPost<T = unknown>(
     return { success: true, data: body as T, raw: body };
   } catch (err: unknown) {
     const axErr = err as { response?: { data?: unknown; status?: number }; message?: string; stack?: string };
-    console.log('❌❌❌ 1688 深层报错响应（Catch 完整）❌❌❌', axErr.response ? JSON.stringify(axErr.response.data ?? axErr.response, null, 2) : err);
-    console.error(`[1688 API POST] ${apiPath} 网络/HTTP异常 → status=${axErr.response?.status}, msg=${axErr.message}`);
-    if (axErr.stack) console.error('[1688 API POST] 完整堆栈:', axErr.stack);
-    if (axErr.response?.data) {
-      console.error('[1688 API POST] 异常响应体:', JSON.stringify(axErr.response.data, null, 2));
-    }
+    const rawBody = axErr.response?.data as Record<string, unknown> | undefined;
+
+    // ★ 1688 部分接口在权限不足时以 HTTP 400 + JSON body 返回业务错误码（如 gw.APIUnsupported）
+    //   必须从 rawBody 提取真实 errorCode，否则后续判断全部失效。
+    const bizErrorCode = rawBody?.error_code ?? rawBody?.errorCode;
+    const bizErrorMsg  = rawBody?.error_message ?? rawBody?.errorMessage;
+
+    console.log('❌❌❌ 1688 深层报错响应（Catch 完整）❌❌❌', JSON.stringify(rawBody ?? err, null, 2));
+    console.error(`[1688 API POST] ${apiPath} HTTP异常 → status=${axErr.response?.status} bizCode=${bizErrorCode ?? 'N/A'}, msg=${axErr.message}`);
+
     return {
       success: false, data: null,
-      errorCode: String(axErr.response?.status ?? 'NETWORK_ERROR'),
-      errorMessage: axErr.message ?? '网络请求失败',
-      raw: axErr.response?.data,
+      // 优先返回 1688 业务错误码（如 gw.APIUnsupported），其次才是 HTTP 状态码
+      errorCode:    bizErrorCode ? String(bizErrorCode) : String(axErr.response?.status ?? 'NETWORK_ERROR'),
+      errorMessage: bizErrorMsg  ? String(bizErrorMsg)  : (axErr.message ?? '网络请求失败'),
+      raw: rawBody,
     };
   }
 }

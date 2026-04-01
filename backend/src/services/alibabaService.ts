@@ -263,7 +263,9 @@ export async function getLogisticsTraceByOrder(
     return { error: true, message: '1688 授权已过期，请重新绑定账号', errorCode: 'NO_TOKEN' };
   }
 
-  const apiPath = 'param2/1/com.alibaba.trade/alibaba.trade.getLogisticsTraceInfo.buyerView';
+  // ★ 正确 namespace 为 com.alibaba.logistics（官方文档：com.alibaba.logistics:alibaba.trade.getLogisticsTraceInfo.buyerView）
+  //   旧写法 com.alibaba.trade 会导致 gw.APIUnsupported（HTTP 400）
+  const apiPath = 'param2/1/com.alibaba.logistics/alibaba.trade.getLogisticsTraceInfo.buyerView';
   const result = await callAlibabaAPIPost<Record<string, unknown>>(
     apiPath,
     { orderId: alibabaOrderId, webSite: '1688' },
@@ -281,21 +283,37 @@ export async function getLogisticsTraceByOrder(
 
   const raw = (result.raw ?? {}) as Record<string, unknown>;
 
-  // 典型响应:
-  // { result: { logisticsCompanyName, logisticsBillNo, logisticsId, traceNodeList: [{acceptTime, remark}] } }
-  const resultObj = (raw?.result as Record<string, unknown>) ?? raw;
+  // ★ 1688 getLogisticsTraceInfo.buyerView 真实响应结构（经线上验证）：
+  // {
+  //   logisticsTrace: [{
+  //     logisticsId: "LP00805234421740",
+  //     logisticsBillNo: "73701751082121",
+  //     logisticsCompanyName: "中通快递(ZTO)",
+  //     logisticsSteps: [{ acceptTime: "2026-03-31 18:57:26", remark: "..." }, ...]
+  //   }]
+  // }
+  // 注意：顶层 key 是 logisticsTrace（数组），不是 result.traceNodeList（旧的猜测写法）
+  const traceArray = (raw?.logisticsTrace as unknown[] | undefined) ?? [];
+  const firstEntry = (traceArray[0] ?? {}) as Record<string, unknown>;
 
-  const logisticsId          = String(resultObj?.logisticsId      ?? resultObj?.logisticsOrderId ?? '').trim();
-  const logisticsBillNo      = String(resultObj?.logisticsBillNo  ?? resultObj?.mailNo           ?? '').trim();
-  const logisticsCompanyName = String(resultObj?.logisticsCompanyName ?? resultObj?.logisticsCompany ?? '').trim();
+  // 兼容旧版 result.traceNodeList 结构（防御性降级）
+  const resultObj  = (raw?.result as Record<string, unknown>) ?? {};
 
-  const rawNodes = (resultObj?.traceNodeList as unknown[] | undefined) ?? [];
+  const logisticsId          = String(firstEntry?.logisticsId          ?? resultObj?.logisticsId          ?? resultObj?.logisticsOrderId ?? '').trim();
+  const logisticsBillNo      = String(firstEntry?.logisticsBillNo      ?? resultObj?.logisticsBillNo      ?? resultObj?.mailNo           ?? '').trim();
+  const logisticsCompanyName = String(firstEntry?.logisticsCompanyName ?? resultObj?.logisticsCompanyName ?? resultObj?.logisticsCompany ?? '').trim();
+
+  // logisticsSteps（新结构）优先，traceNodeList（旧结构）兜底
+  const rawNodes: unknown[] =
+    (firstEntry?.logisticsSteps as unknown[] | undefined) ??
+    (resultObj?.traceNodeList   as unknown[] | undefined) ??
+    [];
 
   const nodes: LogisticsTraceNode[] = rawNodes
     .map((n) => {
       const node = (n ?? {}) as Record<string, unknown>;
       return {
-        // buyerView 接口字段：acceptTime + remark；兼容旧字段 time/desc
+        // logisticsSteps 字段：acceptTime + remark；兼容旧字段 time/desc
         eventTime:   String(node.acceptTime ?? node.time        ?? node.eventTime   ?? '').trim(),
         description: String(node.remark     ?? node.desc        ?? node.description ?? '').trim(),
         location:    String(node.address    ?? node.location    ?? node.city        ?? '').trim() || null,
@@ -329,10 +347,11 @@ export async function getLogisticsTrace(
     return { error: true, message: '1688 授权已过期，请重新绑定账号', errorCode: 'NO_TOKEN' };
   }
 
+  // ★ 1688 文档要求参数名为 logisticsId（物流单主键），而非 logisticsOrderId
   const apiPath = 'param2/1/com.alibaba.logistics/alibaba.logistics.trace.info.get';
   const result = await callAlibabaAPIPost<Record<string, unknown>>(
     apiPath,
-    { logisticsOrderId: logisticsId, webSite },
+    { logisticsId: logisticsId, webSite },
     accessToken,
   );
 
