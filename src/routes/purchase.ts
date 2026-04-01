@@ -351,12 +351,16 @@ router.get('/', async (req: Request, res: Response) => {
 
     if (kw) {
       const kwOrClauses: any[] = [
-        // 主单号精确搜索
+        // 主单号
         { orderNo:        { contains: kw, mode: 'insensitive' as const } },
-        // 主单 1688 订单号（新增：覆盖手动绑定/下单的场景）
+        // 主单 1688 订单号
         { alibabaOrderId: { contains: kw, mode: 'insensitive' as const } },
+        // ★ 主单物流运单号（仓库人员扫码反查采购单的核心入口）
+        { trackingNumber: { contains: kw, mode: 'insensitive' as const } },
         // 子单 1688 订单号
         { items: { some: { alibabaOrderId: { contains: kw, mode: 'insensitive' as const } } } },
+        // ★ 子单物流单号（PurchaseOrderItem.logisticsNo）
+        { items: { some: { logisticsNo:    { contains: kw, mode: 'insensitive' as const } } } },
         // SKU 路径①：Product.purchaseOrderId FK 正常时，通过 products 关联搜索
         { products: { some: { sku: { contains: kw, mode: 'insensitive' as const } } } },
       ];
