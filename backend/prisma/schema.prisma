@@ -176,7 +176,8 @@ model PurchaseOrderItem {
   purchaseOrderId     Int           @map("purchase_order_id")
   offerId             String?       @map("offer_id")           // 1688 商品 offerId（即卖家维度标识）
   productIds          String?       @map("product_ids")        // 关联的本地产品 ID 列表（JSON 数组）
-  quantity            Int           @default(1)                // 本批次合计采购数量
+  quantity            Int           @default(1)                // 本批次计划采购数量
+  receivedQuantity    Int           @default(0) @map("received_quantity") // 已累计入库数量（支持分批到货）
   createdAt           DateTime      @default(now()) @map("created_at")
   // ── 1688 子单回填字段（一个 offerId 对应一个 1688 子订单）────
   alibabaOrderId      String?       @map("alibaba_order_id")      // 1688 官方订单号
@@ -396,7 +397,8 @@ enum OrderStatus {
   PENDING       // 待下单（内部建单完成，尚未调 1688）
   PLACED        // 已下单/待付款（1688 订单已创建）
   IN_TRANSIT    // 运输中
-  RECEIVED      // 已入库
+  PARTIAL       // 部分入库（实到数量 < 计划数量，等待剩余货物或人工强制结单）
+  RECEIVED      // 已全部入库
 }
 
 /// 库存流水类型

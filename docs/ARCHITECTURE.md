@@ -349,10 +349,19 @@ graph TD
   │
 PLACED（采购中）→ IN_TRANSIT（运输中，待后续物流同步）
   │
-  ▼  POST /:id/stock-in { warehouseId }
-RECEIVED（已入库）
-  ★ 事务：WarehouseStock.stockQuantity += qty + Product.stockActual 重聚合
-  ★ 【在途联动】GREATEST(0, inTransitQuantity - qty)（货已到仓，扣减在途）
+  ▼  POST /:id/stock-in { warehouseId, items? }     （首次或继续入库）
+PARTIAL（部分入库）←→ 继续 stock-in 直至累计量 >= 计划量
+  ★ 累加 PurchaseOrderItem.receivedQuantity（历次到货总量）
+  ★ WarehouseStock.stockQuantity += 本次实盘量
+  ★ GREATEST(0, inTransitQuantity - 本次实盘量)（在途联动扣减）
+  ★ 判断：totalReceived >= totalPlan → RECEIVED；否则 → PARTIAL
+  │
+  ├── 方案 A：继续 stock-in（等后续批次到货）
+  └── 方案 B：POST /:id/force-complete（人工宣告终止，清理残留在途）
+        ★ 强制 status → RECEIVED
+        ★ 遍历欠量（item.quantity - item.receivedQuantity）
+        ★ GREATEST(0, inTransitQuantity - undeliveredQty)（永不到货量归零，防虚高）
+RECEIVED（已全部入库）
   ★ 写 PURCHASE_IN 库存流水 + 产品 status 回归 SELECTED
 ```
 
@@ -372,7 +381,8 @@ RECEIVED（已入库）
 | `POST /api/purchases/:id/place-1688-order` | `routes/purchase.ts` | 手动触发 1688 真实下单，仅 PENDING 状态可执行；调用 `createAlibabaOrder` → 回填订单号 → PLACED |
 | `POST /api/purchases/:id/bind-1688-order` | `routes/purchase.ts` | 手动绑定 1688 订单号（线下已下单回填），事务更新 item.alibabaOrderId + PO.status→PLACED + Product.externalOrderId |
 | `POST /api/purchases/:id/mark-purchasing` | `routes/purchase.ts` | 线下采购标记：直接 PENDING→PLACED，无需 1688 交互，可选回填外部单号 |
-| `POST /api/purchases/:id/stock-in` | `routes/purchase.ts` | **确认入库**：接收 `warehouseId`，事务内 WarehouseStock.upsert(stockQuantity += qty) + 重聚合 Product.stockActual + PURCHASE_IN 库存流水 + 主单→RECEIVED；**★ 同时 `GREATEST(0, inTransitQuantity - qty)`（在途库存-）** |
+| `POST /api/purchases/:id/stock-in` | `routes/purchase.ts` | **精准入库（支持分批）**：接收 `warehouseId` + 可选 `items[]{productId,receivedQuantity}`；累加 `PurchaseOrderItem.receivedQuantity`；WarehouseStock.upsert(stockQuantity += 实盘量) + `GREATEST(0,inTransitQuantity-实盘量)`；重聚合 stockActual + PURCHASE_IN 流水；**★ 状态判断：totalReceived≥totalPlan → RECEIVED，否则 → PARTIAL** |
+| `POST /api/purchases/:id/force-complete` | `routes/purchase.ts` | **强制结单**：PARTIAL/PLACED/IN_TRANSIT→RECEIVED；**★ 核心：遍历欠量(item.quantity-item.receivedQuantity)，对每个产品执行 `GREATEST(0,inTransitQuantity-undeliveredQty)` 清理永不到货的在途残量，防止在途库存虚高** |
 | `POST /api/purchases/:id/rollback` | `routes/purchase.ts` | **高危撤销（任意状态→PENDING）**：若原为 RECEIVED，事务内逐 SKU 扣减 WarehouseStock + 重聚合 stockActual + MANUAL_ADJUST 流水；**★ 同时 `inTransitQuantity += qty`（还原在途）**；清空 items.alibabaOrderId；主单 status→PENDING + warehouseId→null；产品 status→PURCHASING + externalOrderId→null |
 | `PATCH /api/purchases/:id/warehouse` | `routes/purchase.ts` | 前置绑定目标入库仓库（RECEIVED 状态禁止修改）；校验仓库存在且 ACTIVE；更新 PO.warehouseId 并返回 warehouse 实体 |
 | `PATCH /api/purchases/:id/logistics` | `routes/purchase.ts` | 手动回填物流信息（支持线下采购）；可更新 logisticsCompany / trackingNumber / logisticsStatus / supplierName / alibabaOrderId；至少传一个字段；任意状态可操作 |
@@ -404,6 +414,8 @@ RECEIVED（已入库）
 ### 6.4 Schema 变更（OrderStatus 枚举 + PurchaseOrder 模型）
 
 - `OrderStatus` 新增 `PENDING` 值（待下单，内部建单完成，尚未调 1688）
+- `OrderStatus` 新增 `PARTIAL` 值（部分入库，累计已收 < 计划数量，等待剩余货物或人工强制结单）
+- `PurchaseOrderItem` 新增 `receivedQuantity Int @default(0)`（累计已入库数量，支持分批到货追踪）
 - `PurchaseOrder` 新增：`warehouseId`（目标入库仓）、`remark`、`updatedAt`
 - `PurchaseOrder` 扩充物流与供应商字段：`alibabaOrderId`（1688 主订单号）、`supplierName`（供应商名称）、`logisticsCompany`（物流公司）、`trackingNumber`（运单号）、`logisticsStatus`（物流状态文本）
 - 新建 `src/services/alibabaService.ts`：封装五个 1688 服务函数：
