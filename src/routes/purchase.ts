@@ -391,6 +391,7 @@ router.get('/', async (req: Request, res: Response) => {
           items: {
             select: {
               id: true, offerId: true, quantity: true,
+              receivedQuantity: true,                    // ← 已入库累计量（前端"已入库量"显示的来源）
               productIds: true,                          // ← 用于精准关联 product
               alibabaOrderId: true, alibabaOrderStatus: true,
               alibabaTotalAmount: true, shippingFee: true,
@@ -476,6 +477,7 @@ router.get('/', async (req: Request, res: Response) => {
           id:                 item.id,
           offerId:            item.offerId            ?? null,
           quantity:           item.quantity,
+          receivedQuantity:   item.receivedQuantity   ?? 0,  // ← 已入库累计量，缺失时兜底 0
           alibabaOrderId:     item.alibabaOrderId     ?? null,
           alibabaOrderStatus: item.alibabaOrderStatus ?? null,
           alibabaTotalAmount: item.alibabaTotalAmount != null ? Number(item.alibabaTotalAmount) : null,
@@ -583,6 +585,7 @@ router.get('/:id/products', async (req: Request, res: Response) => {
       where: { purchaseOrderId: id },
       select: {
         id: true, offerId: true, productIds: true, quantity: true,
+        receivedQuantity: true,                                      // ← 已入库累计量（前端"已入库量"显示的来源）
         alibabaOrderId: true, alibabaOrderStatus: true,
         alibabaTotalAmount: true, shippingFee: true,
         logisticsCompany: true, logisticsNo: true,
@@ -652,6 +655,7 @@ router.get('/:id/products', async (req: Request, res: Response) => {
         purchaseOrderItemId: item?.id                                          ?? null,
         offerId:             item?.offerId                                     ?? null,
         quantity:            item?.quantity                                    ?? p.purchaseQuantity ?? null,
+        receivedQuantity:    item?.receivedQuantity                            ?? 0,  // ← 已入库累计量，缺失时兜底 0
         alibabaOrderId:      item?.alibabaOrderId                              ?? null,
         alibabaOrderStatus:  item?.alibabaOrderStatus                          ?? null,
         alibabaTotalAmount:  item?.alibabaTotalAmount != null
@@ -663,7 +667,11 @@ router.get('/:id/products', async (req: Request, res: Response) => {
       };
     });
 
-    console.log(`[GET /purchases/${id}/products] ✅ 最终返回 list.length=${list.length}`);
+    // ★ 验证日志：打印每个 item 的 receivedQuantity，确认已正确透传给前端
+    console.log(
+      `[GET /purchases/${id}/products] ✅ 最终返回 list.length=${list.length}`,
+      list.map((item) => `sku=${item.sku ?? item.id} quantity=${item.quantity} receivedQuantity=${item.receivedQuantity}`).join(' | '),
+    );
     res.json({ code: 200, data: list, message: 'success' });
   } catch (err: any) {
     console.error('[GET /api/purchases/:id/products]', err?.message ?? err);
@@ -1869,6 +1877,16 @@ router.post('/:id/stock-in', async (req: Request, res: Response) => {
     const finalOrder  = await prisma.purchaseOrder.findUnique({ where: { id }, select: { status: true } });
     const finalStatus = finalOrder?.status ?? 'PARTIAL';
     const totalReceivedQty = stockDetails.reduce((s, d) => s + d.receivedQty, 0);
+
+    // ★ 强制验证日志：事务提交后重新从 DB 读取 receivedQuantity，证明数据已落库
+    const verifyItems = await prisma.purchaseOrderItem.findMany({
+      where:  { purchaseOrderId: id },
+      select: { id: true, quantity: true, receivedQuantity: true },
+    });
+    console.log(
+      `[stock-in][DB验证] 采购单 #${id}(${order.orderNo}) 事务提交后从DB重新读取子单 receivedQuantity：`,
+      verifyItems.map((i) => `ItemId=${i.id} 计划=${i.quantity} 已收=${i.receivedQuantity}`).join(' | '),
+    );
 
     console.log(
       `[stock-in] 采购单 #${id}(${order.orderNo}) 入库 → ${wh.name}，` +
