@@ -21,7 +21,8 @@
     "backfill:product-urls": "node -r ./scripts/preload-file-polyfill.js -r tsx/cjs scripts/backfill-product-urls.ts",
     "inspect:emag-product": "node -r ./scripts/preload-file-polyfill.js -r tsx/cjs scripts/inspect-emag-product-response.ts",
     "sync:platform-orders": "node -r ./scripts/preload-file-polyfill.js -r tsx/cjs scripts/sync-platform-orders.ts",
-    "sync:platform-orders:incremental": "node -r ./scripts/preload-file-polyfill.js -r tsx/cjs scripts/sync-platform-orders.ts --incremental"
+    "sync:platform-orders:incremental": "node -r ./scripts/preload-file-polyfill.js -r tsx/cjs scripts/sync-platform-orders.ts --incremental",
+    "ops:reset-admin-password": "tsx scripts/reset-admin-password.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",
