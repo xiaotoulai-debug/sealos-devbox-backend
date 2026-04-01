@@ -313,15 +313,42 @@ router.put('/purchase-orders/:id/receive', async (req: Request, res: Response) =
       }
     }
 
-    // ── productId → PurchaseOrderItem.id 映射 ─────────────────────
-    const productToItemMap = new Map<number, number>();
+    // ── productId → PurchaseOrderItem 映射（含计划量和已收量） ──
+    const productToItemMap = new Map<number, number>();          // productId → itemId
+    const productToItemData = new Map<number, { quantity: number; receivedQuantity: number }>(); // 用于防超收
     for (const item of order.items) {
       try {
         const pids: number[] = JSON.parse(item.productIds ?? '[]');
         for (const pid of pids) {
-          if (!productToItemMap.has(pid)) productToItemMap.set(pid, item.id);
+          if (!productToItemMap.has(pid)) {
+            productToItemMap.set(pid, item.id);
+            productToItemData.set(pid, { quantity: item.quantity, receivedQuantity: item.receivedQuantity });
+          }
         }
       } catch { /* ignore */ }
+    }
+
+    // ★★★ 防超收硬拦截：本次入库量 + 已入库量 不可超过计划采购量 ★★★
+    const overReceiveErrors: string[] = [];
+    for (const [productId, thisQty] of receivedMap.entries()) {
+      const itemData = productToItemData.get(productId);
+      if (!itemData) continue;
+      const alreadyReceived = itemData.receivedQuantity;
+      const planQty         = itemData.quantity;
+      if (alreadyReceived + thisQty > planQty) {
+        const prod = allProducts.find((p) => p.id === productId);
+        overReceiveErrors.push(
+          `SKU [${prod?.sku ?? productId}]：本次入库 ${thisQty} + 已入库 ${alreadyReceived} = ${alreadyReceived + thisQty}，超出计划采购量 ${planQty}`,
+        );
+      }
+    }
+    if (overReceiveErrors.length > 0) {
+      res.status(400).json({
+        code:    400,
+        data:    null,
+        message: `入库总数不可超过采购总数，拒绝超收！\n${overReceiveErrors.join('\n')}`,
+      });
+      return;
     }
 
     const stockChanges: Array<{ productId: number; sku: string | null; receivedQty: number; before: number; after: number }> = [];
