@@ -322,16 +322,27 @@ router.get('/', async (req: Request, res: Response) => {
       req.query.search  ?? req.body?.search  ?? '',
     ).trim();
 
+    // ── ② 预查：关键词可能是 SKU，先找到所有匹配的产品 ID ──────────
+    //
+    // ★ 背景：Product.purchaseOrderId 是单 FK，若同一产品被多次建单，
+    //   后建的订单会覆盖 FK，导致先建订单的 products 关联断裂。
+    //   直接用 { products: { some: { sku: ... } } } 会漏掉 FK 断裂的订单。
+    //
+    // ★ 修复策略：先查出 SKU 匹配的产品 ID 列表，再通过
+    //   PurchaseOrderItem.productIds JSON 字段进行二次匹配，彻底绕过 FK 断裂问题。
+    let skuMatchProductIds: string[] = [];
+    if (kw) {
+      const skuMatches = await prisma.product.findMany({
+        where: { sku: { contains: kw, mode: 'insensitive' } },
+        select: { id: true },
+      });
+      skuMatchProductIds = skuMatches.map((p) => String(p.id));
+    }
+
     // ── ③ 用显式 AND 构建 where，彻底隔离状态过滤与关键词 OR 条件 ──
     //
-    // 旧写法：Object.assign(where, { OR: [...] })
-    //   → 产生 { status: X, OR: [...] }
-    //   → Prisma 根级 OR 与根级 status 同级，OR 条件独立运算，
-    //     可能返回不属于 status=X 的记录（BUG！）
-    //
-    // 新写法：显式 AND 数组，每个条件都是独立子句，互不影响
-    //   → 产生 { AND: [{ status: X }, { OR: [...] }] }
-    //   → 严格等价于 SQL: WHERE status=X AND (cond1 OR cond2 OR cond3)
+    // 产生结构：{ AND: [{ status: X }, { OR: [cond1, cond2, ...] }] }
+    // 等价 SQL：WHERE status=X AND (cond1 OR cond2 OR ...)
     const andClauses: any[] = [];
 
     if (statusFilter !== undefined) {
@@ -339,13 +350,26 @@ router.get('/', async (req: Request, res: Response) => {
     }
 
     if (kw) {
-      andClauses.push({
-        OR: [
-          { orderNo:   { contains: kw, mode: 'insensitive' as const } },
-          { items:     { some: { alibabaOrderId: { contains: kw, mode: 'insensitive' as const } } } },
-          { products:  { some: { sku:            { contains: kw, mode: 'insensitive' as const } } } },
-        ],
-      });
+      const kwOrClauses: any[] = [
+        // 主单号精确搜索
+        { orderNo:        { contains: kw, mode: 'insensitive' as const } },
+        // 主单 1688 订单号（新增：覆盖手动绑定/下单的场景）
+        { alibabaOrderId: { contains: kw, mode: 'insensitive' as const } },
+        // 子单 1688 订单号
+        { items: { some: { alibabaOrderId: { contains: kw, mode: 'insensitive' as const } } } },
+        // SKU 路径①：Product.purchaseOrderId FK 正常时，通过 products 关联搜索
+        { products: { some: { sku: { contains: kw, mode: 'insensitive' as const } } } },
+      ];
+
+      // SKU 路径②（兜底）：FK 断裂时，通过 PurchaseOrderItem.productIds JSON 字段搜索
+      // productIds 存储格式为 "[93678]"，contains 子字符串匹配精确 ID 数字
+      for (const pid of skuMatchProductIds) {
+        kwOrClauses.push({
+          items: { some: { productIds: { contains: pid } } },
+        });
+      }
+
+      andClauses.push({ OR: kwOrClauses });
     }
 
     // 无条件时 where = {} → 返回全部（ALL Tab 行为）
