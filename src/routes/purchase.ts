@@ -900,7 +900,23 @@ router.get('/:id/logistics-trace', async (req: Request, res: Response) => {
       return;
     }
 
+    // ── 统一节点格式转换（内部 eventTime/description → 前端 Timeline 所需 time/content） ──
+    const toTimelineNodes = (nodes: Array<{ eventTime: string; description: string; location: string | null }>) =>
+      nodes.map((n) => ({
+        time:        n.eventTime,
+        content:     n.description,
+        location:    n.location ?? null,
+        // 保留原始字段，向后兼容
+        eventTime:   n.eventTime,
+        description: n.description,
+      })).sort((a, b) => {
+        const ta = new Date(a.time).getTime();
+        const tb = new Date(b.time).getTime();
+        return isNaN(ta) || isNaN(tb) ? 0 : tb - ta;
+      });
+
     // ── ① 优先：alibaba.trade.getLogisticsTraceInfo.buyerView ────────
+    //   namespace 必须为 com.alibaba.logistics（已修正，旧写法 com.alibaba.trade → gw.APIUnsupported）
     const traceByOrder = await getLogisticsTraceByOrder(order.alibabaOrderId);
     if (!isAliServiceError(traceByOrder) && traceByOrder.nodes.length > 0) {
       // 顺手把运单号落库（防止下次再请求）
@@ -921,12 +937,21 @@ router.get('/:id/logistics-trace', async (req: Request, res: Response) => {
           logisticsId:          traceByOrder.logisticsId || traceByOrder.logisticsBillNo,
           logisticsBillNo:      traceByOrder.logisticsBillNo,
           logisticsCompanyName: traceByOrder.logisticsCompanyName,
-          nodes:                traceByOrder.nodes,
+          nodes:                toTimelineNodes(traceByOrder.nodes),
           source:               'buyerView',
         },
         message: 'success',
       });
       return;
+    }
+
+    // ── ① 降级处理：getLogisticsTraceInfo 返回 gw.APIUnsupported 表示账号未开通此权限 ──
+    //   不再抛 502，转走 ② 兜底链路
+    if (isAliServiceError(traceByOrder)) {
+      console.warn(
+        `[logistics-trace] getLogisticsTraceInfo.buyerView 失败（${traceByOrder.errorCode}）` +
+        `，降级走 alibaba.logistics.trace.info.get 或 sync-1688 链路`,
+      );
     }
 
     // ── ② 兜底：按已落库运单号 → alibaba.logistics.trace.info.get ───
@@ -937,15 +962,26 @@ router.get('/:id/logistics-trace', async (req: Request, res: Response) => {
     if (!logisticsId) {
       const detail = await syncOrderDetail(order.alibabaOrderId);
       if (isAliServiceError(detail)) {
-        // 三级均失败，返回最后一次错误
+        // 三级均失败；若 gw.APIUnsupported 则友好提示，否则 502
         const errMsg = isAliServiceError(traceByOrder) ? traceByOrder.message : detail.message;
-        res.status(502).json({ code: 502, data: null, message: errMsg });
+        const isUnsupported = (traceByOrder as any)?.errorCode === 'gw.APIUnsupported'
+          || detail.errorCode === 'gw.APIUnsupported';
+        if (isUnsupported) {
+          res.json({
+            code: 200,
+            data: { nodes: [], logisticsCompanyName: '', logisticsBillNo: '', unsupported: true },
+            message: '当前 1688 应用未开通物流轨迹查询权限，请在 1688 开放平台申请开通',
+          });
+        } else {
+          res.status(502).json({ code: 502, data: null, message: errMsg });
+        }
         return;
       }
       const first = detail.logisticsOrders[0] ?? null;
       if (!first?.logisticsId) {
-        res.status(404).json({
-          code: 404, data: null,
+        res.json({
+          code: 200,
+          data: { nodes: [], logisticsCompanyName: companyName, logisticsBillNo: '', noShipment: true },
           message: '该 1688 订单暂无物流运单号（可能尚未发货）',
         });
         return;
@@ -960,16 +996,21 @@ router.get('/:id/logistics-trace', async (req: Request, res: Response) => {
 
     const trace = await getLogisticsTrace(logisticsId);
     if (isAliServiceError(trace)) {
-      res.status(502).json({ code: 502, data: null, message: trace.message });
+      // gw.APIUnsupported → 降级为友好提示
+      if ((trace as any).errorCode === 'gw.APIUnsupported') {
+        res.json({
+          code: 200,
+          data: {
+            nodes: [], logisticsCompanyName: companyName,
+            logisticsBillNo: logisticsId, unsupported: true,
+          },
+          message: '当前 1688 应用未开通物流轨迹查询权限，请在 1688 开放平台申请开通',
+        });
+      } else {
+        res.status(502).json({ code: 502, data: null, message: trace.message });
+      }
       return;
     }
-
-    // 节点统一倒序（最新在前）
-    const sortedNodes = [...trace.nodes].sort((a, b) => {
-      const ta = new Date(a.eventTime).getTime();
-      const tb = new Date(b.eventTime).getTime();
-      return isNaN(ta) || isNaN(tb) ? 0 : tb - ta;
-    });
 
     res.json({
       code: 200,
@@ -977,7 +1018,7 @@ router.get('/:id/logistics-trace', async (req: Request, res: Response) => {
         logisticsId,
         logisticsBillNo:      logisticsId,
         logisticsCompanyName: trace.logisticsCompanyName || companyName,
-        nodes:                sortedNodes,
+        nodes:                toTimelineNodes(trace.nodes),
         source:               'logisticsTrace',
       },
       message: 'success',
