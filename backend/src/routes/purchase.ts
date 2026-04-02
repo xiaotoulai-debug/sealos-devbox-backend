@@ -490,7 +490,7 @@ router.get('/', async (req: Request, res: Response) => {
           chineseName:        prod?.chineseName       ?? null,
           imageUrl:           prod?.imageUrl          ?? null,
           purchasePrice:      prod?.purchasePrice != null ? Number(prod.purchasePrice) : null,
-          purchaseQuantity:   prod?.purchaseQuantity  ?? item.quantity,
+          purchaseQuantity:   item.quantity,            // ★ 绑定子单计划量，不依赖可断裂的 Product FK
           purchaseUrl:        prod?.purchaseUrl       ?? null,
           // ★ 1688 映射字段：前端下单弹窗必需
           externalProductId:  prod?.externalProductId ?? null,  // 1688 offerId
@@ -2282,12 +2282,12 @@ router.delete('/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    // 查主单（含关联产品 + 子单，以及仓库和采购数量，用于扣减在途库存）
+    // 查主单（含关联产品 + 子单，productIds 用于 FK 断裂兜底路径重建产品集合）
     const order = await prisma.purchaseOrder.findUnique({
       where: { id },
       include: {
         products: { select: { id: true, sku: true, purchaseQuantity: true } },
-        items:    { select: { id: true } },
+        items:    { select: { id: true, productIds: true, quantity: true } },
       },
     });
 
@@ -2315,6 +2315,31 @@ router.delete('/:id', async (req: Request, res: Response) => {
     const username = req.user!.username ?? 'unknown';
 
     await prisma.$transaction(async (tx) => {
+      // ── 构建完整产品 ID → 数量映射（兼容 FK 断裂兜底路径）────────────────
+      // 正常路径：order.products 通过 purchaseOrderId FK 直接关联
+      const prodQuantityMap = new Map<number, number>(
+        order.products.map((p) => [p.id, Math.max(1, p.purchaseQuantity ?? 1)]),
+      );
+
+      // 兜底路径：从 items.productIds JSON 中提取可能因 FK 覆盖而断裂的产品 ID
+      const allPidSet = new Set<number>(order.products.map((p) => p.id));
+      for (const item of (order as any).items as Array<{ productIds: string | null; quantity: number }>) {
+        try {
+          const pids: number[] = JSON.parse(item.productIds ?? '[]');
+          for (const pid of pids) allPidSet.add(pid);
+        } catch { /* ignore malformed JSON */ }
+      }
+      const missingPids = [...allPidSet].filter((pid) => !prodQuantityMap.has(pid));
+      if (missingPids.length > 0) {
+        const fallbackProds = await tx.product.findMany({
+          where:  { id: { in: missingPids } },
+          select: { id: true, purchaseQuantity: true },
+        });
+        for (const fp of fallbackProds) {
+          prodQuantityMap.set(fp.id, Math.max(1, fp.purchaseQuantity ?? 1));
+        }
+      }
+
       // ② 释放关联产品：解除采购单绑定，状态退回采购计划（PURCHASING）
       //    purchaseOrderId: null → 产品重新出现在 GET /api/products/purchasing 列表
       if (order.products.length > 0) {
@@ -2325,18 +2350,28 @@ router.delete('/:id', async (req: Request, res: Response) => {
             status:          'PURCHASING',
           },
         });
+      }
 
-        // ★ 扣减在途库存：采购单作废，货物不再在途（防负：用 GREATEST 钳制到 0）
+      // ★ 扣减在途库存：精准 + else 兜底，绝对不依赖 warehouseId 非空
+      //   - 精准路径：order.warehouseId 存在 → 只 UPDATE 目标仓，避免误扣其他仓
+      //   - 兜底路径：warehouseId 为 null（历史脏数据）→ 扫描该产品所有在途 > 0 的仓库记录
+      //   PostgreSQL UPDATE 在事务内对匹配行自动加行级锁，防并发重复扣减
+      for (const [pid, qty] of prodQuantityMap) {
         if (order.warehouseId) {
-          for (const prod of order.products) {
-            const qty = Math.max(1, prod.purchaseQuantity ?? 1);
-            await tx.$executeRaw`
-              UPDATE warehouse_stocks
-              SET    in_transit_quantity = GREATEST(0, in_transit_quantity - ${qty})
-              WHERE  product_id = ${prod.id}
-              AND    warehouse_id = ${order.warehouseId}
-            `;
-          }
+          await tx.$executeRaw`
+            UPDATE warehouse_stocks
+            SET    in_transit_quantity = GREATEST(0, in_transit_quantity - ${qty})
+            WHERE  product_id = ${pid}
+            AND    warehouse_id = ${order.warehouseId}
+          `;
+        } else {
+          // warehouseId 为 null 的历史脏数据：全仓扫描，扣减所有有在途记录的行
+          await tx.$executeRaw`
+            UPDATE warehouse_stocks
+            SET    in_transit_quantity = GREATEST(0, in_transit_quantity - ${qty})
+            WHERE  product_id = ${pid}
+            AND    in_transit_quantity > 0
+          `;
         }
       }
 
