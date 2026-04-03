@@ -186,16 +186,17 @@ export async function readOrders(
   const filters: Record<string, any> = {};
   if (opts.id !== undefined) filters.id = opts.id;
   if (opts.status !== undefined) filters.status = opts.status;
-  if (opts.createdAfter || opts.createdBefore) {
-    filters.created = {};
-    if (opts.createdAfter) {
-      const raw = opts.createdAfter.slice(0, 10);
-      filters.created.from = toEmagDateTime(raw, opts.createdAfter.includes(' ') ? opts.createdAfter.slice(11, 19) : '00:00:00');
-    }
-    if (opts.createdBefore) {
-      const raw = opts.createdBefore.slice(0, 10);
-      filters.created.to = toEmagDateTime(raw, opts.createdBefore.includes(' ') ? opts.createdBefore.slice(11, 19) : '23:59:59');
-    }
+
+  // ★ 参数格式修正（2026-04-03，文档 v4.4.7 §5.4）：
+  //   eMAG 要求 createdAfter/createdBefore 为顶层扁平字段（YYYY-mm-dd HH:ii:ss）。
+  //   原嵌套结构 { created: { from, to } } 会触发 500 "Error processing data"。
+  if (opts.createdAfter) {
+    const raw = opts.createdAfter.slice(0, 10);
+    filters.createdAfter = toEmagDateTime(raw, opts.createdAfter.includes(' ') ? opts.createdAfter.slice(11, 19) : '00:00:00');
+  }
+  if (opts.createdBefore) {
+    const raw = opts.createdBefore.slice(0, 10);
+    filters.createdBefore = toEmagDateTime(raw, opts.createdBefore.includes(' ') ? opts.createdBefore.slice(11, 19) : '23:59:59');
   }
   if (opts.modifiedAfter) {
     filters.modified = { from: opts.modifiedAfter.includes(' ') ? opts.modifiedAfter : `${opts.modifiedAfter} 00:00:00` };
@@ -210,34 +211,41 @@ export async function readOrders(
  * 按全状态分页拉取订单（status 1,2,3,4,5 各查一遍，合并去重）
  * 用于平台订单同步，确保不漏单
  *
- * ★ 严格错误策略（防漏单铁律）：
- *   - 任何分页请求（API isError 或网络异常）都会立即抛出异常
- *   - 绝不允许在部分拉取失败的情况下返回 200 假象
- *   - 调用方必须用 try/catch 处理，并向上层正确传递错误
+ * ★ 双轮扫描设计（文档 v4.4.7 §5.4，2026-04-03 修正参数格式后启用）：
+ *   第一轮（modified 扫描）：严格模式 —— 任何分页失败立即抛出异常，不允许静默吞错。
+ *   第二轮（created 扫描）： 宽松模式 —— 单个状态网络超时/报错仅跳过本状态，
+ *     不会抛出，也不会中断其他状态或其他店铺的同步（防 HU 超时阻断 RO/BG）。
+ *   两轮结果通过内存 Map(orderId) 去重，避免同一订单重复 upsert。
  *
- * ★ 注意：eMAG order/read API 经实测仅支持 modified.from 时间过滤，
- *   不支持 created.from（返回 500 "Error processing data"）。
- *   请勿在 opts 中传入 createdAfter，该参数已从签名中移除。
+ * ★ 异常隔离架构：
+ *   - 调用方（syncAllPlatformOrders）使用 Promise.allSettled，每店独立隔离
+ *   - modified 轮失败 → 整个店铺同步中止（防漏单铁律）
+ *   - created 轮单个状态失败 → 仅跳过该状态，其他状态和其他店铺正常继续
  */
 export async function readOrdersForAllStatuses(
   creds: EmagCredentials,
-  opts: Omit<ReadOrdersOptions, 'status'> & { statuses?: number[] } = {},
+  opts: Omit<ReadOrdersOptions, 'status'> & { statuses?: number[]; createdAfter?: string } = {},
 ): Promise<EmagApiResponse<EmagOrder[]>> {
-  const statuses = opts.statuses ?? [...ALL_ORDER_STATUSES];
-  const allOrders = new Map<number, EmagOrder>();
+  const statuses     = opts.statuses ?? [...ALL_ORDER_STATUSES];
+  const allOrders    = new Map<number, EmagOrder>();
   const itemsPerPage = opts.itemsPerPage ?? 100;
 
+  // ── 第一轮：modified 扫描（严格模式，防漏单铁律）─────────────────────────
   for (const status of statuses) {
     let page = 1;
     while (true) {
-      const res = await readOrders(creds, { ...opts, status, currentPage: page, itemsPerPage });
+      const res = await readOrders(creds, {
+        ...opts,
+        createdAfter: undefined,   // 第一轮只用 modifiedAfter，显式清空 createdAfter
+        status,
+        currentPage:  page,
+        itemsPerPage,
+      });
 
       // ★ 严禁静默吞错：API 返回 isError 时立即抛出，让同步任务感知并上报
       if (res.isError) {
         const errMsg = res.messages?.join('; ') ?? 'eMAG API 返回错误（isError=true）';
-        throw new Error(
-          `eMAG 订单同步失败（status=${status} page=${page}）：${errMsg}`,
-        );
+        throw new Error(`eMAG 订单同步失败（modified scan, status=${status} page=${page}）：${errMsg}`);
       }
 
       const batch = Array.isArray(res.results) ? res.results : [];
@@ -245,12 +253,59 @@ export async function readOrdersForAllStatuses(
         if (o?.id != null) allOrders.set(o.id, o);
       }
 
-      // 本页条数 < 每页上限 → 已是最后一页
       if (batch.length < itemsPerPage) break;
       page++;
-      // 安全熔断：eMAG 单次查询最大 100 页
       if (page > 100) break;
-      await new Promise((r) => setTimeout(r, 100)); // 限速：避免过快触发 429
+      await new Promise((r) => setTimeout(r, 100));
+    }
+  }
+
+  // ── 第二轮：created 扫描（宽松模式，网络抖动不中断整体）──────────────────
+  // 仅当调用方显式传入 createdAfter 时执行；用于补录"从未被 modified 命中"的订单
+  if (opts.createdAfter) {
+    for (const status of statuses) {
+      let page = 1;
+      while (true) {
+        let res;
+        try {
+          res = await readOrders(creds, {
+            ...opts,
+            modifiedAfter: undefined,  // 第二轮只用 createdAfter，显式清空 modifiedAfter
+            status,
+            currentPage:  page,
+            itemsPerPage,
+          });
+        } catch (networkErr) {
+          // 宽松模式：网络异常跳过本状态，不抛出
+          console.warn(
+            `[readOrdersForAllStatuses] created 轮网络异常` +
+            ` shop=${creds.region} status=${status} page=${page}:` +
+            ` ${networkErr instanceof Error ? networkErr.message : networkErr}，跳过本状态`,
+          );
+          break;
+        }
+
+        if (res.isError) {
+          // 宽松模式：API 错误跳过本状态，记录警告
+          console.warn(
+            `[readOrdersForAllStatuses] created 轮 API 错误` +
+            ` shop=${creds.region} status=${status} page=${page}:` +
+            ` ${res.messages?.join('; ') ?? 'isError=true'}，跳过本状态`,
+          );
+          break;
+        }
+
+        const batch = Array.isArray(res.results) ? res.results : [];
+        for (const o of batch) {
+          // 去重：modified 轮已抓取的订单 id 不覆盖（保留 modified 轮的最新数据）
+          if (o?.id != null && !allOrders.has(o.id)) allOrders.set(o.id, o);
+        }
+
+        if (batch.length < itemsPerPage) break;
+        page++;
+        if (page > 100) break;
+        await new Promise((r) => setTimeout(r, 100));
+      }
     }
   }
 
