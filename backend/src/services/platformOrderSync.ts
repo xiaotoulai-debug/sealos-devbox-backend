@@ -1,12 +1,13 @@
 /**
  * 平台订单全量同步 — 循环分页拉取 eMAG 订单并写入 PlatformOrder 表
- * 全状态抓取: status 1,2,3,4,5；24h 回溯窗口防漏单；本地状态以 eMAG 为准覆盖
+ * 全状态抓取: status 1,2,3,4,5；双轮扫描（modified + created）彻底防漏单
  * eMAG 限制: 单次查询日期范围不超过 31 天 [cite: dashboardStats]
  */
 import { prisma } from '../lib/prisma';
 import { getEmagCredentials } from './emagClient';
 import { readOrdersForAllStatuses, mapOrderForDisplay } from './emagOrder';
 import type { EmagOrder } from './emagOrder';
+import { formatInTimeZone } from 'date-fns-tz';
 
 /**
  * 将 eMAG 返回的罗马尼亚本地时间字符串转为 UTC Date 对象
@@ -56,11 +57,24 @@ function toDateStr(d: Date): string {
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
+/** @deprecated 使用本地时间（UTC 服务器上等同 UTC），发给 eMAG 会产生 2-3h 时区偏差，已被 toRomanianTimeStr 替代 */
 function toDateTimeStr(d: Date): string {
   const h = String(d.getHours()).padStart(2, '0');
   const m = String(d.getMinutes()).padStart(2, '0');
   const s = String(d.getSeconds()).padStart(2, '0');
   return `${toDateStr(d)} ${h}:${m}:${s}`;
+}
+
+/**
+ * 将 UTC Date 转为罗马尼亚本地时间字符串（eMAG API 过滤参数专用）
+ *
+ * 使用 date-fns-tz formatInTimeZone + IANA tz 'Europe/Bucharest'，
+ * 自动处理 EET(UTC+2) / EEST(UTC+3) 夏令冬令切换，无需手写 DST 逻辑。
+ * 替代原有 toDateTimeStr（在 UTC 服务器上产生 2-3h 偏差的根因）。
+ */
+const RO_TZ = 'Europe/Bucharest';
+function toRomanianTimeStr(utcDate: Date): string {
+  return formatInTimeZone(utcDate, RO_TZ, 'yyyy-MM-dd HH:mm:ss');
 }
 
 /** 将日期范围拆分为不超过 31 天的批次 */
@@ -187,16 +201,22 @@ export async function syncPlatformOrdersForShop(
   );
 
   const allOrders: EmagOrder[] = [];
-  const modifiedAfter = toDateTimeStr(start);
 
-  // ★ readOrdersForAllStatuses 遇到任何分页失败会抛出明确错误（防漏单铁律）
-  //   此处用 try/catch 将错误写入 result.errors 并立即返回，
-  //   绝不允许用部分数据假装同步成功
+  // ★ 嫌疑 A + B 根治：
+  //   1. toRomanianTimeStr 修复时区偏差（原 toDateTimeStr 在 UTC 服务器发给 eMAG 有 2-3h 偏移）
+  //   2. 同时传入 modifiedAfter + createdAfter，双轮扫描确保"新建但未修改"的订单不再漏单
+  const modifiedAfter = toRomanianTimeStr(start);
+  const createdAfter  = toRomanianTimeStr(start);
+
+  // ★ readOrdersForAllStatuses 主轮（modified）失败会抛出明确错误（防漏单铁律）
+  //   created 轮失败仅打印警告，不中断主流程（已在 readOrdersForAllStatuses 内部处理）
+  //   此处 try/catch 兜住主轮失败，写入 result.errors 并立即返回
   let readRes: Awaited<ReturnType<typeof readOrdersForAllStatuses>>;
   try {
     readRes = await readOrdersForAllStatuses(creds, {
       itemsPerPage: ITEMS_PER_PAGE,
       modifiedAfter,
+      createdAfter,
     });
   } catch (fetchErr: any) {
     const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
