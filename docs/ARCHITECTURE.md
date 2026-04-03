@@ -307,6 +307,33 @@ graph TD
 
 **防回归机制**：`salesStats.ts` 诊断日志仅输出当前 shopId 下销量最高的 Top3 SKU（动态取值），严禁出现任何硬编码 SKU 或 region 字符串。
 
+### 4.6 双轮防漏单扫描机制（2026-04-03 启用）
+
+**问题根因**：eMAG 订单在创建后如果买家不操作（状态不变化），`modified` 字段保持为 null，仅靠 `modifiedAfter` 无法命中此类订单，导致漏单。
+
+**修复方案**：`readOrdersForAllStatuses` 实现双轮扫描：
+
+| 轮次 | 参数 | 模式 | 策略 |
+|------|------|------|------|
+| 第一轮 | `modifiedAfter` | 严格 | 任何分页失败立即抛出，防漏单铁律 |
+| 第二轮 | `createdAfter` | 宽松 | 单状态失败仅跳过本状态，不中断整体同步 |
+
+**参数格式铁律**（文档 v4.4.7 §5.4）：
+- `createdAfter` / `createdBefore` 必须以**顶层扁平字段**传入，格式 `YYYY-mm-dd HH:ii:ss`
+- 历史错误：嵌套 `{ created: { from: "..." } }` 会触发 eMAG API `500 "Error processing data"`
+- `modifiedAfter` 使用嵌套格式 `{ modified: { from: "..." } }`（两者 API 风格不统一）
+
+**时区处理**：所有时间参数通过 `toRomanianTimeStr(utcDate)` 转换（`date-fns-tz` + IANA `Europe/Bucharest`），自动处理 EET/EEST 夏令冬令切换，避免 2-3h 偏差。
+
+**异常隔离架构**：
+- `syncAllPlatformOrders` 使用 `Promise.allSettled`，每店独立隔离，HU 超时不阻断 RO/BG
+- created 轮单状态异常仅 `console.warn` 跳过，不向上 throw
+- modified 轮失败则整个店铺同步中止并记录到 `result.errors`
+
+**运维补单工具**：
+- `scripts/backfill-platform-orders.ts`：7 天串行补单脚本，`createdAfter` 过滤，幂等 upsert
+- `scripts/diagnose-orders-dryrun.ts`：只读诊断脚本，按日期统计 API 返回量 vs DB 入库量
+
 ---
 
 ## 5. 1688 采购计划规格解析（万邦 API）

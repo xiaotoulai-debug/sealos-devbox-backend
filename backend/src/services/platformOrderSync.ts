@@ -1,6 +1,11 @@
 /**
  * 平台订单全量同步 — 循环分页拉取 eMAG 订单并写入 PlatformOrder 表
  * 全状态抓取: status 1,2,3,4,5；双轮扫描（modified + created）彻底防漏单
+ *
+ * 双轮扫描说明（文档 v4.4.7 §5.4，2026-04-03 参数格式修正后启用）：
+ *   - modified 轮（严格模式）：覆盖所有"状态/内容有过变更"的订单
+ *   - created  轮（宽松模式）：补录"创建后从未被修改"的纯新订单，网络抖动不阻断整体
+ *   - 两轮结果内存 Map 去重，无重复 upsert
  * eMAG 限制: 单次查询日期范围不超过 31 天 [cite: dashboardStats]
  */
 import { prisma } from '../lib/prisma';
@@ -202,15 +207,15 @@ export async function syncPlatformOrdersForShop(
 
   const allOrders: EmagOrder[] = [];
 
-  // ★ 嫌疑 B 修复：toRomanianTimeStr 将 UTC 时间精确转为罗马尼亚本地时间字符串
-  //   替代原 toDateTimeStr（在 UTC 服务器上输出 UTC 时间发给 eMAG，产生 2-3h 偏差）
-  //   使用 date-fns-tz + IANA 'Europe/Bucharest' 自动处理 EET/EEST 夏令冬令切换
-  //
-  // ★ 注意：eMAG order/read API 经实测不支持 created.from 参数（返回 500），
-  //   仅使用 modified.from 单轮拉取，保持原有防漏单铁律不变。
+  // ★ 双轮防漏单扫描（2026-04-03 启用，文档 v4.4.7 §5.4 参数格式修正后解锁）：
+  //   - modifiedAfter：覆盖"状态变更过"的订单（增量同步主力）
+  //   - createdAfter：覆盖"创建后从未被修改"的订单（如新下单但买家未操作）
+  //   两参数均使用 toRomanianTimeStr 将 UTC 转为罗马尼亚本地时间，避免 2-3h DST 偏差
+  //   created 轮采用宽松模式：单个状态网络超时仅跳过本状态，不中断整体同步
   const modifiedAfter = toRomanianTimeStr(start);
+  const createdAfter  = toRomanianTimeStr(start);
 
-  // ★ readOrdersForAllStatuses 遇到任何分页失败会抛出明确错误（防漏单铁律）
+  // ★ readOrdersForAllStatuses 的 modified 轮遇到任何分页失败会抛出（防漏单铁律）
   //   此处用 try/catch 将错误写入 result.errors 并立即返回，
   //   绝不允许用部分数据假装同步成功
   let readRes: Awaited<ReturnType<typeof readOrdersForAllStatuses>>;
@@ -218,6 +223,7 @@ export async function syncPlatformOrdersForShop(
     readRes = await readOrdersForAllStatuses(creds, {
       itemsPerPage: ITEMS_PER_PAGE,
       modifiedAfter,
+      createdAfter,  // ★ 双轮扫描：created 轮宽松模式，网络抖动不阻断 modified 轮结果
     });
   } catch (fetchErr: any) {
     const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);

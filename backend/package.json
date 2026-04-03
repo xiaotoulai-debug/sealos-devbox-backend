@@ -26,7 +26,8 @@
     "ops:calibrate-transit": "tsx scripts/calibrate-in-transit.ts",
     "ops:calibrate-transit:fix": "tsx scripts/calibrate-in-transit.ts --fix",
     "ops:backfill-orders": "tsx scripts/backfill-platform-orders.ts",
-    "ops:backfill-orders:3d": "tsx scripts/backfill-platform-orders.ts --days=3"
+    "ops:backfill-orders:3d": "tsx scripts/backfill-platform-orders.ts --days=3",
+    "ops:diagnose-orders": "tsx scripts/diagnose-orders-dryrun.ts"
   },
   "dependencies": {
     "@prisma/client": "^5.22.0",
