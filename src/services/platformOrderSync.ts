@@ -202,21 +202,22 @@ export async function syncPlatformOrdersForShop(
 
   const allOrders: EmagOrder[] = [];
 
-  // ★ 嫌疑 A + B 根治：
-  //   1. toRomanianTimeStr 修复时区偏差（原 toDateTimeStr 在 UTC 服务器发给 eMAG 有 2-3h 偏移）
-  //   2. 同时传入 modifiedAfter + createdAfter，双轮扫描确保"新建但未修改"的订单不再漏单
+  // ★ 嫌疑 B 修复：toRomanianTimeStr 将 UTC 时间精确转为罗马尼亚本地时间字符串
+  //   替代原 toDateTimeStr（在 UTC 服务器上输出 UTC 时间发给 eMAG，产生 2-3h 偏差）
+  //   使用 date-fns-tz + IANA 'Europe/Bucharest' 自动处理 EET/EEST 夏令冬令切换
+  //
+  // ★ 注意：eMAG order/read API 经实测不支持 created.from 参数（返回 500），
+  //   仅使用 modified.from 单轮拉取，保持原有防漏单铁律不变。
   const modifiedAfter = toRomanianTimeStr(start);
-  const createdAfter  = toRomanianTimeStr(start);
 
-  // ★ readOrdersForAllStatuses 主轮（modified）失败会抛出明确错误（防漏单铁律）
-  //   created 轮失败仅打印警告，不中断主流程（已在 readOrdersForAllStatuses 内部处理）
-  //   此处 try/catch 兜住主轮失败，写入 result.errors 并立即返回
+  // ★ readOrdersForAllStatuses 遇到任何分页失败会抛出明确错误（防漏单铁律）
+  //   此处用 try/catch 将错误写入 result.errors 并立即返回，
+  //   绝不允许用部分数据假装同步成功
   let readRes: Awaited<ReturnType<typeof readOrdersForAllStatuses>>;
   try {
     readRes = await readOrdersForAllStatuses(creds, {
       itemsPerPage: ITEMS_PER_PAGE,
       modifiedAfter,
-      createdAfter,
     });
   } catch (fetchErr: any) {
     const errMsg = fetchErr instanceof Error ? fetchErr.message : String(fetchErr);
