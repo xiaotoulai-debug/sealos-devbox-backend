@@ -49,6 +49,25 @@ function cleanStr(val: string | undefined | null): string | null {
   return val.trim().replace(/^\n+|\n+$/g, '').trim() || null;
 }
 
+/** 从 RawItem 提取"只在更新时写入"的可变字段（不含 status / pnk） */
+function buildUpdateData(item: RawItem, pnk: string) {
+  return {
+    title:       item['产品标题']?.trim() || `Product ${pnk}`,
+    imageUrl:    item['产品图片']?.trim()  || null,
+    productUrl:  item['产品链接']?.trim()  || null,
+    price:       parseDecimal(item['前端价格']),
+    rating:      parseRating(item['评论分数']),
+    reviewCount: parseInt10(item['评价数量']),
+    categoryL1:  cleanStr(item['一级类']),
+    categoryL2:  cleanStr(item['二级类']),
+    categoryL3:  cleanStr(item['三级类']),
+    categoryL4:  cleanStr(item['四级类']),
+    category:    cleanStr(item['三级类']),  // 当前业务约定：category 取三级类
+    brand:       cleanStr(item['品牌']),
+    linkTag:     cleanStr(item['链接打标']),
+  };
+}
+
 export async function importPublicSeaFromDisk(): Promise<{
   totalFiles: number;
   totalRecords: number;
@@ -80,7 +99,10 @@ export async function importPublicSeaFromDisk(): Promise<{
     try {
       const raw = fs.readFileSync(filePath, 'utf8');
       items = JSON.parse(raw);
-      if (!Array.isArray(items)) { console.error(`  非数组格式，跳过`); continue; }
+      if (!Array.isArray(items)) {
+        console.error(`  非数组格式，跳过`);
+        continue;
+      }
     } catch (e) {
       console.error(`  解析 JSON 失败:`, e);
       errors++;
@@ -93,94 +115,60 @@ export async function importPublicSeaFromDisk(): Promise<{
     const BATCH_SIZE = 100;
     for (let i = 0; i < items.length; i += BATCH_SIZE) {
       const batch = items.slice(i, i + BATCH_SIZE);
+
       const ops = batch.map((item) => {
         const pnk = item['PNK码']?.trim();
         if (!pnk) return null;
 
-        const price = parseDecimal(item['前端价格']);
-        const rating = parseRating(item['评论分数']);
-        const reviewCount = parseInt10(item['评价数量']);
-        const linkTag = cleanStr(item['链接打标']);
-        const brand = cleanStr(item['品牌']);
+        const updateData = buildUpdateData(item, pnk);
 
-        const data = {
-          title:      item['产品标题']?.trim() ?? `Product ${pnk}`,
-          imageUrl:   item['产品图片']?.trim() || null,
-          productUrl: item['产品链接']?.trim() || null,
-          price:      price,
-          rating:     rating,
-          reviewCount: reviewCount,
-          categoryL1: cleanStr(item['一级类']),
-          categoryL2: cleanStr(item['二级类']),
-          categoryL3: cleanStr(item['三级类']),
-          categoryL4: cleanStr(item['四级类']),
-          category:   cleanStr(item['三级类']),
-          brand:      brand,
-          linkTag:    linkTag,
-          status:     'PENDING' as const,
-        };
-
+        // ★ 业务铁律：update 块绝对不含 status 字段
+        //   - create：新产品默认进公海（status = PENDING）
+        //   - update：已有产品只刷新价格/评分等可变字段，
+        //             status/ownerId/collectedAt 等业务状态保持不变，
+        //             防止 SELECTED/PURCHASING/ORDERED 产品被打回公海
         return prisma.product.upsert({
-          where: { pnk },
-          create: { pnk, ...data },
-          update: data,
+          where:  { pnk },
+          create: { pnk, ...updateData, status: 'PENDING' },
+          update: updateData,
         });
       }).filter(Boolean);
+
+      if (ops.length === 0) {
+        skipped += batch.length;
+        continue;
+      }
 
       try {
         const results = await prisma.$transaction(ops as any[]);
         for (const r of results) {
-          if ((r as any).createdAt?.getTime() === (r as any).updatedAt?.getTime()) {
+          const rec = r as { createdAt: Date; updatedAt: Date };
+          // createdAt ≈ updatedAt（误差 < 100ms）说明是本次新增
+          if (Math.abs(rec.createdAt.getTime() - rec.updatedAt.getTime()) < 100) {
             inserted++;
           } else {
             updated++;
           }
         }
-      } catch (err) {
-        console.error(`  批次 ${i}-${i + BATCH_SIZE} 事务失败, 逐条重试...`);
+      } catch (batchErr) {
+        console.error(`  ⚠️  批次 [${i}~${i + batch.length - 1}] 事务失败，逐条回退重试...`);
+
         for (const item of batch) {
           const pnk = item['PNK码']?.trim();
           if (!pnk) { skipped++; continue; }
+
           try {
-            const price = parseDecimal(item['前端价格']);
-            const rating = parseRating(item['评论分数']);
-            const reviewCount = parseInt10(item['评价数量']);
-            await prisma.product.upsert({
-              where: { pnk },
-              create: {
-                pnk,
-                title:      item['产品标题']?.trim() ?? `Product ${pnk}`,
-                imageUrl:   item['产品图片']?.trim() || null,
-                productUrl: item['产品链接']?.trim() || null,
-                price,
-                rating,
-                reviewCount,
-                categoryL1: cleanStr(item['一级类']),
-                categoryL2: cleanStr(item['二级类']),
-                categoryL3: cleanStr(item['三级类']),
-                categoryL4: cleanStr(item['四级类']),
-                category:   cleanStr(item['三级类']),
-                brand:      cleanStr(item['品牌']),
-                linkTag:    cleanStr(item['链接打标']),
-                status:     'PENDING',
-              },
-              update: {
-                title:      item['产品标题']?.trim() ?? `Product ${pnk}`,
-                imageUrl:   item['产品图片']?.trim() || null,
-                productUrl: item['产品链接']?.trim() || null,
-                price,
-                rating,
-                reviewCount,
-                categoryL1: cleanStr(item['一级类']),
-                categoryL2: cleanStr(item['二级类']),
-                categoryL3: cleanStr(item['三级类']),
-                categoryL4: cleanStr(item['四级类']),
-                category:   cleanStr(item['三级类']),
-                brand:      cleanStr(item['品牌']),
-                linkTag:    cleanStr(item['链接打标']),
-              },
+            const updateData = buildUpdateData(item, pnk);
+            const r = await prisma.product.upsert({
+              where:  { pnk },
+              create: { pnk, ...updateData, status: 'PENDING' },
+              update: updateData,
             });
-            inserted++;
+            if (Math.abs(r.createdAt.getTime() - r.updatedAt.getTime()) < 100) {
+              inserted++;
+            } else {
+              updated++;
+            }
           } catch {
             errors++;
           }
@@ -193,7 +181,10 @@ export async function importPublicSeaFromDisk(): Promise<{
     }
   }
 
-  console.log(`[importPublicSea] 完成! 文件=${files.length}, 总记录=${totalRecords}, 新增=${inserted}, 更新=${updated}, 跳过=${skipped}, 错误=${errors}`);
+  console.log(
+    `[importPublicSea] 完成！文件=${files.length}, 总记录=${totalRecords}, ` +
+    `新增=${inserted}, 更新=${updated}, 跳过=${skipped}, 错误=${errors}`,
+  );
 
   return { totalFiles: files.length, totalRecords, inserted, updated, skipped, errors };
 }
