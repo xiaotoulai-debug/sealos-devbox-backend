@@ -27,9 +27,13 @@
     "ops:calibrate-transit:fix": "tsx scripts/calibrate-in-transit.ts --fix",
     "ops:backfill-orders": "tsx scripts/backfill-platform-orders.ts",
     "ops:backfill-orders:3d": "tsx scripts/backfill-platform-orders.ts --days=3",
-    "ops:diagnose-orders": "tsx scripts/diagnose-orders-dryrun.ts"
+    "ops:diagnose-orders": "tsx scripts/diagnose-orders-dryrun.ts",
+    "ops:import-public-sea": "tsx scripts/import-public-sea.ts",
+    "ops:migrate-sea-images": "tsx scripts/backfill-public-sea-images.ts",
+    "ops:migrate-sea-images:log": "tsx scripts/backfill-public-sea-images.ts 2>&1 | tee /tmp/oss-migrate.log"
   },
   "dependencies": {
+    "@aws-sdk/client-s3": "^3.967.0",
     "@prisma/client": "^5.22.0",
     "axios": "^1.13.6",
     "bcryptjs": "^2.4.3",
