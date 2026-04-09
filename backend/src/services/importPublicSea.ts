@@ -1,8 +1,10 @@
 import fs from 'fs';
+import fsPromises from 'fs/promises';
 import path from 'path';
 import { prisma } from '../lib/prisma';
 
-const DATA_DIR = path.resolve(__dirname, '../../prisma/data_uploads/public_sea_raw');
+const DATA_DIR      = path.resolve(__dirname, '../../prisma/data_uploads/public_sea_raw');
+const PROCESSED_DIR = path.resolve(__dirname, '../../prisma/data_uploads/processed');
 
 interface RawItem {
   '产品图片'?: string;
@@ -49,6 +51,42 @@ function cleanStr(val: string | undefined | null): string | null {
   return val.trim().replace(/^\n+|\n+$/g, '').trim() || null;
 }
 
+/** 确保目标目录存在（不存在则自动创建，recursive 模式安全幂等） */
+async function ensureDir(dir: string): Promise<void> {
+  await fsPromises.mkdir(dir, { recursive: true });
+}
+
+/**
+ * 将处理完成的文件移动到 processed/ 目录，文件名追加 Unix 秒时间戳防止同名覆盖。
+ * 示例：Componente PC.json → processed/Componente PC_1744113600.json
+ *
+ * 跨挂载卷兜底（EXDEV）：
+ *   rename() 在源/目标不在同一 inode 设备时会抛 EXDEV，此时降级为 copyFile + unlink。
+ */
+async function archiveFile(srcPath: string, filename: string): Promise<void> {
+  const ts       = Math.floor(Date.now() / 1000);
+  const ext      = path.extname(filename);
+  const stem     = path.basename(filename, ext);
+  const newName  = `${stem}_${ts}${ext}`;
+  const destPath = path.join(PROCESSED_DIR, newName);
+
+  await ensureDir(PROCESSED_DIR);
+
+  try {
+    await fsPromises.rename(srcPath, destPath);
+  } catch (err: any) {
+    if (err.code === 'EXDEV') {
+      // 跨设备/挂载卷：降级为 copy + delete
+      await fsPromises.copyFile(srcPath, destPath);
+      await fsPromises.unlink(srcPath);
+    } else {
+      throw err;
+    }
+  }
+
+  console.log(`  ✅ 已归档: ${filename} → processed/${newName}`);
+}
+
 /** 从 RawItem 提取"只在更新时写入"的可变字段（不含 status / pnk） */
 function buildUpdateData(item: RawItem, pnk: string) {
   return {
@@ -62,7 +100,8 @@ function buildUpdateData(item: RawItem, pnk: string) {
     categoryL2:  cleanStr(item['二级类']),
     categoryL3:  cleanStr(item['三级类']),
     categoryL4:  cleanStr(item['四级类']),
-    category:    cleanStr(item['三级类']),  // 当前业务约定：category 取三级类
+    // 三级优先、二级兜底、一级兜底：确保只有 L1/L2 的产品 category 不为空
+    category:    cleanStr(item['三级类']) || cleanStr(item['二级类']) || cleanStr(item['一级类']) || null,
     brand:       cleanStr(item['品牌']),
     linkTag:     cleanStr(item['链接打标']),
   };
@@ -95,26 +134,35 @@ export async function importPublicSeaFromDisk(): Promise<{
     const filePath = path.join(DATA_DIR, file);
     console.log(`[importPublicSea] 处理文件: ${file}`);
 
+    // ── 阶段 A：解析 JSON ──────────────────────────────────────────
+    // fileParseOk 标记：只有解析成功且全部批次入库完毕后才为 true。
+    // 阶段 C 凭此决定是否归档——解析或入库中途抛出异常执行 continue，
+    // 永远不会到达阶段 C，文件绝对保留在 public_sea_raw/。
     let items: RawItem[];
+    let fileParseOk = false;
+
     try {
       const raw = fs.readFileSync(filePath, 'utf8');
       items = JSON.parse(raw);
       if (!Array.isArray(items)) {
-        console.error(`  非数组格式，跳过`);
+        console.error(`  非数组格式，跳过（文件保留在 public_sea_raw/）`);
+        errors++;
         continue;
       }
+      fileParseOk = true;
     } catch (e) {
-      console.error(`  解析 JSON 失败:`, e);
+      console.error(`  解析 JSON 失败（文件保留在 public_sea_raw/）:`, e);
       errors++;
       continue;
     }
 
-    console.log(`  共 ${items.length} 条记录`);
-    totalRecords += items.length;
+    // ── 阶段 B：批量入库 ────────────────────────────────────────────
+    console.log(`  共 ${items!.length} 条记录`);
+    totalRecords += items!.length;
 
     const BATCH_SIZE = 100;
-    for (let i = 0; i < items.length; i += BATCH_SIZE) {
-      const batch = items.slice(i, i + BATCH_SIZE);
+    for (let i = 0; i < items!.length; i += BATCH_SIZE) {
+      const batch = items!.slice(i, i + BATCH_SIZE);
 
       const ops = batch.map((item) => {
         const pnk = item['PNK码']?.trim();
@@ -175,8 +223,20 @@ export async function importPublicSeaFromDisk(): Promise<{
         }
       }
 
-      if ((i + BATCH_SIZE) % 500 === 0 || i + BATCH_SIZE >= items.length) {
-        console.log(`  进度: ${Math.min(i + BATCH_SIZE, items.length)}/${items.length}`);
+      if ((i + BATCH_SIZE) % 500 === 0 || i + BATCH_SIZE >= items!.length) {
+        console.log(`  进度: ${Math.min(i + BATCH_SIZE, items!.length)}/${items!.length}`);
+      }
+    }
+
+    // ── 阶段 C：归档 ───────────────────────────────────────────────
+    // 事务安全性保证：走到此处意味着阶段 A+B 已完整执行完毕。
+    // 若 A 或 B 中任何 throw 触发了 continue，此块永远不会被执行。
+    if (fileParseOk) {
+      try {
+        await archiveFile(filePath, file);
+      } catch (archiveErr) {
+        // 归档失败不影响已入库的业务数据，仅打印警告，不计入 errors
+        console.warn(`  ⚠️  归档失败（数据已安全入库，请手动移动文件）:`, archiveErr);
       }
     }
   }

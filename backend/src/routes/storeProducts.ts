@@ -13,6 +13,8 @@ import { getEmagCredentials, resolveRegion, REGION_CURRENCY, REGION_DOMAIN } fro
 import { getSalesStatsByShop, getSalesForProduct, logZeroSalesDiagnostic } from '../services/salesStats';
 import { tryAcquireLock, releaseLock } from '../lib/syncStatus';
 import { backfillProductUrls, backfillProductImages, syncStoreProducts, backfillComprehensiveSales } from '../services/storeProductSync';
+import { recalcProfitForShop, recalcProfitForAllShops } from '../services/profitCalculator';
+import { syncExchangeRates } from '../services/exchangeRateSync';
 
 const router = Router();
 router.use(authenticate);
@@ -627,9 +629,6 @@ router.get('/', async (req: Request, res: Response) => {
       const finalImage = emagImage || localImage || null;
 
       const purchaseCost = inv ? Number(inv.purchaseCost ?? 0) : 0;
-      const invWeight = inv?.weight != null ? Number(inv.weight) : null;
-      const estShipping = invWeight != null && invWeight > 0 ? invWeight * SHIPPING_PER_KG : DEFAULT_SHIPPING;
-      const estimatedProfit = salePriceNum - (purchaseCost + estShipping);
 
       const currency = p.currency ?? defaultCurrency;
 
@@ -677,7 +676,20 @@ router.get('/', async (req: Request, res: Response) => {
         local_product_id:    inv?.localProductId    ?? null,
         local_chinese_name:  inv?.localChineseName  ?? null,
         in_transit_quantity: inv?.inTransitQuantity ?? 0,
-        estimated_profit: Number(estimatedProfit.toFixed(2)),
+        estimated_profit:     p.estimatedProfit ? Number(p.estimatedProfit) : null,
+        estimated_profit_cny: p.estimatedProfitCny ? Number(p.estimatedProfitCny) : null,
+        profit_margin_pct:    p.profitMarginPct ?? null,
+        commission_rate:      p.commissionRate ?? null,
+        profit_calculated_at: p.profitCalculatedAt ?? null,
+        // ── camelCase 别名（与架构方案文档 & 前端接口契约严格对齐，向前兼容）──
+        estimatedProfitLocal: p.estimatedProfit ? Number(p.estimatedProfit) : null,
+        estimatedProfitCny:   p.estimatedProfitCny ? Number(p.estimatedProfitCny) : null,
+        profitMarginPct:      p.profitMarginPct ?? null,
+        commissionRate:       p.commissionRate ?? null,
+        profitCalculatedAt:   p.profitCalculatedAt ?? null,
+        // ── 利润明细拆解（前端可直接渲染，无需重算）──
+        profit_breakdown:     p.profitBreakdown ?? null,
+        profitBreakdown:      p.profitBreakdown ?? null,
         comprehensive_sales: compSales,   // 实时计算，与 sales_stats 强耦合，永不陈旧
         sales_stats: salesStatsObj,
         salesStats: salesStatsObj,
@@ -718,6 +730,184 @@ router.get('/', async (req: Request, res: Response) => {
   } catch (err) {
     console.error('[GET /api/store-products]', err);
     res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
+  }
+});
+
+/**
+ * POST /api/store-products/recalc-profit
+ * 手动触发利润重算（可指定 shopId，不传则全店铺）
+ */
+router.post('/recalc-profit', async (req: Request, res: Response) => {
+  try {
+    const rawShopId = req.body?.shopId ?? req.query?.shopId;
+    if (rawShopId != null) {
+      const shopId = Number(rawShopId);
+      if (isNaN(shopId) || shopId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+        return;
+      }
+      const updated = await recalcProfitForShop(shopId);
+      res.json({ code: 200, data: { updated, shopId }, message: `已重算 ${updated} 条产品利润` });
+    } else {
+      const result = await recalcProfitForAllShops();
+      res.json({ code: 200, data: result, message: `全量重算完成：${result.shopCount} 家店铺，${result.totalUpdated} 条` });
+    }
+  } catch (err: any) {
+    console.error('[POST /api/store-products/recalc-profit]', err);
+    res.status(500).json({ code: 500, data: null, message: err?.message ?? '利润重算失败' });
+  }
+});
+
+/**
+ * PATCH /api/store-products/:pnk/cost-correction
+ * 成本纠偏接口：允许用户手动修正 commissionRate（店铺级）/ fbeFee / returnLossRate（产品级），
+ * 并同步触发利润重算，返回最新的 profitBreakdown。
+ *
+ * Body（均可选，至少传一项）：
+ *   commissionRate  number   0~1，佣金率（写入 StoreProduct）
+ *   fbeFee          number   >=0，FBE 费用 CNY（写入 Product）
+ *   returnLossRate  number   0~1，退货损耗率（写入 Product）
+ *   shopId          number   可选；指定则只更新该店 commissionRate；否则全 PNK 店铺同步更新
+ */
+router.patch('/:pnk/cost-correction', async (req: Request, res: Response) => {
+  try {
+    const pnk = String(req.params.pnk ?? '').trim();
+    if (!pnk) {
+      res.status(400).json({ code: 400, data: null, message: 'pnk 不能为空' });
+      return;
+    }
+
+    const body = req.body ?? {};
+    const { commissionRate, fbeFee, returnLossRate } = body;
+    const shopId: number | undefined = body.shopId != null ? Number(body.shopId) : undefined;
+
+    // ── 入参边界校验 ──────────────────────────────────────────────
+    if (commissionRate === undefined && fbeFee === undefined && returnLossRate === undefined) {
+      res.status(400).json({ code: 400, data: null, message: '至少提供一个要修改的字段（commissionRate / fbeFee / returnLossRate）' });
+      return;
+    }
+    if (commissionRate !== undefined) {
+      const v = Number(commissionRate);
+      if (isNaN(v) || v < 0 || v > 1) {
+        res.status(400).json({ code: 400, data: null, message: 'commissionRate 必须在 0~1 之间（如 0.15 表示 15%）' });
+        return;
+      }
+    }
+    if (fbeFee !== undefined) {
+      const v = Number(fbeFee);
+      if (isNaN(v) || v < 0) {
+        res.status(400).json({ code: 400, data: null, message: 'fbeFee 不能为负数' });
+        return;
+      }
+    }
+    if (returnLossRate !== undefined) {
+      const v = Number(returnLossRate);
+      if (isNaN(v) || v < 0 || v > 1) {
+        res.status(400).json({ code: 400, data: null, message: 'returnLossRate 必须在 0~1 之间（如 0.03 表示 3%）' });
+        return;
+      }
+    }
+    if (shopId !== undefined && (isNaN(shopId) || shopId <= 0)) {
+      res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+      return;
+    }
+
+    // ── Step 2：查找关联的 StoreProduct（获取 shopId 列表 + mappedInventorySku）
+    const storeProducts = await prisma.storeProduct.findMany({
+      where: { pnk, ...(shopId ? { shopId } : {}) },
+      select: { id: true, shopId: true, mappedInventorySku: true },
+    });
+
+    if (storeProducts.length === 0) {
+      res.status(404).json({ code: 404, data: null, message: `未找到 PNK "${pnk}" 的平台产品，请先同步产品数据` });
+      return;
+    }
+
+    // ── Step 3a：更新 store_products.commission_rate（店铺级）──────
+    if (commissionRate !== undefined) {
+      await prisma.storeProduct.updateMany({
+        where: { pnk, ...(shopId ? { shopId } : {}) },
+        data: { commissionRate: Number(commissionRate) },
+      });
+    }
+
+    // ── Step 3b：更新 products.fbe_fee / return_loss_rate（产品级）─
+    // 找第一个有 mappedInventorySku 的记录作为 Product 的查找键
+    const effectiveSku = storeProducts.find((sp) => sp.mappedInventorySku)?.mappedInventorySku ?? null;
+    let updatedProduct = false;
+    const warning: string[] = [];
+
+    if (fbeFee !== undefined || returnLossRate !== undefined) {
+      if (effectiveSku) {
+        const productData: Record<string, unknown> = {};
+        if (fbeFee        !== undefined) productData.fbeFee        = Number(fbeFee);
+        if (returnLossRate !== undefined) productData.returnLossRate = Number(returnLossRate);
+        await prisma.product.update({
+          where: { sku: effectiveSku },
+          data: productData,
+        });
+        updatedProduct = true;
+      } else {
+        warning.push('该 PNK 未绑定本地库存 SKU，fbeFee / returnLossRate 未能保存，请先在"平台产品"页绑定库存 SKU');
+      }
+    }
+
+    // ── Step 4：同步触发利润重算（用户主动纠偏，同步等待保证返回最新数据）──
+    const shopIdsToRecalc = [...new Set(storeProducts.map((sp) => sp.shopId))];
+    for (const sid of shopIdsToRecalc) {
+      await recalcProfitForShop(sid);
+    }
+
+    // ── Step 5：读取最新 breakdown 返回给前端 ──────────────────────
+    const refreshed = await prisma.storeProduct.findFirst({
+      where: { pnk, ...(shopId ? { shopId } : {}) },
+      select: {
+        estimatedProfit:    true,
+        estimatedProfitCny: true,
+        profitMarginPct:    true,
+        commissionRate:     true,
+        profitBreakdown:    true,
+        profitCalculatedAt: true,
+      },
+    });
+
+    res.json({
+      code: 200,
+      data: {
+        pnk,
+        shopId:                shopId ?? null,
+        updatedStoreProducts:  storeProducts.length,
+        updatedProduct,
+        profitRecalcTriggered: true,
+        estimatedProfit:       refreshed?.estimatedProfit    ? Number(refreshed.estimatedProfit)    : null,
+        estimatedProfitCny:    refreshed?.estimatedProfitCny ? Number(refreshed.estimatedProfitCny) : null,
+        profitMarginPct:       refreshed?.profitMarginPct    ?? null,
+        commissionRate:        refreshed?.commissionRate      ?? null,
+        profitCalculatedAt:    refreshed?.profitCalculatedAt  ?? null,
+        profitBreakdown:       refreshed?.profitBreakdown     ?? null,
+        warning:               warning.length > 0 ? warning.join('；') : undefined,
+      },
+      message: warning.length > 0
+        ? `成本纠偏完成，利润已重算（注意：${warning[0]}）`
+        : '成本纠偏完成，利润已重算',
+    });
+  } catch (err: any) {
+    console.error('[PATCH /api/store-products/:pnk/cost-correction]', err);
+    res.status(500).json({ code: 500, data: null, message: err?.message ?? '服务器内部错误' });
+  }
+});
+
+/**
+ * POST /api/store-products/sync-exchange-rates
+ * 手动触发汇率同步（测试用，正常由 Cron 每天自动执行）
+ */
+router.post('/sync-exchange-rates', async (_req: Request, res: Response) => {
+  try {
+    const result = await syncExchangeRates();
+    res.json({ code: 200, data: result, message: `汇率同步完成：${result.updated} 条已更新` });
+  } catch (err: any) {
+    console.error('[POST /api/store-products/sync-exchange-rates]', err);
+    res.status(500).json({ code: 500, data: null, message: err?.message ?? '汇率同步失败' });
   }
 });
 

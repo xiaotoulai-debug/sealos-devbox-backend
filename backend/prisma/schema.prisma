@@ -101,6 +101,7 @@ model Product {
   purchaseType      String?        @map("purchase_type")
   purchasePeriod    Int?           @map("purchase_period")
   handlingTime      Int            @default(2) @map("handling_time")
+  returnLossRate    Float?         @default(0) @map("return_loss_rate") // 退货损耗率（小数，0.03 = 3%），null 时视同 0
   vat               Int            @default(19)
   publishStatus     String         @default("UNPUBLISHED") @map("publish_status")
   externalProductId String?        @map("external_product_id")
@@ -276,6 +277,13 @@ model StoreProduct {
   docErrors        String?  @map("doc_errors") // eMAG 驳回原因 (JSON 或文本)
   rejectionReason  String?  @map("rejection_reason") // 驳回原因（便于展示）
   comprehensiveSales Float    @default(0) @map("comprehensive_sales") // 综合日销 = d7/7*0.3 + d14/14*0.3 + d30/30*0.4
+  // ── 利润预计算缓存字段（由 profitCalculator 定时写入，列表接口直读零计算）──
+  commissionRate       Float?     @map("commission_rate")          // eMAG 佣金比例（小数，0.15 = 15%）
+  estimatedProfit      Decimal?   @map("estimated_profit") @db.Decimal(12, 2)      // 预估毛利（站点当地货币）
+  estimatedProfitCny   Decimal?   @map("estimated_profit_cny") @db.Decimal(12, 2)  // 预估毛利（CNY）
+  profitMarginPct      Float?     @map("profit_margin_pct")        // 毛利率 % = profit / salePrice × 100
+  profitCalculatedAt   DateTime?  @map("profit_calculated_at")     // 上次利润计算时间
+  profitBreakdown      Json?      @map("profit_breakdown")          // 利润明细拆解 JSON（各项扣费 + 估算标识）
   syncedAt         DateTime @default(now()) @map("synced_at")
   shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
 
@@ -285,6 +293,19 @@ model StoreProduct {
   @@index([vendorSku])
   @@index([shopId, comprehensiveSales(sort: Desc)])
   @@map("store_products")
+}
+
+/// 汇率缓存表（每日定时拉取，source→target 货币对，upsert 模式保持唯一）
+model ExchangeRate {
+  id        Int      @id @default(autoincrement())
+  source    String   // 源货币代码: CNY, EUR, RON, HUF
+  target    String   // 目标货币代码
+  rate      Decimal  @db.Decimal(18, 8) // 1 source = ? target
+  fetchedAt DateTime @default(now()) @map("fetched_at")
+
+  @@unique([source, target])
+  @@index([source, target])
+  @@map("exchange_rates")
 }
 
 /// 本地库存/SKU 映射表（历史遗留，当前业务"库存 SKU"已迁移至 Product 表管理）

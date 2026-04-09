@@ -666,3 +666,137 @@ RECEIVED（已全部入库）
 | 向后兼容 | `stockActual` 保留原值，前端优先使用新字段 `stockTotal`，逐步迁移 |
 
 *文档版本：基于 backend + prisma/schema.prisma 生成，最后更新：多仓架构重构（Warehouse + WarehouseStock）*
+
+---
+
+## 10. 公海产品池导入管线（Public Sea Import Pipeline）
+
+### Phase 1：JSON 批量入库
+
+- **入口脚本**：`scripts/import-public-sea.ts` → 调用 `src/services/importPublicSeaFromDisk()`
+- **数据目录**：`prisma/data_uploads/public_sea_raw/*.json`（每个文件为一个类目批次）
+- **快捷命令**：`npm run ops:import-public-sea`
+- **Upsert 铁律**：`create` 新记录时 `status = PENDING`；`update` 已有记录时**绝对不写 `status` 字段**，防止已入选/采购产品被打回公海
+- **自动归档机制**（v2，2026-04-08）：每个文件处理完毕后自动移动至 `prisma/data_uploads/processed/`，文件名追加 Unix 秒时间戳防止同名覆盖（如 `Componente PC_1744113600.json`）。下次执行脚本时 `readdirSync` 只读取 `public_sea_raw/` 中的**新文件**，彻底避免对已入库数据的无意义全量 Upsert，实现真正的增量导入。解析或入库失败时文件**绝对保留**在 `public_sea_raw/` 中，跨挂载卷（EXDEV）时自动降级为 `copyFile + unlink`。
+
+#### `category` 字段回退策略（v2，2026-04-08 修复）
+
+> 旧逻辑：`category = cleanStr(三级类)`  
+> 新逻辑：`category = cleanStr(三级类) || cleanStr(二级类) || cleanStr(一级类) || null`
+
+仅有 L1/L2 分类、没有 L3 的产品，`category` 不再为空，改用最深一级有值的类目作为 fallback，确保前端"类目"列正常显示。
+
+### Phase 1.5：category 回退补数（一次性脚本）
+
+- **脚本**：`scripts/patch-category-fallback.ts`
+- **快捷命令**：`npm run ops:patch-category`
+- **修复逻辑**：扫描 `category = null AND (categoryL2 IS NOT NULL OR categoryL1 IS NOT NULL)` 的记录，按三级→二级→一级优先级回填 `category`
+- **已执行状态**：2026-04-08 已成功修复 **1,708 条**，修复后 `category = null` 降至 517 条（1.6%，均为源 JSON 三级全空的无类目产品）
+- **安全机制**：只写 `category` 字段，`finally` 强制 `$disconnect`，不触碰任何业务状态字段
+
+### Phase 2：OSS 图片迁移
+
+- **脚本**：`scripts/backfill-public-sea-images.ts`
+- **快捷命令**：`npm run ops:migrate-sea-images`
+- **机制**：p-limit 并发下载外链图 → 上传至 Sealos OSS（S3 兼容）→ 更新 `products.imageUrl` 为 OSS 公网 URL
+- **依赖环境变量**：`OSS_ENDPOINT`、`OSS_BUCKET`、`OSS_ACCESS_KEY`、`OSS_SECRET_KEY`、`OSS_REGION`、`OSS_PUBLIC_BASE_URL`
+- **容错**：失败记录写 `/tmp/oss-image-errors.jsonl`
+
+### 字段映射总览
+
+| JSON 字段 | DB 字段 | 说明 |
+|-----------|---------|------|
+| `PNK码` | `pnk` | 唯一键，Upsert where 条件 |
+| `产品标题` | `title` | 缺失时 fallback 为 `Product {pnk}` |
+| `前端价格` | `price` | parseDecimal 清洗 |
+| `评论分数` | `rating` | parseRating 清洗 |
+| `评价数量` | `reviewCount` | parseInt10 清洗 |
+| `一级类` | `categoryL1` | cleanStr |
+| `二级类` | `categoryL2` | cleanStr |
+| `三级类` | `categoryL3` | cleanStr |
+| `四级类` | `categoryL4` | cleanStr |
+| `三级类 \|\| 二级类 \|\| 一级类` | `category` | 三级优先回退策略（v2） |
+| `品牌` | `brand` | cleanStr，源为空时 null |
+| `链接打标` | `linkTag` | cleanStr |
+| `产品图片` | `imageUrl` | Phase 2 后替换为 OSS URL |
+| `产品链接` | `productUrl` | cleanStr |
+
+---
+
+## 11. 预估毛利引擎（Profit Estimation Engine）
+
+### 数据模型
+
+| 模型 | 表名 | 说明 |
+|------|------|------|
+| `ExchangeRate` | `exchange_rates` | 汇率缓存：`@@unique([source, target])`，`rate` Decimal(18,8) |
+| `StoreProduct` 新增字段 | `store_products` | `commission_rate`、`estimated_profit`（当地货币）、`estimated_profit_cny`（CNY）、`profit_margin_pct`（%）、`profit_calculated_at`、`profit_breakdown`（JSON 明细） |
+| `Product` 新增字段 | `products` | `return_loss_rate`（Float, default 0.0）退货损耗率 |
+
+### 核心公式（v3，含退货损耗，2026-04-09）
+
+```
+预估毛利(当地) = 售价 - 佣金(售价×佣金率) - FBE费 - 头程(CNY→当地)
+                - 采购成本(CNY→当地) - 退货损耗(采购成本CNY × returnLossRate × CNY→当地)
+预估毛利(CNY) = 预估毛利(当地) × 汇率(当地→CNY)
+头程运费(CNY) = MAX(实重kg, 长×宽×高/6000) × 17
+```
+
+### 数据流与触发时机
+
+| 触发场景 | Cron / 钩子 | 说明 |
+|----------|-------------|------|
+| 汇率每日更新 | `0 0 * * *`（UTC，=北京08:00） | `syncExchangeRates()` → 成功后级联 `recalcProfitForAllShops()` |
+| 产品雷达同步后 | `syncStoreProducts()` 完成 | 按 shopId 增量重算（待挂钩子） |
+| 成本/规格变更后 | `inventory-batch-update` | `recalcProfitBySkus()` 按 SKU 反查重算（待挂钩子） |
+| 手动触发 | `POST /api/store-products/recalc-profit` | 可指定 shopId，不传则全店铺 |
+| 汇率手动同步 | `POST /api/store-products/sync-exchange-rates` | 测试/紧急更新用 |
+
+### 冷启动兜底（v3，2026-04-09 更新）
+
+| 缺失数据 | 策略 |
+|----------|------|
+| 无佣金率 | 三级降级：① `sp.commissionRate`（精确）→ ② `guessCommissionRate()`（字典匹配）→ ③ `DEFAULT_COMMISSION_RATE=0.18`；`profitBreakdown.commissionRateSource` 标记来源，`isEstimatedCommission=true` 标记已估算 |
+| 无 FBE 费 | **`DEFAULT_FBE_CNY = 7` 换算为当地货币兜底**（≈5 RON/1 EUR/2000 HUF），严禁按 0；`isEstimatedFbe=true` 标记已估算 |
+| 无退货损耗率 | `returnLossRate` 默认 0.0（即不扣减），不影响存量计算；前端录入真实值后自动生效 |
+| 无头程数据 | 按 0 计算 |
+| 无采购价 | 跳过，不写利润字段，前端显示 "-" |
+| 无汇率 | 保留上次结果，日志 warn |
+
+### 跨店 SKU 继承（Phase 2 Scheme A，2026-04-09）
+
+同 PNK 产品若本店 `mappedInventorySku` 为 null，自动从全平台其它店铺查找已绑定的同 PNK 记录，继承其 `mappedInventorySku` 获取采购价与尺寸。
+- **实现**：`recalcProfitForShop()` 开始前，对本店无映射 PNK 发起一次全局 `findMany`（`distinct: ['pnk']`），构建 `inheritedSkuMap: Map<pnk, sku>`，零 N+1。
+- **优先级**：本店自有绑定 > 跨店继承 > PNK 直查 > 跳过。
+- **效果**：有利润数据的产品从 590 条提升至 **1524 条**（覆盖率 80%+）。
+
+### 列表接口改造
+
+`GET /api/store-products` 利润字段已从"实时计算"切换为"直读缓存"，零额外查询、零计算开销。
+返回字段（同时提供 snake_case + camelCase 双命名，向前兼容）：
+`estimated_profit` / `estimatedProfitLocal`、`estimated_profit_cny` / `estimatedProfitCny`、`profit_margin_pct` / `profitMarginPct`、`commission_rate` / `commissionRate`、`profit_calculated_at` / `profitCalculatedAt`。
+
+**v3 新增 breakdown 字段**（`profit_breakdown` / `profitBreakdown`）：JSON 对象，前端可直接渲染各项扣费明细及估算标识，无需二次计算。结构示例：
+```json
+{
+  "salePrice": 40.00, "currency": "RON",
+  "commissionRate": 0.18, "commissionRateSource": "dictionary", "isEstimatedCommission": true,
+  "commission": 7.20,
+  "fbe": 4.46, "isEstimatedFbe": true,
+  "headFreightLocal": 0.30, "headFreightCny": 0.47,
+  "purchaseCostLocal": 11.34, "purchaseCostCny": 17.80,
+  "returnLossRate": 0.03, "returnLossLocal": 0.34, "returnLossCny": 0.53,
+  "exchangeRateCnyToLocal": 0.637073, "exchangeRateLocalToCny": 1.56967883,
+  "profitLocal": 16.36, "profitCny": 25.69, "profitMarginPct": 40.90
+}
+```
+
+### 文件清单
+
+| 文件 | 用途 |
+|------|------|
+| `src/services/exchangeRateSync.ts` | 汇率拉取（open.er-api.com）+ DB upsert + `loadExchangeRateMap()` |
+| `src/services/freightCalculator.ts` | `calcHeadFreightCny()` 头程运费工具函数 |
+| `src/services/profitCalculator.ts` | `recalcProfitForShop()` / `recalcProfitForAllShops()` / `recalcProfitBySkus()` |
+| `src/services/syncCron.ts` | 新增 Cron `0 0 * * *` 汇率+利润级联 |
+| `src/routes/storeProducts.ts` | 新增 `POST recalc-profit`、`POST sync-exchange-rates`；列表接口直读缓存 |
