@@ -30,7 +30,11 @@
     "ops:diagnose-orders": "tsx scripts/diagnose-orders-dryrun.ts",
     "ops:import-public-sea": "tsx scripts/import-public-sea.ts",
     "ops:migrate-sea-images": "tsx scripts/backfill-public-sea-images.ts",
-    "ops:migrate-sea-images:log": "tsx scripts/backfill-public-sea-images.ts 2>&1 | tee /tmp/oss-migrate.log"
+    "ops:migrate-sea-images:log": "tsx scripts/backfill-public-sea-images.ts 2>&1 | tee /tmp/oss-migrate.log",
+    "ops:patch-category": "tsx scripts/patch-category-fallback.ts",
+    "ops:init-profit": "tsx scripts/init-profit-engine.ts",
+    "ops:audit-profit": "tsx scripts/audit-profit.ts",
+    "ops:test-commission": "tsx scripts/test-commission-api.ts"
   },
   "dependencies": {
     "@aws-sdk/client-s3": "^3.967.0",

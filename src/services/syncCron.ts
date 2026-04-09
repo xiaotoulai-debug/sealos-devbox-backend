@@ -17,6 +17,8 @@ import { syncInventoryToPlatform } from './inventorySync';
 import { getEmagCredentials } from './emagClient';
 import { shouldDelayNextSync, setDelayMultiplier, getDelayMultiplier } from './emagRateLimit';
 import { syncPurchaseOrderFromAlibaba } from './alibabaService';
+import { syncExchangeRates } from './exchangeRateSync';
+import { recalcProfitForAllShops } from './profitCalculator';
 
 export type SyncType = 'order_sentinel' | 'order_daily_catchup' | 'product_radar' | 'inventory_sync' | 'alibaba_purchase_sync';
 
@@ -312,9 +314,26 @@ export function startSyncCrons(): void {
   cron.schedule('5 * * * *',   () => runInventorySync());           // 每 1 小时（无锁）
   cron.schedule('0 */6 * * *', () => runAlibabaPurchaseSync());     // 每 6 小时（1688 采购同步）
 
+  // 汇率同步 + 利润引擎级联：每天 08:00（北京时间 = UTC+8 = UTC 00:00）
+  cron.schedule('0 0 * * *', async () => {
+    try {
+      console.log('[Cron] 汇率同步开始...');
+      const fxResult = await syncExchangeRates();
+      if (fxResult.updated > 0) {
+        console.log('[Cron] 汇率已更新，级联触发全量利润重算...');
+        await recalcProfitForAllShops();
+      } else {
+        console.log('[Cron] 汇率无变化或拉取失败，跳过利润重算');
+      }
+    } catch (err: any) {
+      console.error('[Cron] 汇率/利润定时任务异常:', err.message ?? err);
+    }
+  });
+
   console.log('[Cron] 订单哨兵: 每 10 分钟（30min 窗口，订单锁）');
   console.log('[Cron] 日级兜底: 每天凌晨 2:00（48h 窗口，订单锁）');
   console.log('[Cron] 产品雷达: 每 2 小时（产品锁，与订单隔离）');
   console.log('[Cron] 库存同步: 每 1 小时');
   console.log('[Cron] 1688采购同步: 每 6 小时（PLACED/IN_TRANSIT 活跃单，串行防限流）');
+  console.log('[Cron] 汇率+利润: 每天 UTC 00:00（北京 08:00，级联重算）');
 }

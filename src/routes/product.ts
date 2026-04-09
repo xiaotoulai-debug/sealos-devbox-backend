@@ -1,8 +1,9 @@
-import { Router, Request, Response } from 'express';
+import express, { Router, Request, Response } from 'express';
 import { prisma } from '../lib/prisma';
 import { authenticate, requireSuperAdmin } from '../middleware/auth';
 import { importPublicSeaFromDisk } from '../services/importPublicSea';
 import { backfillProductUrls } from '../services/storeProductSync';
+import { recalcProfitBySkus } from '../services/profitCalculator';
 
 const router = Router();
 
@@ -1134,7 +1135,11 @@ router.put('/batch-stock-set', async (req: Request, res: Response) => {
 
 // ── PUT /api/products/inventory-batch-update ──────────────────
 // 库存 SKU 批量逐行编辑（中文名、物流规格、采购价等）
+// ★ 利润联动：修改了影响利润的字段（采购价/尺寸/重量）后，异步触发 profitCalculator 重算
 router.put('/inventory-batch-update', async (req: Request, res: Response) => {
+  // 影响利润计算的字段列表（出现任一即触发重算）
+  const PROFIT_RELEVANT_FIELDS = ['purchasePrice', 'length', 'width', 'height', 'actualWeight'];
+
   try {
     const { items } = req.body ?? {};
     if (!Array.isArray(items) || items.length === 0) {
@@ -1143,6 +1148,9 @@ router.put('/inventory-batch-update', async (req: Request, res: Response) => {
     }
     const userId = req.user!.userId;
     let count = 0;
+    // 记录触发了利润相关字段变更的 Product.id 集合
+    const idsForRecalc = new Set<number>();
+
     await prisma.$transaction(async (tx) => {
       for (const item of items) {
         const id = Number(item.id);
@@ -1154,17 +1162,227 @@ router.put('/inventory-batch-update', async (req: Request, res: Response) => {
         if (item.height        !== undefined) data.height       = item.height != null ? Number(item.height) : null;
         if (item.actualWeight  !== undefined) data.actualWeight = item.actualWeight != null ? Number(item.actualWeight) : null;
         if (item.purchasePrice !== undefined) data.purchasePrice = item.purchasePrice != null ? Number(item.purchasePrice) : null;
+        if (item.purchaseUrl   !== undefined) data.purchaseUrl  = typeof item.purchaseUrl === 'string' && item.purchaseUrl.trim() ? item.purchaseUrl.trim() : null;
         if (Object.keys(data).length === 0) continue;
         const result = await tx.product.updateMany({ where: { id, ownerId: userId, sku: { not: null } }, data });
         count += result.count;
+        // 仅当本次确实写入成功 & 含利润相关字段时，才加入重算队列
+        if (result.count > 0 && PROFIT_RELEVANT_FIELDS.some((f) => f in data)) {
+          idsForRecalc.add(id);
+        }
       }
     });
+
     res.json({ code: 200, data: { count }, message: `已更新 ${count} 个产品` });
+
+    // ── 异步利润联动（fire-and-forget，不阻塞响应）─────────────────
+    if (idsForRecalc.size > 0) {
+      setImmediate(async () => {
+        try {
+          const products = await prisma.product.findMany({
+            where: { id: { in: [...idsForRecalc] }, sku: { not: null } },
+            select: { sku: true },
+          });
+          const skus = products.map((p) => p.sku!).filter(Boolean);
+          if (skus.length > 0) {
+            const updated = await recalcProfitBySkus(skus);
+            console.log(`[inventory-batch-update] 利润联动重算完成：${skus.length} 个 SKU → ${updated} 条 StoreProduct 已更新`);
+          }
+        } catch (e: any) {
+          console.error('[inventory-batch-update] 利润联动重算失败:', e?.message ?? e);
+        }
+      });
+    }
   } catch (err) {
     console.error('[PUT /api/products/inventory-batch-update]', err);
     res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
   }
 });
+
+// ── POST /api/products/inventory-bulk-import ──────────────────
+// 大批量库存资料导入（Excel/CSV 解析后提交，SKU 为主键，最多 5000 条）
+//
+// 五段式流水线：
+//   Step 1 入参校验（内存）→ Step 2 去重 → Step 3 存在性预检（1 次 DB IN 查询）
+//   → Step 4 分块写入（chunk=200, $transaction([...]), sleep 50ms）
+//   → Step 5 响应 + 异步利润重算（setImmediate，updated>0 才触发）
+//
+// bodyParser 在本路由局部放大至 5MB，其余接口保持默认 100KB。
+
+const BULK_IMPORT_CHUNK_SIZE   = 200;
+const BULK_IMPORT_CHUNK_DELAY  = 50;    // ms，块间休眠保护连接池
+const BULK_IMPORT_MAX_ITEMS    = 5000;
+const BULK_IMPORT_PROFIT_FIELDS = new Set(['purchasePrice', 'length', 'width', 'height', 'actualWeight']);
+const bulkImportSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
+
+/**
+ * 校验并解析单个非负数字字段。
+ * - 未传键 / null / 空字符串 → value 为 undefined → **不写入** Prisma update（保留库内原值，防覆盖）。
+ * - 禁止 `|| 0` 等兜底，避免把真实采购价抹成 0。
+ */
+function parseNonNegNum(
+  val: unknown,
+  fieldName: string,
+): { ok: true; value: number | undefined } | { ok: false; reason: string } {
+  if (val === undefined || val === null || val === '') return { ok: true, value: undefined };
+  const n = Number(val);
+  if (isNaN(n))  return { ok: false, reason: `${fieldName} 不是有效数字（收到: ${String(val).slice(0, 20)}）` };
+  if (n < 0)     return { ok: false, reason: `${fieldName} 不能为负数` };
+  return { ok: true, value: n };
+}
+
+router.post(
+  '/inventory-bulk-import',
+  express.json({ limit: '5mb' }),   // 局部放大，仅此路由生效，其余路由保持 100KB
+  async (req: Request, res: Response) => {
+    const userId = req.user!.userId;
+    const { items } = req.body ?? {};
+
+    // ── Step 1：基础入参校验（纯内存，O(n)，无 DB 调用）────────────
+    if (!Array.isArray(items) || items.length === 0) {
+      res.status(400).json({ code: 400, data: null, message: '没有需要导入的数据' });
+      return;
+    }
+    if (items.length > BULK_IMPORT_MAX_ITEMS) {
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: `Payload exceeds maximum limit of ${BULK_IMPORT_MAX_ITEMS} items（当前提交了 ${items.length} 条）`,
+      });
+      return;
+    }
+
+    const totalInput = items.length;
+    type ErrorRecord  = { sku: string; reason: string };
+    type CandidateItem = { sku: string; data: Record<string, unknown>; hasProfitField: boolean };
+
+    const rejected:   ErrorRecord[]   = [];
+    const candidates: CandidateItem[] = [];
+
+    for (const item of items) {
+      const sku = String(item.sku ?? '').trim();
+      if (!sku) { rejected.push({ sku: '(空)', reason: 'SKU 不能为空' }); continue; }
+
+      // 逐字段校验，遇错记录并跳过整行
+      const lenR   = parseNonNegNum(item.length,        'length');
+      const widR   = parseNonNegNum(item.width,         'width');
+      const heiR   = parseNonNegNum(item.height,        'height');
+      const wgtR   = parseNonNegNum(item.actualWeight,  'actualWeight');
+      const priceR = parseNonNegNum(item.purchasePrice, 'purchasePrice');
+
+      const firstErr = [lenR, widR, heiR, wgtR, priceR].find((r) => !r.ok);
+      if (firstErr && !firstErr.ok) { rejected.push({ sku, reason: firstErr.reason }); continue; }
+
+      // 仅把「前端显式给出数值」的字段放进 update；缺省键不进入 data → Prisma 忽略 undefined，不覆盖列
+      const data: Record<string, unknown> = {};
+      if (lenR.ok   && lenR.value   !== undefined) data.length        = lenR.value;
+      if (widR.ok   && widR.value   !== undefined) data.width         = widR.value;
+      if (heiR.ok   && heiR.value   !== undefined) data.height        = heiR.value;
+      if (wgtR.ok   && wgtR.value   !== undefined) data.actualWeight  = wgtR.value;
+      if (priceR.ok && priceR.value !== undefined) data.purchasePrice = priceR.value;
+
+      if (item.chineseName !== undefined) {
+        data.chineseName = typeof item.chineseName === 'string' && item.chineseName.trim()
+          ? item.chineseName.trim() : null;
+      }
+      if (item.purchaseUrl !== undefined) {
+        data.purchaseUrl = typeof item.purchaseUrl === 'string' && item.purchaseUrl.trim()
+          ? item.purchaseUrl.trim() : null;
+      }
+
+      if (Object.keys(data).length === 0) continue; // 所有字段均未提供，静默跳过
+
+      candidates.push({
+        sku,
+        data,
+        hasProfitField: Object.keys(data).some((k) => BULK_IMPORT_PROFIT_FIELDS.has(k)),
+      });
+    }
+
+    // ── Step 2：去重（同 SKU 以最后一条为准，模拟 Excel 末行覆盖）──
+    const dedupedMap = new Map<string, CandidateItem>();
+    for (const c of candidates) dedupedMap.set(c.sku, c);
+    const deduped = [...dedupedMap.values()];
+
+    // ── Step 3：存在性预检（单次 IN 查询，O(1) round-trip）──────────
+    const allSkus = deduped.map((c) => c.sku);
+    const existingProducts = await prisma.product.findMany({
+      where: { sku: { in: allSkus }, ownerId: userId },
+      select: { id: true, sku: true },
+    });
+    const skuToId = new Map(existingProducts.map((p) => [p.sku!, p.id]));
+
+    type WriteItem = CandidateItem & { id: number };
+    const toWrite:         WriteItem[] = [];
+    const skippedNotFound: string[]    = [];
+
+    for (const c of deduped) {
+      const id = skuToId.get(c.sku);
+      if (!id) {
+        skippedNotFound.push(c.sku);
+        rejected.push({ sku: c.sku, reason: 'SKU 在库中不存在或无访问权限' });
+      } else {
+        toWrite.push({ ...c, id });
+      }
+    }
+
+    // ── Step 4：分块批量写入（chunk=200, $transaction([...]), sleep 50ms）
+    let updated = 0;
+    const updatedSkus: string[] = [];
+
+    for (let i = 0; i < toWrite.length; i += BULK_IMPORT_CHUNK_SIZE) {
+      const chunk = toWrite.slice(i, i + BULK_IMPORT_CHUNK_SIZE);
+      try {
+        // $transaction([...]) = 非交互式批量事务，单次 BEGIN/COMMIT round-trip
+        await prisma.$transaction(
+          chunk.map((u) => prisma.product.update({ where: { id: u.id }, data: u.data })),
+        );
+        updated += chunk.length;
+        for (const u of chunk) {
+          if (u.hasProfitField) updatedSkus.push(u.sku);
+        }
+      } catch (err: any) {
+        // 单块失败：只记日志和错误集合，不中断后续块，不 throw 500
+        const msg = String(err?.message ?? err).slice(0, 100);
+        console.error(`[inventory-bulk-import] chunk[${i}..${i + chunk.length - 1}] 写入失败: ${msg}`);
+        for (const u of chunk) rejected.push({ sku: u.sku, reason: `DB 写入失败: ${msg}` });
+      }
+      // 块间休眠，保护连接池，防止瞬间打满
+      if (i + BULK_IMPORT_CHUNK_SIZE < toWrite.length) await bulkImportSleep(BULK_IMPORT_CHUNK_DELAY);
+    }
+
+    // ── Step 5：先响应，再异步触发利润重算 ──────────────────────────
+    const skippedNoChange = Math.max(0, deduped.length - toWrite.length - skippedNotFound.length);
+    res.json({
+      code: 200,
+      data: {
+        total:                totalInput,
+        deduped:              deduped.length,
+        updated,
+        skipped_not_found:    skippedNotFound.length,
+        skipped_no_change:    skippedNoChange,
+        rejected:             rejected.length,
+        profit_recalc_queued: updatedSkus.length,
+        errors:               rejected.slice(0, 50),  // 最多返回 50 条详细错误，保护响应体积
+      },
+      message: `批量导入完成：${updated} 条已更新，${rejected.length} 条已跳过`,
+    });
+
+    // ★ 仅 updated > 0 且含利润相关字段变更时触发重算，success=0 时跳过
+    if (updatedSkus.length > 0) {
+      setImmediate(async () => {
+        try {
+          const cnt = await recalcProfitBySkus(updatedSkus);
+          console.log(
+            `[inventory-bulk-import] 利润联动重算完成：${updatedSkus.length} 个 SKU → ${cnt} 条 StoreProduct 已更新`,
+          );
+        } catch (e: any) {
+          console.error('[inventory-bulk-import] 利润联动重算失败:', e?.message ?? e);
+        }
+      });
+    }
+  },
+);
 
 // ── POST /api/products/inventory-create ───────────────────────
 // 手动创建单个库存 SKU 产品
