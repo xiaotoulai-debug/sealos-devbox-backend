@@ -184,8 +184,12 @@ export function normalizeEmagProduct(raw: Record<string, unknown>, region: EmagR
  */
 function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion, options?: NormalizeOptions): NormalizedProduct {
   const pnk = String(raw?.part_number_key ?? raw?.pnk ?? raw?.part_number ?? '').trim();
+  // sku  = eMAG 平台编码（raw.part_number，对应 PNK 层级，非卖家自有 SKU）
   const sku = raw?.part_number != null ? String(raw.part_number).trim() : null;
-  const vendorSku = sku;
+  // vendorSku = 卖家自有 SKU（raw.ext_part_number，文档："Your unique identifier for the product."）
+  // 降级回退：若 ext_part_number 为空（部分旧产品可能缺失此字段），则退回使用 part_number
+  const extPn = raw?.ext_part_number != null ? String(raw.ext_part_number).trim() : null;
+  const vendorSku = (extPn && extPn.length > 0) ? extPn : sku;
 
   const eanRaw = raw?.ean;
 

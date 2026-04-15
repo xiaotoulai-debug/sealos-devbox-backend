@@ -19,6 +19,8 @@ import { normalizeEmagProduct, slugifyProductName } from './emagProductNormalize
 const PAGE_SIZE = 20;               // 从 100 降至 20，减小单次响应体积
 const DELAY_MS  = 1000;             // 从 350ms 增至 1000ms，降低代理连接并发压力
 const PRODUCT_OFFER_TIMEOUT = 180_000; // 产品同步专属超时 3min（不影响订单/其他接口的 60s）
+// ★ Best-effort Delivery：允许单次同步任务中最多连续失败多少页后安全中止
+const MAX_CONSECUTIVE_PAGE_FAILURES = 3;
 const EAN_BATCH_SIZE = 100;
 const EAN_DELAY_MS = 200;
 const CATALOG_BATCH_SIZE = 50; // 第二阶段每批 SKU 数
@@ -47,14 +49,140 @@ export interface SyncResult {
 export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: string): Promise<SyncResult> {
   const result: SyncResult = { shopId: creds.shopId, totalFetched: 0, upserted: 0, errors: [], rejectedCount: 0, rejectedReasons: [], eanImagesRecovered: 0, deepSyncImagesUpdated: 0 };
 
-  const allOffers: any[] = [];
   const seenPnkKey = new Set<string>();
+  const firstFiveRaw: Array<{ pn: string; pnk: string; imageUrl: string }> = [];
+  const PIPELINE_LOG_LIMIT = 20;
+  let pipelineLogCount = 0;
 
   const baseFilters: Record<string, any> = {};
   if (modifiedAfter) baseFilters.modified = { from: modifiedAfter };
 
+  // ─── 逐页 upsert 回调（Best-effort Delivery 核心）───────────────────────────
+  // 每拉一页，立即预取 EAN 图片并 upsert，不等待全量拉取完成。
+  // 网络抖动只影响当前页，已落库页不受影响。
+  const processBatch = async (batch: any[]): Promise<void> => {
+    // 收集本页无图产品的 EAN，预拉取图片（引擎二：documentation/find_by_eans）
+    const eanToImage = new Map<string, string>();
+    const pageEans: string[] = [];
+    for (const o of batch) {
+      const np = normalizeEmagProduct(o as Record<string, unknown>, creds.region, { logOutput: false });
+      if (!np.pnk) continue;
+      if (!np.mainImage && np.ean) {
+        const firstEan = String(np.ean).split(/[,\s]+/)[0]?.trim();
+        if (firstEan) pageEans.push(firstEan);
+      }
+    }
+    const uniquePageEans = [...new Set(pageEans)];
+    if (uniquePageEans.length > 0) {
+      try {
+        for (let i = 0; i < uniquePageEans.length; i += EAN_BATCH_SIZE) {
+          const eanChunk = uniquePageEans.slice(i, i + EAN_BATCH_SIZE);
+          await new Promise((r) => setTimeout(r, EAN_DELAY_MS));
+          const eanRes = await findDocumentationByEans(creds, eanChunk);
+          if (eanRes.isError || !eanRes.results) continue;
+          const items = Array.isArray(eanRes.results) ? eanRes.results : (eanRes.results as any)?.items ?? [];
+          for (const item of items) {
+            const ean = item?.ean ?? item?.EAN ?? item?.ean_code;
+            const img = item?.product_image ?? item?.productImage ?? item?.image ?? item?.main_image;
+            if (ean && typeof img === 'string' && img.trim()) {
+              const eanStr = String(ean).trim();
+              if (!eanToImage.has(eanStr)) eanToImage.set(eanStr, img.trim());
+            }
+          }
+        }
+      } catch (eanErr: any) {
+        console.warn(`[Engine 2 API] EAN 预拉取失败，跳过: ${eanErr?.message ?? eanErr}`);
+      }
+    }
+
+    // 逐条规范化 + upsert
+    for (const o of batch) {
+      try {
+        const np = normalizeEmagProduct(o as Record<string, unknown>, creds.region, {
+          logOutput: pipelineLogCount < PIPELINE_LOG_LIMIT,
+        });
+        if (pipelineLogCount < PIPELINE_LOG_LIMIT) pipelineLogCount++;
+        if (!np.pnk) continue;
+
+        // 引擎一（JSON）+ 引擎二（EAN API）合并
+        const firstEan = np.ean ? String(np.ean).split(/[,\s]+/)[0]?.trim() : null;
+        const eanImage = firstEan ? eanToImage.get(firstEan) ?? null : null;
+        const mainImage: string | null = np.mainImage ?? eanImage;
+        if (eanImage && !np.mainImage) result.eanImagesRecovered!++;
+
+        const skuForLog = np.sku ?? np.vendorSku ?? np.pnk;
+
+        if (firstFiveRaw.length < 5) {
+          firstFiveRaw.push({
+            pn: np.vendorSku ?? np.sku ?? '(空)',
+            pnk: np.pnk,
+            imageUrl: mainImage ?? '(无)',
+          });
+        }
+
+        if (np.isRejected) {
+          result.rejectedCount++;
+          if (np.rejectionReason && !result.rejectedReasons.includes(np.rejectionReason)) {
+            result.rejectedReasons.push(np.rejectionReason);
+          }
+          if (!result.rejectedSample) result.rejectedSample = { pnk: np.pnk, docErrors: np.rejectionReason || '' };
+        }
+
+        console.log(`🚀 [eMAG 同步] PNK=${np.pnk} 准备存入数据库的图片 URL: ${mainImage ?? '(null - 无图片)'}`);
+
+        const data: Record<string, any> = {
+          shopId: creds.shopId,
+          pnk: np.pnk,
+          vendorSku: np.vendorSku ?? undefined,
+          sku: np.sku ?? undefined,
+          ean: np.ean ?? undefined,
+          emagOfferId: np.emagOfferId ?? undefined,
+          name: np.name,
+          salePrice: np.salePrice,
+          currency: np.currency,
+          stock: np.stock,
+          status: np.status,
+          categoryId: np.categoryId,
+          imageUrl: mainImage ?? undefined,
+          mainImage: mainImage ?? undefined,
+          productUrl: np.productUrl ?? undefined,
+          validationStatus: np.validationStatus,
+          docErrors: np.docErrors ?? undefined,
+          rejectionReason: np.rejectionReason,
+        };
+
+        const updateData: Record<string, any> = { ...data };
+        if (mainImage) {
+          updateData.imageUrl = mainImage;
+          updateData.mainImage = mainImage;
+        } else {
+          delete updateData.imageUrl;
+          delete updateData.mainImage;
+        }
+
+        await prisma.storeProduct.upsert({
+          where: { shopId_pnk: { shopId: creds.shopId, pnk: np.pnk } },
+          create: data as Prisma.StoreProductCreateInput,
+          update: updateData as Prisma.StoreProductUpdateInput,
+        });
+
+        if (mainImage) {
+          console.log(`[Global Pipeline] SKU: ${skuForLog} -> Valid Image: ${mainImage}`);
+        }
+        result.upserted++;
+      } catch (e) {
+        const pnk = o?.part_number_key ?? o?.part_number ?? o?.pnk ?? '(unknown)';
+        const errMsg = e instanceof Error ? e.message : String(e);
+        result.errors.push(`${pnk}: ${errMsg}`);
+        console.error(`[storeProductSync] Skip broken item PNK=${pnk}:`, e);
+      }
+    }
+  };
+
+  // ─── 弹性分页拉取（Best-effort Delivery：连续失败 MAX_CONSECUTIVE_PAGE_FAILURES 页后安全中止）
   const fetchPage = async (extraFilters: Record<string, any> = {}) => {
     let page = 1;
+    let consecutiveFailures = 0;
     while (true) {
       const filters: Record<string, any> = {
         currentPage: page,
@@ -64,33 +192,62 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
       };
 
       const pageStart = Date.now();
-      // ★ 传入产品专属超时（180s），不影响全局 DEFAULT_TIMEOUT_MS=60s
-      const res = await readProductOffers(creds, filters, { timeout: PRODUCT_OFFER_TIMEOUT });
-      const pageElapsed = Date.now() - pageStart;
-      console.log(
-        `[Product Sync] shop=${creds.shopId}(${creds.region}) Page ${page} fetched in ${pageElapsed}ms` +
-        ` (itemsPerPage=${PAGE_SIZE}${modifiedAfter ? ` modified_after=${modifiedAfter}` : ''})`,
-      );
+      try {
+        // ★ 传入产品专属超时（180s），不影响全局 DEFAULT_TIMEOUT_MS=60s
+        const res = await readProductOffers(creds, filters, { timeout: PRODUCT_OFFER_TIMEOUT });
+        const pageElapsed = Date.now() - pageStart;
 
-      if (res.isError) {
-        const msgs = res.messages?.join('; ') ?? JSON.stringify(res.errors ?? res).slice(0, 300);
-        const errMsg = `[EMAG API ERROR] Shop: ${creds.region}, BaseURL: ${creds.baseUrl}, product_offer/read 失败: ${msgs}`;
-        console.error(`\n========== ${errMsg} ==========`);
-        throw new Error(errMsg);
-      }
-      const raw = res.results as any;
-      const batch = Array.isArray(raw) ? raw : (raw?.items ?? raw?.results ?? []);
-      if (batch.length === 0) break;
-      for (const o of batch) {
-        const pnkKey = String(o?.part_number_key ?? o?.pnk ?? o?.part_number ?? '').trim();
-        if (o && pnkKey) {
-          if (!seenPnkKey.has(pnkKey)) {
+        if (res.isError) {
+          const msgs = res.messages?.join('; ') ?? JSON.stringify(res.errors ?? res).slice(0, 300);
+          console.error(
+            `[Product Sync] shop=${creds.shopId}(${creds.region}) Page ${page} API error (${pageElapsed}ms): ${msgs}`,
+          );
+          consecutiveFailures++;
+        } else {
+          const raw = res.results as any;
+          const batch = Array.isArray(raw) ? raw : (raw?.items ?? raw?.results ?? []);
+          const newBatch = batch.filter((o: any) => {
+            const pnkKey = String(o?.part_number_key ?? o?.pnk ?? o?.part_number ?? '').trim();
+            if (!o || !pnkKey || seenPnkKey.has(pnkKey)) return false;
             seenPnkKey.add(pnkKey);
-            allOffers.push(o);
+            return true;
+          });
+
+          console.log(
+            `[Product Sync] shop=${creds.shopId}(${creds.region}) Page ${page} ✅ ${newBatch.length} 条 (${pageElapsed}ms)` +
+            `${modifiedAfter ? ` modified_after=${modifiedAfter}` : ''}`,
+          );
+
+          if (newBatch.length > 0) {
+            result.totalFetched += newBatch.length;
+            // ★ 立即 upsert，不等待后续页（Best-effort Delivery）
+            await processBatch(newBatch);
+            console.log(
+              `[Product Sync] shop=${creds.shopId}(${creds.region}) Page ${page} 💾 已入库 (累计 ${result.upserted} 条)`,
+            );
           }
+
+          consecutiveFailures = 0;
+
+          if (batch.length === 0 || newBatch.length === 0) break;
+          if (batch.length < PAGE_SIZE) break;
         }
+      } catch (e: any) {
+        const pageElapsed = Date.now() - pageStart;
+        console.error(
+          `[Product Sync] shop=${creds.shopId}(${creds.region}) Page ${page} ❌ 网络异常 (${pageElapsed}ms): ${e?.message?.slice(0, 120) ?? e}`,
+        );
+        consecutiveFailures++;
       }
-      if (batch.length < PAGE_SIZE) break;
+
+      if (consecutiveFailures >= MAX_CONSECUTIVE_PAGE_FAILURES) {
+        console.warn(
+          `[Product Sync] shop=${creds.shopId}(${creds.region}) ⚠️ 连续 ${MAX_CONSECUTIVE_PAGE_FAILURES} 页失败，` +
+          `安全中止（已入库 ${result.upserted} 条，尽最大努力交付）`,
+        );
+        break;
+      }
+
       page++;
       if (page > 500) break;
       await new Promise((r) => setTimeout(r, DELAY_MS));
@@ -101,145 +258,16 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
   await new Promise((r) => setTimeout(r, DELAY_MS));
   await fetchPage({ validation_status: 8 }); // 强制拉取 validation_status=8 驳回产品
   await new Promise((r) => setTimeout(r, DELAY_MS));
-  if (allOffers.length === 0) {
+  if (result.totalFetched === 0) {
     await fetchPage({ status: 1 });
     await new Promise((r) => setTimeout(r, DELAY_MS));
     await fetchPage({ status: 0 });
   }
-  result.totalFetched = allOffers.length;
 
   console.log(
-    `[storeProductSync] shop=${creds.shopId} ${modifiedAfter ? `增量 modified_after=${modifiedAfter}` : '全量'}，upsert ${allOffers.length} 个产品（强制更新 main_image/price）`,
+    `[storeProductSync] shop=${creds.shopId} ${modifiedAfter ? `增量 modified_after=${modifiedAfter}` : '全量'}，` +
+    `第一阶段完成，已同步 ${result.upserted} 个产品（EAN 补图: ${result.eanImagesRecovered ?? 0}，跨页去重: ${seenPnkKey.size} 个 PNK）`,
   );
-
-  const firstFiveRaw: Array<{ pn: string; pnk: string; imageUrl: string }> = [];
-  const PIPELINE_LOG_LIMIT = 20;
-  let pipelineLogCount = 0;
-
-  // ─── 预拉取 EAN 图片（引擎二：documentation/find_by_eans，跨境 B 店验证有效）───
-  const eanToImage = new Map<string, string>();
-  const needEanOffers: Array<{ o: any; np: ReturnType<typeof normalizeEmagProduct> }> = [];
-  for (const o of allOffers) {
-    const np = normalizeEmagProduct(o as Record<string, unknown>, creds.region, { logOutput: false });
-    if (!np.pnk) continue;
-    if (!np.mainImage && np.ean) {
-      const firstEan = String(np.ean).split(/[,\s]+/)[0]?.trim();
-      if (firstEan) needEanOffers.push({ o, np });
-    }
-  }
-  const uniqueEans = [...new Set(needEanOffers.map(({ np }) => String(np.ean).split(/[,\s]+/)[0]?.trim()).filter(Boolean))];
-  if (uniqueEans.length > 0) {
-    try {
-      for (let i = 0; i < uniqueEans.length; i += EAN_BATCH_SIZE) {
-        const batch = uniqueEans.slice(i, i + EAN_BATCH_SIZE);
-        await new Promise((r) => setTimeout(r, EAN_DELAY_MS));
-        const res = await findDocumentationByEans(creds, batch);
-        if (res.isError || !res.results) continue;
-        const items = Array.isArray(res.results) ? res.results : (res.results as any)?.items ?? [];
-        for (const item of items) {
-          const ean = item?.ean ?? item?.EAN ?? item?.ean_code;
-          const img = item?.product_image ?? item?.productImage ?? item?.image ?? item?.main_image;
-          if (ean && typeof img === 'string' && img.trim()) {
-            const eanStr = String(ean).trim();
-            if (!eanToImage.has(eanStr)) eanToImage.set(eanStr, img.trim());
-          }
-        }
-      }
-      console.log(`[Engine 2 API] documentation/find_by_eans 预拉取 ${eanToImage.size} 张图片（${uniqueEans.length} 个 EAN）`);
-    } catch (eanErr: any) {
-      console.warn(`[Engine 2 API] EAN 预拉取失败，跳过: ${eanErr?.message ?? eanErr}`);
-    }
-  }
-
-  for (const o of allOffers) {
-    try {
-      const np = normalizeEmagProduct(o as Record<string, unknown>, creds.region, {
-        logOutput: pipelineLogCount < PIPELINE_LOG_LIMIT,
-      });
-      if (pipelineLogCount < PIPELINE_LOG_LIMIT) pipelineLogCount++;
-      if (!np.pnk) continue;
-
-      // 引擎一（JSON）+ 引擎二（EAN API）合并
-      const firstEan = np.ean ? String(np.ean).split(/[,\s]+/)[0]?.trim() : null;
-      const eanImage = firstEan ? eanToImage.get(firstEan) ?? null : null;
-      const mainImage: string | null = np.mainImage ?? eanImage;
-      if (eanImage && !np.mainImage) result.eanImagesRecovered!++;
-
-      const skuForLog = np.sku ?? np.vendorSku ?? np.pnk;
-
-      if (firstFiveRaw.length < 5) {
-        firstFiveRaw.push({
-          pn: np.vendorSku ?? np.sku ?? '(空)',
-          pnk: np.pnk,
-          imageUrl: mainImage ?? '(无)',
-        });
-      }
-
-      if (np.isRejected) {
-        result.rejectedCount++;
-        if (np.rejectionReason && !result.rejectedReasons.includes(np.rejectionReason)) {
-          result.rejectedReasons.push(np.rejectionReason);
-        }
-        if (!result.rejectedSample) result.rejectedSample = { pnk: np.pnk, docErrors: np.rejectionReason || '' };
-      }
-
-      // 从 platform_orders 聚合的销量已在第一阶段 upsert 前由 syncCron 写好；
-      // 此处使用当前产品已同步到 DB 的 sales 字段回读并计算综合日销。
-      // 由于 Offer API 不返回销量，综合日销需在 upsert 后由独立回填脚本或定时任务写入。
-      // 同步写入时设 comprehensiveSales=0（保留字段），后续由 backfillComprehensiveSales 刷入。
-      // 🚀 落库探针：确认图片 URL 是否被提取到
-      console.log(`🚀 [eMAG 同步] PNK=${np.pnk} 准备存入数据库的图片 URL: ${mainImage ?? '(null - 无图片)'}`);
-
-      const data: Record<string, any> = {
-        shopId: creds.shopId,
-        pnk: np.pnk,
-        vendorSku: np.vendorSku ?? undefined,
-        sku: np.sku ?? undefined,
-        ean: np.ean ?? undefined,
-        emagOfferId: np.emagOfferId ?? undefined,
-        name: np.name,
-        salePrice: np.salePrice,
-        currency: np.currency,
-        stock: np.stock,
-        status: np.status,
-        categoryId: np.categoryId,
-        imageUrl: mainImage ?? undefined,
-        mainImage: mainImage ?? undefined,
-        productUrl: np.productUrl ?? undefined,
-        validationStatus: np.validationStatus,
-        docErrors: np.docErrors ?? undefined,
-        rejectionReason: np.rejectionReason,
-      };
-
-      // 构建 update 对象：有新图片时强制覆盖，无图片时保留 DB 已有值（不传 undefined = 跳过更新）
-      const updateData: Record<string, any> = { ...data };
-      if (mainImage) {
-        updateData.imageUrl = mainImage;
-        updateData.mainImage = mainImage;
-      } else {
-        delete updateData.imageUrl;
-        delete updateData.mainImage;
-      }
-
-      await prisma.storeProduct.upsert({
-        where: { shopId_pnk: { shopId: creds.shopId, pnk: np.pnk } },
-        create: data as Prisma.StoreProductCreateInput,
-        update: updateData as Prisma.StoreProductUpdateInput,
-      });
-
-      if (mainImage) {
-        console.log(`[Global Pipeline] SKU: ${skuForLog} -> Valid Image: ${mainImage}`);
-      }
-      result.upserted++;
-    } catch (e) {
-      const pnk = o?.part_number_key ?? o?.part_number ?? o?.pnk ?? '(unknown)';
-      const errMsg = e instanceof Error ? e.message : String(e);
-      result.errors.push(`${pnk}: ${errMsg}`);
-      console.error(`[storeProductSync] Skip broken item PNK=${pnk}:`, e);
-    }
-  }
-
-  console.log(`[storeProductSync] shop=${creds.shopId} 第一阶段完成，已同步 ${result.upserted} 个产品（EAN 补图: ${result.eanImagesRecovered ?? 0}）`);
 
   // ─── 第二阶段：深层图片补全 (Deep Catalog Enrichment) ───
   try {

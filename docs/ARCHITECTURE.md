@@ -865,3 +865,117 @@ eMAG API 在部分情形下将 EAN 字段以 **number 类型**返回（而非 st
 
 - **入口**：`product.ts` 中 `extractOfferIdFromUrl` + `buildPurchaseUrlUpdate` —— URL 中 offerId 变化时清空 `externalSkuId` 并重置 `externalSynced=false`。
 - **下单前**：`purchase.ts` 的 `POST /api/purchases/:id/place-1688-order` 校验 `externalSynced`；失败时若 1688 返回 `500_003` /「不属于商品」等，自动清空本地规格映射并提示重新选规格。
+
+---
+
+## 9. 产品同步弹性管道（Best-effort Delivery）（2026-04-15）
+
+### 9.1 架构升级：逐页 upsert（`storeProductSync.ts`）
+
+将原"全量拉取后统一处理"模式升级为 **"拉一页 → 立即 upsert 一页"**，确保网络抖动只影响当前页，已落库页绝对安全。
+
+| 配置项 | 值 | 说明 |
+|-------|-----|------|
+| `PAGE_SIZE` | 20 | 从 100 降至 20，减小单次响应体积 |
+| `DELAY_MS` | 1000ms | 页间冷却，降低代理并发压力 |
+| `PRODUCT_OFFER_TIMEOUT` | 180s | 产品同步专属超时，不影响其他接口 60s 默认值 |
+| `MAX_CONSECUTIVE_PAGE_FAILURES` | 3 | 连续失败 3 页后安全中止，输出已入库条数 |
+
+**EAN 图片预取**也随之改为逐页批量（而非全量完成后一次性批量），进一步降低内存峰值。
+
+---
+
+## 10. StoreProduct SKU 字段技术债（待重构）（2026-04-15）
+
+### 10.1 已知设计缺陷
+
+`schema.prisma` 对 `StoreProduct` 定义了两个从意图上应有区别的字段：
+
+| 字段 | 映射列名 | 注释意图 |
+|------|---------|---------|
+| `sku` | `sku` | eMAG part_number（平台侧 SKU） |
+| `vendorSku` | `vendor_sku` | part_number / 供应商 SKU |
+
+但 `emagProductNormalizer.ts` 的实现是：
+
+```typescript
+const sku = raw?.part_number != null ? String(raw.part_number).trim() : null;
+const vendorSku = sku;  // ← 两者恒等，设计意图未实现
+```
+
+两字段存储完全相同的值（`raw.part_number`），`vendorSku` 字段的独立语义被浪费。
+
+### 10.2 全局脏数据扫描结果（2026-04-15 审计，shopId=5）
+
+运营人员需在 eMAG 后台核查并修正以下记录，下次产品雷达自动同步入库：
+
+**① PNK 格式误填（确认脏数据，1 条）**
+
+卖家上传时 `part_number` 误用了 eMAG 自动生成 ID 而非自有 SKU：
+
+| PNK | 数据库存储的 sku/vendorSku | 应填值 | 商品名 |
+|-----|--------------------------|--------|-------|
+| `DKWY832BM` | `D92HPMYBM` ❌ | `KFB001-Black` | Cana termos SuooTci 510ml negru |
+
+**② 纯数字老格式（历史遗留，4 条，运营确认是否需修正）**
+
+| PNK | 当前 sku/vendorSku | 商品名 |
+|-----|-------------------|-------|
+| `DY9V9QBBM` | `00005765` | Comutator Intrerupator ghidon Moto |
+| `D9119QBBM` | `00003660` | Priza auto suplimentara incorporabila |
+| `DXXZYYMBM` | `00003142` | Set tampoane anti vibratii |
+| `DHJNWZYBM` | `1200969009` | Set de saci pentru aspirator Xiaomi |
+
+**③ 正常供应商 SKU（满足扫描正则但实际合规，29 条，无需处理）**
+
+格式如 `WXJSQ005`、`SBCDQ001`、`LYJSQ001` 等，已人工判定为合规卖家自定义 SKU。
+
+### 10.3 根因已确认（2026-04-15 复盘更新）
+
+经与 eMAG API 文档 v4.4.7 核对（`order/read` 章节字段说明）以及代码交叉比对：
+
+| eMAG API 字段 | 含义 | 正确映射目标 |
+|--------------|------|------------|
+| `part_number_key` | eMAG 内部目录 ID（PNK） | `StoreProduct.pnk` |
+| `part_number` | 平台侧编码，与 PNK 对应 | `StoreProduct.sku`（平台 SKU，可选保留） |
+| `ext_part_number` | **卖家自有唯一标识（卖家 SKU）** | `StoreProduct.vendorSku` ← **修复目标** |
+
+同一语义已在 `emagOrder.ts`（订单同步）中正确实现：
+```typescript
+pnk: p?.part_number ?? null,      // 平台编码
+sku: p?.ext_part_number ?? null,  // 卖家 SKU（ext_part_number）
+```
+
+`emagProductNormalizer.ts`（产品同步）错误地将 `raw.part_number` 同时赋给了 `sku` 和 `vendorSku`，而未读取 `ext_part_number`。
+
+### 10.4 修复方案（待老板审批后实施）
+
+**修改文件**：`backend/src/services/emagProductNormalizer.ts`，第 187-188 行
+
+```typescript
+// ── BEFORE（Bug）──────────────────────────────────────────────
+const sku = raw?.part_number != null ? String(raw.part_number).trim() : null;
+const vendorSku = sku;   // ← 两者恒等，vendorSku 语义丢失
+
+// ── AFTER（修复，带降级回退）──────────────────────────────────────
+const sku = raw?.part_number != null ? String(raw.part_number).trim() : null;
+// ext_part_number = 卖家自有 SKU（来源：eMAG API 文档 & emagOrder.ts 已验证）
+// 降级回退：若 ext_part_number 为空（旧产品可能没有此字段），退回使用 part_number
+const extPn = raw?.ext_part_number != null ? String(raw.ext_part_number).trim() : null;
+const vendorSku = (extPn && extPn.length > 0) ? extPn : sku;
+```
+
+**修改原则**：
+- `sku` 保持不变（仍为 `raw.part_number`，保留平台侧语义）
+- `vendorSku` 优先取 `raw.ext_part_number`，无值时降级回退至 `raw.part_number`（零破坏性）
+
+### 10.5 清洗执行记录（2026-04-15 已完成）
+
+| 步骤 | 状态 | 说明 |
+|------|------|------|
+| 代码修复 `emagProductNormalizer.ts` | ✅ 已完成 | 第 187-190 行，增加 `extPn` 读取 `raw.ext_part_number`，`vendorSku` 降级回退至 `sku` |
+| 外科手术直修 `DKWY832BM` | ✅ 已完成 | `vendorSku`: `D92HPMYBM` → `KFB001-Black`（老板会话中已确认） |
+| 全库 PNK 格式脏数据扫描 | ✅ 零残留 | `'^D[A-Z0-9]{6,8}BM$'` 模式扫描 shopId=5，返回 0 条 |
+| 代理恢复后全量重同步 | ⏳ 待执行 | 执行 `DRY_RUN=false npx tsx scripts/clean-dirty-vendor-sku.ts`，验证 `ext_part_number` 字段覆盖全量产品 |
+
+**新同步行为**：代理恢复 + 产品雷达 Cron 触发后，所有产品的 `vendorSku` 将自动由 `ext_part_number` 填充（无值则降级至 `part_number`），本次 Bug 的影响范围将被彻底消除。
