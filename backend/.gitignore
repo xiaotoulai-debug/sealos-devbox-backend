@@ -1,0 +1,31 @@
+# ── 依赖与构建产物 ──────────────────────────────────────────
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# ── 环境变量（含 DB 密码、密钥、Sealos 凭证）── 绝对禁止入库 ──
+.env
+.env.*
+!.env.example
+
+# ── Prisma 生成产物（由 prisma generate 实时生成，无需追踪）──
+node_modules/.prisma/
+
+# ── 日志与临时文件 ──────────────────────────────────────────
+*.log
+npm-debug.log*
+logs/
+/tmp/
+
+# ── 操作系统杂项 ────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDE 配置 ─────────────────────────────────────────────────
+.vscode/
+.idea/
+
+# ── 已归档的导入数据（含业务数据，不纳入版本控制）─────────────
+prisma/data_uploads/processed/
+prisma/data_uploads/public_sea_raw/
