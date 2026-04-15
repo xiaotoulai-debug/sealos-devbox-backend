@@ -137,12 +137,16 @@ export async function saveFullProductOffer(
 
 /**
  * 读取产品 offer（支持分页，status=1 为在售）
+ *
+ * options.timeout 默认继承全局 DEFAULT_TIMEOUT_MS（60s）；
+ * 产品同步场景可传 { timeout: 180_000 }，订单等轻量接口不受影响。
  */
 export async function readProductOffers(
   creds: EmagCredentials,
   filters: Record<string, any> = {},
+  options: { timeout?: number } = {},
 ): Promise<EmagApiResponse> {
-  return emagApiCall(creds, 'product_offer', 'read', filters);
+  return emagApiCall(creds, 'product_offer', 'read', filters, options);
 }
 
 /**

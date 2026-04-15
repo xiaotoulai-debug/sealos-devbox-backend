@@ -13,8 +13,12 @@ import { EmagCredentials, getEmagCredentials, REGION_DOMAIN } from './emagClient
 import { readProductOffers, findDocumentationByEans, readProductsByPnk } from './emagProduct';
 import { normalizeEmagProduct, slugifyProductName } from './emagProductNormalizer';
 
-const PAGE_SIZE = 100;
-const DELAY_MS = 350; // 3 req/sec (product_offer)
+// ★ 降级配置（2026-04-15）：eMAG RO product_offer/read 响应极慢（实测 156s），
+//   缩小单页大小 + 加大页间间隔，减轻单次请求的服务端处理压力。
+// 全局 DEFAULT_TIMEOUT_MS=60s 保持不变；产品同步通过 readProductOffers options 单独配置 180s。
+const PAGE_SIZE = 20;               // 从 100 降至 20，减小单次响应体积
+const DELAY_MS  = 1000;             // 从 350ms 增至 1000ms，降低代理连接并发压力
+const PRODUCT_OFFER_TIMEOUT = 180_000; // 产品同步专属超时 3min（不影响订单/其他接口的 60s）
 const EAN_BATCH_SIZE = 100;
 const EAN_DELAY_MS = 200;
 const CATALOG_BATCH_SIZE = 50; // 第二阶段每批 SKU 数
@@ -59,7 +63,15 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
         ...extraFilters,
       };
 
-      const res = await readProductOffers(creds, filters);
+      const pageStart = Date.now();
+      // ★ 传入产品专属超时（180s），不影响全局 DEFAULT_TIMEOUT_MS=60s
+      const res = await readProductOffers(creds, filters, { timeout: PRODUCT_OFFER_TIMEOUT });
+      const pageElapsed = Date.now() - pageStart;
+      console.log(
+        `[Product Sync] shop=${creds.shopId}(${creds.region}) Page ${page} fetched in ${pageElapsed}ms` +
+        ` (itemsPerPage=${PAGE_SIZE}${modifiedAfter ? ` modified_after=${modifiedAfter}` : ''})`,
+      );
+
       if (res.isError) {
         const msgs = res.messages?.join('; ') ?? JSON.stringify(res.errors ?? res).slice(0, 300);
         const errMsg = `[EMAG API ERROR] Shop: ${creds.region}, BaseURL: ${creds.baseUrl}, product_offer/read 失败: ${msgs}`;
@@ -377,7 +389,9 @@ export async function backfillProductUrls(): Promise<{ updated: number; total: n
       const apiUrlMap = new Map<string, string>();
       let page = 1;
       while (true) {
-        const res = await readProductOffers(creds, { currentPage: page, itemsPerPage: PAGE_SIZE });
+        const pageStart = Date.now();
+        const res = await readProductOffers(creds, { currentPage: page, itemsPerPage: PAGE_SIZE }, { timeout: PRODUCT_OFFER_TIMEOUT });
+        console.log(`[Product Sync] backfillUrls shop=${shopId} Page ${page} fetched in ${Date.now() - pageStart}ms`);
         if (res.isError) {
           const msgs = res.messages?.join('; ') ?? 'API 返回错误';
           throw new Error(`[EMAG API ERROR] Shop: ${creds.region}, backfillProductUrls 失败: ${msgs}`);
@@ -463,7 +477,9 @@ export async function backfillProductImages(): Promise<{ updated: number; total:
       const apiImageMap = new Map<string, string>();
       let page = 1;
       while (true) {
-        const res = await readProductOffers(creds, { currentPage: page, itemsPerPage: PAGE_SIZE });
+        const pageStart = Date.now();
+        const res = await readProductOffers(creds, { currentPage: page, itemsPerPage: PAGE_SIZE }, { timeout: PRODUCT_OFFER_TIMEOUT });
+        console.log(`[Product Sync] backfillImages shop=${shopId} Page ${page} fetched in ${Date.now() - pageStart}ms`);
         if (res.isError) {
           const msgs = res.messages?.join('; ') ?? 'API 返回错误';
           throw new Error(`[EMAG API ERROR] Shop: ${creds.region}, backfillProductImages 失败: ${msgs}`);
