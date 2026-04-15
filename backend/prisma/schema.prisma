@@ -290,6 +290,7 @@ model StoreProduct {
   @@unique([shopId, pnk])
   @@index([shopId])
   @@index([pnk])
+  @@index([ean])          // EAN 条码搜索索引，支持扫码枪查询与双格式兼容搜索
   @@index([vendorSku])
   @@index([shopId, comprehensiveSales(sort: Desc)])
   @@map("store_products")

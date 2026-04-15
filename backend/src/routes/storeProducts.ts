@@ -389,11 +389,26 @@ router.get('/', async (req: Request, res: Response) => {
 
     if (search) {
       const q = { contains: search, mode: 'insensitive' as const };
+
+      // EAN 双格式容错：当搜索词为纯数字 12~13 位时（扫码枪 / 手动输入），
+      // 同时匹配「带前导零的 13 位标准格式」与「去除前导零的短格式」，
+      // 避免因历史数据格式不一致导致漏搜。
+      // 使用 ean 字段 B-tree 索引（store_products_ean_idx），不触发全表扫描。
+      const eanSearchTerms: string[] = [search];
+      if (/^\d{12,13}$/.test(search)) {
+        const withLeadingZero    = search.padStart(13, '0');
+        const withoutLeadingZero = search.replace(/^0+/, '') || search; // 防止全零
+        if (!eanSearchTerms.includes(withLeadingZero))    eanSearchTerms.push(withLeadingZero);
+        if (!eanSearchTerms.includes(withoutLeadingZero)) eanSearchTerms.push(withoutLeadingZero);
+      }
+      // EAN 搜索：对每个候选格式生成一条 equals 条件（走索引），合并为 OR
+      const eanOrConditions = eanSearchTerms.map((t) => ({ ean: { equals: t, mode: 'insensitive' as const } }));
+
       // 四维混合搜索：sku / ean / pnk / name / vendorSku
       // 支持仓库扫码枪输入 EAN 条码、PNK 码、供应商 SKU 等任意标识符
       const searchOr = [
         { sku:       q },   // 本地 SKU
-        { ean:       q },   // EAN 条码（精准/模糊均可）
+        ...eanOrConditions, // EAN 条码（双格式兼容，走 ean 索引）
         { pnk:       q },   // eMAG part_number_key（PNK 码）
         { name:      q },   // 平台产品名称（支持关键词搜索）
         { vendorSku: q },   // 供应商 SKU / part_number（仓库备用扫码标识）

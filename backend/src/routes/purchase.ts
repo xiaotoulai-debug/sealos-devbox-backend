@@ -1290,7 +1290,8 @@ router.post('/:id/place-1688-order', async (req: Request, res: Response) => {
         products: {
           select: {
             id: true, sku: true, chineseName: true,
-            externalProductId: true, externalSkuId: true, purchaseQuantity: true,
+            externalProductId: true, externalSkuId: true, externalSynced: true,
+            purchaseQuantity: true, purchaseUrl: true,
           },
         },
       },
@@ -1328,6 +1329,34 @@ router.post('/:id/place-1688-order', async (req: Request, res: Response) => {
       return;
     }
 
+    // ★ Layer 2 — 换链联动拦截：检测 purchaseUrl 中的 offerId 与 externalProductId 是否一致
+    //
+    // 场景：业务员更换了 purchaseUrl 但未重新选择 1688 规格，
+    //       externalSynced 已被 buildPurchaseUrlUpdate 置为 false。
+    // 此时 externalSkuId 属于旧商品，与新 offerId 不匹配，下单必然失败。
+    // 直接在此拦截并给出明确提示，避免消耗 1688 API 配额。
+    const staleProducts = order.products.filter((p) => p.externalSynced === false);
+    if (staleProducts.length > 0) {
+      const skuList = staleProducts.map((p) => p.sku ?? `id=${p.id}`).join(', ');
+      console.warn(
+        `[place-1688-order] ⛔ 拦截：采购单 #${id}(${order.orderNo}) 中 ${staleProducts.length} 个产品` +
+        ` externalSynced=false，换链后规格未重新绑定。SKUs: ${skuList}`,
+      );
+      res.status(400).json({
+        code: 400,
+        data: {
+          staleSkus: staleProducts.map((p) => ({
+            sku:               p.sku,
+            purchaseUrl:       p.purchaseUrl,
+            externalProductId: p.externalProductId,
+            externalSkuId:     p.externalSkuId,
+          })),
+        },
+        message: `以下产品的采购链接已更换，但 1688 规格尚未重新绑定，请先在采购计划页选择新规格再下单：${skuList}`,
+      });
+      return;
+    }
+
     // ── 组装 1688 下单参数 ─────────────────────────────────────────
     const SPEC_ID_REGEX = /^[a-fA-F0-9]{32}$/;
     const validProducts = order.products.filter(
@@ -1354,6 +1383,51 @@ router.post('/:id/place-1688-order', async (req: Request, res: Response) => {
 
     if (!result.success) {
       console.error(`[place-1688-order] 1688 下单失败 PO#${id}:`, result.errorMessage);
+
+      // ★ SPEC_NOT_FOUND 防御：若 1688 返回规格不存在/已下架，自动重置本地规格映射
+      // 1688 规格串货错误码：500_003；也扫描 raw 响应中的中文描述（errorMessage 可能是兜底"未知错误"）
+      const rawErrStr = JSON.stringify(result.raw ?? '').toLowerCase();
+      const errStr    = `${result.errorCode ?? ''} ${result.errorMessage ?? ''} ${rawErrStr}`.toLowerCase();
+      const isSpecError =
+        result.errorCode === '500_003'      ||   // 1688：规格不属于该商品（最常见）
+        errStr.includes('spec_not_found')   ||
+        errStr.includes('spec not found')   ||
+        errStr.includes('cargo_not_match')  ||
+        errStr.includes('cargo not match')  ||
+        errStr.includes('invalid_specid')   ||
+        errStr.includes('invalid specid')   ||
+        errStr.includes('specid')           ||
+        errStr.includes('不属于商品')        ||   // "规格[xxx] 不属于商品[xxx]"
+        errStr.includes('规格不存在')        ||
+        errStr.includes('规格已下架')        ||
+        errStr.includes('规格.*不属于')      ||
+        errStr.includes('sku不存在')         ||
+        errStr.includes('sku not exist');
+
+      if (isSpecError) {
+        const affectedIds = validProducts.map((p) => p.id);
+        await prisma.product.updateMany({
+          where: { id: { in: affectedIds } },
+          data:  { externalSkuId: null, externalSkuIdNum: null, externalSynced: false },
+        });
+        console.warn(
+          `[place-1688-order] ⚠️ SPEC_NOT_FOUND 触发自动重置：已清空 ${affectedIds.length} 个产品的 externalSkuId` +
+          `，externalSynced=false。SKUs: ${validProducts.map((p) => p.sku).join(', ')}`,
+        );
+        res.json({
+          code: 400,
+          data: {
+            success: false,
+            errorCode:    result.errorCode,
+            errorMessage: result.errorMessage,
+            autoReset:    true,
+            resetSkus:    validProducts.map((p) => p.sku),
+          },
+          message: `1688 规格已失效，系统已自动重置规格绑定，请重新在采购计划页选择规格后再下单。（原始错误: ${result.errorMessage}）`,
+        });
+        return;
+      }
+
       res.json({
         code: 200,
         data: {

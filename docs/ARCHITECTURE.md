@@ -800,3 +800,68 @@ RECEIVED（已全部入库）
 | `src/services/profitCalculator.ts` | `recalcProfitForShop()` / `recalcProfitForAllShops()` / `recalcProfitBySkus()` |
 | `src/services/syncCron.ts` | 新增 Cron `0 0 * * *` 汇率+利润级联 |
 | `src/routes/storeProducts.ts` | 新增 `POST recalc-profit`、`POST sync-exchange-rates`；列表接口直读缓存 |
+
+---
+
+## 7. EAN 数据一致性架构（2026-04-15 启用）
+
+### 问题根因
+
+eMAG API 在部分情形下将 EAN 字段以 **number 类型**返回（而非 string），导致前导零丢失：
+- 正确：`"0786188447478"` (13位字符串)
+- 错误：`786188447478` (数字转 string 后 12位，缺前导零)
+
+### 修复架构
+
+#### 7.1 EAN 归一化层（`src/services/emagProductNormalizer.ts`）
+
+`normalizeEanString()` 内部函数，规则如下：
+
+| 条件 | 处理 |
+|------|------|
+| EAN 为 number 类型 | `Math.round()` 转 string 后再归一化 |
+| 纯数字字符串 < 13 位 | `padStart(13, '0')` 补齐，并输出审计日志 |
+| 纯数字字符串 = 13 位 | 原样保留 |
+| 非纯数字（含字母等旧格式）| 原样保留，不干预 |
+
+**审计日志格式**：
+```
+[EAN Normalize] pnk=XXXXXXX EAN 前导零补全: "786188447478" → "0786188447478"
+```
+
+#### 7.2 双格式搜索容错（`src/routes/storeProducts.ts`）
+
+当 `search` 参数为 12~13 位纯数字时（扫码枪场景），同时生成两个 EAN 搜索候选：
+- 带前导零的 13 位标准格式
+- 去掉前导零的短格式
+
+使用 `ean: { equals: term }` 替代 `contains`，走 **B-tree 索引**（`store_products_ean_idx`），避免大数据量下全表扫描。
+
+#### 7.3 `ean` 字段索引
+
+`prisma/schema.prisma` 新增 `@@index([ean])`，已通过 `prisma db push` 同步至 PostgreSQL（索引名：`store_products_ean_idx`）。
+
+#### 7.4 历史数据处理策略
+
+- **存量数据**：873 条 12 位 EAN 将在产品雷达（每 2 小时）下次同步时由归一化逻辑自动修正入库。
+- **立即修复**：针对 `shopId=5`（跨境A店 RO）已触发一次手动全量重同步（`scripts/manual-sync-shop5.ts`）。
+
+---
+
+## 8. 进程管理与 1688 换链下单（2026-04-15）
+
+### 8.1 PM2 持久化（Sealos / 生产）
+
+| 项 | 说明 |
+|----|------|
+| 配置 | `backend/ecosystem.config.cjs`，进程名 `emag-backend` |
+| 启动 | `npm run pm2:start` 或 `bash scripts/start-prod.sh`（内部执行 `pm2 start` + `pm2 save`） |
+| 持久化列表 | 发版后执行 `npm run pm2:save`，宿主机重启后需配合 `pm2 resurrect` 或一次性配置 `pm2 startup`（systemd） |
+| 日志 | `npm run pm2:logs` |
+
+依赖：`package.json` 的 `dependencies` 含 `pm2`，避免仅全局安装导致 CI/容器内找不到命令。
+
+### 8.2 1688 采购链接变更与下单熔断
+
+- **入口**：`product.ts` 中 `extractOfferIdFromUrl` + `buildPurchaseUrlUpdate` —— URL 中 offerId 变化时清空 `externalSkuId` 并重置 `externalSynced=false`。
+- **下单前**：`purchase.ts` 的 `POST /api/purchases/:id/place-1688-order` 校验 `externalSynced`；失败时若 1688 返回 `500_003` /「不属于商品」等，自动清空本地规格映射并提示重新选规格。

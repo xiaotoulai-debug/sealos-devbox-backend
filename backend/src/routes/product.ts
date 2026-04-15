@@ -10,6 +10,58 @@ const router = Router();
 // 所有产品接口必须登录
 router.use(authenticate);
 
+// ─────────────────────────────────────────────────────────────────────
+// 工具：从 1688 采购链接中提取 offerId（商品 ID）
+//
+// 支持格式：
+//   https://detail.1688.com/offer/953322464035.html
+//   https://www.1688.com/…?id=953322464035
+//   直接输入数字串（10位以上）
+//
+// 返回：offerId 字符串 或 null
+// ─────────────────────────────────────────────────────────────────────
+function extractOfferIdFromUrl(url: string | null | undefined): string | null {
+  if (!url) return null;
+  const m =
+    url.match(/\/offer\/(\d{10,})/i) ||   // detail.1688.com/offer/XXXXXXXXXX
+    url.match(/[?&]id=(\d{10,})/i)  ||   // ?id=XXXXXXXXXX
+    url.match(/(\d{10,})/);               // 裸数字串兜底（仅10位以上，防止匹配短数字）
+  return m ? m[1] : null;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// 工具：构建 purchaseUrl 变更时的附加字段集
+//
+// 当检测到 URL 中的 offerId 与数据库现有 externalProductId 不一致时，
+// 自动将 externalSkuId / externalSkuIdNum / externalSynced 清空，
+// 防止旧规格 specId 与新商品 offerId 错配导致 1688 下单失败。
+//
+// 返回：需要一并写入 DB 的字段对象（已包含 purchaseUrl 本身）
+// ─────────────────────────────────────────────────────────────────────
+function buildPurchaseUrlUpdate(
+  newUrl: string | null,
+  currentExternalProductId: string | null,
+): Record<string, unknown> {
+  const cleanUrl = typeof newUrl === 'string' && newUrl.trim() ? newUrl.trim() : null;
+  const data: Record<string, unknown> = { purchaseUrl: cleanUrl };
+
+  const newOfferId = extractOfferIdFromUrl(cleanUrl);
+
+  if (newOfferId && newOfferId !== currentExternalProductId) {
+    // URL 指向了新商品 → 旧规格作废，强制要求重新绑定规格
+    data.externalProductId = newOfferId;
+    data.externalSkuId     = null;
+    data.externalSkuIdNum  = null;
+    data.externalSynced    = false;
+    console.log(
+      `[purchaseUrl 变更] offerId: ${currentExternalProductId ?? 'null'} → ${newOfferId}` +
+      `，externalSkuId/externalSynced 已清空，等待业务员重新选规格`,
+    );
+  }
+
+  return data;
+}
+
 // ── POST /api/products/sync-urls ─────────────────────────────────
 // 平台产品 product_url 全量补齐（store_products 表）
 router.post('/sync-urls', async (_req: Request, res: Response) => {
@@ -823,6 +875,11 @@ router.post('/:id/select', async (req: Request, res: Response) => {
 
     const { purchasePrice, actualWeight, freightCost, fbeFee, margin, purchaseUrl, chineseName, length: pLen, width: pWid, height: pHei } = req.body ?? {};
 
+    // ★ 换链检测：若 purchaseUrl 含新 offerId，清空旧规格映射
+    const urlUpdateFields = purchaseUrl !== undefined
+      ? buildPurchaseUrlUpdate(purchaseUrl, product.externalProductId ?? null)
+      : {};
+
     const updated = await prisma.product.update({
       where: { id: productId },
       data: {
@@ -830,11 +887,11 @@ router.post('/:id/select', async (req: Request, res: Response) => {
         ownerId:       req.user!.userId,
         collectedAt:   new Date(),
         purchasePrice: purchasePrice != null ? Number(purchasePrice) : null,
-        purchaseUrl:   typeof purchaseUrl === 'string' && purchaseUrl.trim() ? purchaseUrl.trim() : null,
         chineseName:   typeof chineseName === 'string' && chineseName.trim() ? chineseName.trim() : null,
         actualWeight:  actualWeight  != null ? Number(actualWeight)  : null,
         freightCost:   freightCost   != null ? Number(freightCost)   : null,
         fbeFee:        fbeFee        != null ? Number(fbeFee)        : null,
+        ...urlUpdateFields,  // 已包含 purchaseUrl 及可能的 externalProductId/externalSkuId/externalSynced
         margin:        margin        != null ? Number(margin)        : null,
         length:        pLen          != null ? Number(pLen)          : null,
         width:         pWid          != null ? Number(pWid)          : null,
@@ -1151,6 +1208,20 @@ router.put('/inventory-batch-update', async (req: Request, res: Response) => {
     // 记录触发了利润相关字段变更的 Product.id 集合
     const idsForRecalc = new Set<number>();
 
+    // ★ 换链前置预查：收集本批次含 purchaseUrl 的 ID，查出当前 externalProductId
+    //   用于 buildPurchaseUrlUpdate 判断 offerId 是否真正变化
+    const urlUpdateIds = items
+      .map((i: any) => Number(i.id))
+      .filter((id: number) => !isNaN(id) && items.find((i: any) => Number(i.id) === id && i.purchaseUrl !== undefined));
+    const currentExternalMap = new Map<number, string | null>();
+    if (urlUpdateIds.length > 0) {
+      const existing = await prisma.product.findMany({
+        where: { id: { in: urlUpdateIds }, ownerId: userId },
+        select: { id: true, externalProductId: true },
+      });
+      for (const p of existing) currentExternalMap.set(p.id, p.externalProductId ?? null);
+    }
+
     await prisma.$transaction(async (tx) => {
       for (const item of items) {
         const id = Number(item.id);
@@ -1162,7 +1233,11 @@ router.put('/inventory-batch-update', async (req: Request, res: Response) => {
         if (item.height        !== undefined) data.height       = item.height != null ? Number(item.height) : null;
         if (item.actualWeight  !== undefined) data.actualWeight = item.actualWeight != null ? Number(item.actualWeight) : null;
         if (item.purchasePrice !== undefined) data.purchasePrice = item.purchasePrice != null ? Number(item.purchasePrice) : null;
-        if (item.purchaseUrl   !== undefined) data.purchaseUrl  = typeof item.purchaseUrl === 'string' && item.purchaseUrl.trim() ? item.purchaseUrl.trim() : null;
+        // ★ purchaseUrl 换链检测：若 offerId 变化则自动清空旧规格映射
+        if (item.purchaseUrl !== undefined) {
+          const urlFields = buildPurchaseUrlUpdate(item.purchaseUrl, currentExternalMap.get(id) ?? null);
+          Object.assign(data, urlFields);
+        }
         if (Object.keys(data).length === 0) continue;
         const result = await tx.product.updateMany({ where: { id, ownerId: userId, sku: { not: null } }, data });
         count += result.count;
@@ -1285,8 +1360,9 @@ router.post(
         data.chineseName = typeof item.chineseName === 'string' && item.chineseName.trim()
           ? item.chineseName.trim() : null;
       }
+      // ★ purchaseUrl 先暂存原始值；offerId 变更检测在 Step3 拿到 DB 数据后统一处理
       if (item.purchaseUrl !== undefined) {
-        data.purchaseUrl = typeof item.purchaseUrl === 'string' && item.purchaseUrl.trim()
+        data.__rawPurchaseUrl = typeof item.purchaseUrl === 'string' && item.purchaseUrl.trim()
           ? item.purchaseUrl.trim() : null;
       }
 
@@ -1305,12 +1381,14 @@ router.post(
     const deduped = [...dedupedMap.values()];
 
     // ── Step 3：存在性预检（单次 IN 查询，O(1) round-trip）──────────
+    // ★ 同时拉取 externalProductId，供换链检测器对比新旧 offerId
     const allSkus = deduped.map((c) => c.sku);
     const existingProducts = await prisma.product.findMany({
       where: { sku: { in: allSkus }, ownerId: userId },
-      select: { id: true, sku: true },
+      select: { id: true, sku: true, externalProductId: true },
     });
-    const skuToId = new Map(existingProducts.map((p) => [p.sku!, p.id]));
+    const skuToId          = new Map(existingProducts.map((p) => [p.sku!, p.id]));
+    const skuToExtProdId   = new Map(existingProducts.map((p) => [p.sku!, p.externalProductId ?? null]));
 
     type WriteItem = CandidateItem & { id: number };
     const toWrite:         WriteItem[] = [];
@@ -1322,6 +1400,15 @@ router.post(
         skippedNotFound.push(c.sku);
         rejected.push({ sku: c.sku, reason: 'SKU 在库中不存在或无访问权限' });
       } else {
+        // ★ 换链检测：将 __rawPurchaseUrl 替换为 buildPurchaseUrlUpdate 的完整字段集
+        if ('__rawPurchaseUrl' in c.data) {
+          const rawUrl = c.data.__rawPurchaseUrl as string | null;
+          delete c.data.__rawPurchaseUrl;
+          const urlFields = buildPurchaseUrlUpdate(rawUrl, skuToExtProdId.get(c.sku) ?? null);
+          Object.assign(c.data, urlFields);
+          // purchaseUrl 纳入利润相关字段统计（换链可能影响采购成本）
+          // 此处无需额外处理，hasProfitField 已在 Step1 计算
+        }
         toWrite.push({ ...c, id });
       }
     }

@@ -188,15 +188,40 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
   const vendorSku = sku;
 
   const eanRaw = raw?.ean;
+
+  /**
+   * EAN 归一化规则：
+   * 1. 只保留纯数字字符串（过滤非数字干扰）
+   * 2. 不足 13 位的补前导零至 13 位（EAN-13 标准；防止 API 将数字类型转回字符串时丢失前导零）
+   * 3. 记录格式转换日志供审计
+   */
+  function normalizeEanString(raw: string, pnkCtx: string): string {
+    const cleaned = raw.trim().replace(/\s/g, '');
+    if (!/^\d+$/.test(cleaned)) return cleaned; // 非纯数字（如旧格式含字母），原样保留
+    if (cleaned.length < 13) {
+      const padded = cleaned.padStart(13, '0');
+      // 审计日志：记录哪些 EAN 发生了格式补全
+      console.log(`[EAN Normalize] pnk=${pnkCtx} EAN 前导零补全: "${cleaned}" → "${padded}"`);
+      return padded;
+    }
+    return cleaned;
+  }
+
   const ean =
     Array.isArray(eanRaw) && eanRaw.length > 0
       ? eanRaw
-          .map((x: unknown) => (typeof x === 'string' ? x : (x as any)?.value ?? (x as any)?.ean ?? String(x)))
+          .map((x: unknown) => {
+            const raw = typeof x === 'string' ? x : (x as any)?.value ?? (x as any)?.ean ?? String(x);
+            return raw ? normalizeEanString(String(raw), pnk) : null;
+          })
           .filter(Boolean)
           .join(', ') || null
       : typeof eanRaw === 'string' && eanRaw.trim()
-        ? eanRaw.trim()
-        : null;
+        ? normalizeEanString(eanRaw, pnk)
+        : eanRaw != null && typeof eanRaw === 'number'
+          ? // eMAG 偶发 number 类型（数字型 EAN 丢失前导零的根本原因）
+            normalizeEanString(String(Math.round(eanRaw as number)), pnk)
+          : null;
 
   // product_url：API 优先，否则按 region 域名拼接
   const domain = REGION_DOMAIN[region];
