@@ -157,6 +157,8 @@ export { statusMap };
 export interface ReadOrdersOptions {
   id?: number;            // 单订单查询
   status?: number;        // 单状态筛选；不传则 API 可能只返回 New，需显式传 1,2,3,4,5 分批拉取
+  type?: number;          // 订单履行类型：2=FBE（平台代发）, 3=FBM（卖家自发，API 默认）
+                          // ★ API 默认值为 3，必须显式传 2 才能拉取 FBE 订单，否则永久漏单
   createdAfter?: string;   // YYYY-mm-dd HH:ii:ss 或 YYYY-MM-DD
   createdBefore?: string;
   modifiedAfter?: string;  // 增量优先：仅拉取该时间后有变动的订单 YYYY-mm-dd HH:ii:ss
@@ -186,6 +188,7 @@ export async function readOrders(
   const filters: Record<string, any> = {};
   if (opts.id !== undefined) filters.id = opts.id;
   if (opts.status !== undefined) filters.status = opts.status;
+  if (opts.type !== undefined) filters.type = opts.type;
 
   // ★ 参数格式修正（2026-04-03，文档 v4.4.7 §5.4）：
   //   eMAG 要求 createdAfter/createdBefore 为顶层扁平字段（YYYY-mm-dd HH:ii:ss）。
@@ -224,87 +227,99 @@ export async function readOrders(
  */
 export async function readOrdersForAllStatuses(
   creds: EmagCredentials,
-  opts: Omit<ReadOrdersOptions, 'status'> & { statuses?: number[]; createdAfter?: string } = {},
+  opts: Omit<ReadOrdersOptions, 'status'> & {
+    statuses?: number[];
+    createdAfter?: string;
+    // ★ types: 显式指定需拉取的履行类型。默认 [2, 3]（FBE + FBM）
+    //   eMAG API type 参数默认值为 3（FBM），不传 type=2 永久漏拉 FBE 订单
+    types?: number[];
+  } = {},
 ): Promise<EmagApiResponse<EmagOrder[]>> {
   const statuses     = opts.statuses ?? [...ALL_ORDER_STATUSES];
+  // ★ 默认同时拉取 FBE(2) 和 FBM(3)，逐类型独立循环，结果 Map 内存去重
+  const types        = opts.types ?? [2, 3];
   const allOrders    = new Map<number, EmagOrder>();
   const itemsPerPage = opts.itemsPerPage ?? 100;
 
-  // ── 第一轮：modified 扫描（严格模式，防漏单铁律）─────────────────────────
-  for (const status of statuses) {
-    let page = 1;
-    while (true) {
-      const res = await readOrders(creds, {
-        ...opts,
-        createdAfter: undefined,   // 第一轮只用 modifiedAfter，显式清空 createdAfter
-        status,
-        currentPage:  page,
-        itemsPerPage,
-      });
-
-      // ★ 严禁静默吞错：API 返回 isError 时立即抛出，让同步任务感知并上报
-      if (res.isError) {
-        const errMsg = res.messages?.join('; ') ?? 'eMAG API 返回错误（isError=true）';
-        throw new Error(`eMAG 订单同步失败（modified scan, status=${status} page=${page}）：${errMsg}`);
-      }
-
-      const batch = Array.isArray(res.results) ? res.results : [];
-      for (const o of batch) {
-        if (o?.id != null) allOrders.set(o.id, o);
-      }
-
-      if (batch.length < itemsPerPage) break;
-      page++;
-      if (page > 100) break;
-      await new Promise((r) => setTimeout(r, 100));
-    }
-  }
-
-  // ── 第二轮：created 扫描（宽松模式，网络抖动不中断整体）──────────────────
-  // 仅当调用方显式传入 createdAfter 时执行；用于补录"从未被 modified 命中"的订单
-  if (opts.createdAfter) {
+  for (const orderType of types) {
+    // ── 第一轮：modified 扫描（严格模式，防漏单铁律）───────────────────────
     for (const status of statuses) {
       let page = 1;
       while (true) {
-        let res;
-        try {
-          res = await readOrders(creds, {
-            ...opts,
-            modifiedAfter: undefined,  // 第二轮只用 createdAfter，显式清空 modifiedAfter
-            status,
-            currentPage:  page,
-            itemsPerPage,
-          });
-        } catch (networkErr) {
-          // 宽松模式：网络异常跳过本状态，不抛出
-          console.warn(
-            `[readOrdersForAllStatuses] created 轮网络异常` +
-            ` shop=${creds.region} status=${status} page=${page}:` +
-            ` ${networkErr instanceof Error ? networkErr.message : networkErr}，跳过本状态`,
-          );
-          break;
-        }
+        const res = await readOrders(creds, {
+          ...opts,
+          type:         orderType,
+          createdAfter: undefined,   // 第一轮只用 modifiedAfter，显式清空 createdAfter
+          status,
+          currentPage:  page,
+          itemsPerPage,
+        });
 
+        // ★ 严禁静默吞错：API 返回 isError 时立即抛出，让同步任务感知并上报
         if (res.isError) {
-          // 宽松模式：API 错误跳过本状态，记录警告
-          console.warn(
-            `[readOrdersForAllStatuses] created 轮 API 错误` +
-            ` shop=${creds.region} status=${status} page=${page}:` +
-            ` ${res.messages?.join('; ') ?? 'isError=true'}，跳过本状态`,
-          );
-          break;
+          const errMsg = res.messages?.join('; ') ?? 'eMAG API 返回错误（isError=true）';
+          throw new Error(`eMAG 订单同步失败（modified scan, type=${orderType} status=${status} page=${page}）：${errMsg}`);
         }
 
         const batch = Array.isArray(res.results) ? res.results : [];
         for (const o of batch) {
-          // 去重：modified 轮已抓取的订单 id 不覆盖（保留 modified 轮的最新数据）
-          if (o?.id != null && !allOrders.has(o.id)) allOrders.set(o.id, o);
+          if (o?.id != null) allOrders.set(o.id, o);
         }
 
         if (batch.length < itemsPerPage) break;
         page++;
         if (page > 100) break;
         await new Promise((r) => setTimeout(r, 100));
+      }
+    }
+
+    // ── 第二轮：created 扫描（宽松模式，网络抖动不中断整体）────────────────
+    // 仅当调用方显式传入 createdAfter 时执行；用于补录"从未被 modified 命中"的订单
+    if (opts.createdAfter) {
+      for (const status of statuses) {
+        let page = 1;
+        while (true) {
+          let res;
+          try {
+            res = await readOrders(creds, {
+              ...opts,
+              type:          orderType,
+              modifiedAfter: undefined,  // 第二轮只用 createdAfter，显式清空 modifiedAfter
+              status,
+              currentPage:  page,
+              itemsPerPage,
+            });
+          } catch (networkErr) {
+            // 宽松模式：网络异常跳过本状态，不抛出
+            console.warn(
+              `[readOrdersForAllStatuses] created 轮网络异常` +
+              ` shop=${creds.region} type=${orderType} status=${status} page=${page}:` +
+              ` ${networkErr instanceof Error ? networkErr.message : networkErr}，跳过本状态`,
+            );
+            break;
+          }
+
+          if (res.isError) {
+            // 宽松模式：API 错误跳过本状态，记录警告
+            console.warn(
+              `[readOrdersForAllStatuses] created 轮 API 错误` +
+              ` shop=${creds.region} type=${orderType} status=${status} page=${page}:` +
+              ` ${res.messages?.join('; ') ?? 'isError=true'}，跳过本状态`,
+            );
+            break;
+          }
+
+          const batch = Array.isArray(res.results) ? res.results : [];
+          for (const o of batch) {
+            // 去重：modified 轮已抓取的订单 id 不覆盖（保留 modified 轮的最新数据）
+            if (o?.id != null && !allOrders.has(o.id)) allOrders.set(o.id, o);
+          }
+
+          if (batch.length < itemsPerPage) break;
+          page++;
+          if (page > 100) break;
+          await new Promise((r) => setTimeout(r, 100));
+        }
       }
     }
   }
