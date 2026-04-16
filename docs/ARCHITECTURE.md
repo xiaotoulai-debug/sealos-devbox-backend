@@ -75,7 +75,7 @@ backend/
 │   │   │                      #   POST /api/store-products/map      — 绑定库存 SKU（★ SKU 字符串优先匹配，inventorySkuId 兜底；pnk+shopId 或 storeProductId 定位平台产品）
 │   │   ├── dashboard.ts       # 业绩看板（stats、shops 下拉）
 │   │   ├── translate.ts       # 翻译代理（MyMemory API 转发，ro→zh 等）
-│   │   ├── fbeShipment.ts     # FBE 发货单管理（在途库存闭环，POST/GET /api/fbe-shipments，PUT /:id/status）
+│   │   ├── fbeShipment.ts     # FBE 发货单管理（在途库存闭环；GET /counts 须在 /:id 前；PUT /:id 严格校验 items）
 │   │   ├── inventory.ts       # 进销存核心（POST batch-adjust / PUT purchase-orders receive / GET logs）
 │   │   ├── warehouse.ts       # 仓库管理（GET/POST /api/warehouses，PUT /:id — 含 skuCount 聚合、名称唯一性校验）
 │   │   ├── alibaba.ts         # 1688 OAuth、规格解析、下单、子单同步
@@ -589,7 +589,8 @@ RECEIVED（已全部入库）
 | `POST /api/translate` | `routes/translate.ts` | 翻译代理（MyMemory API 转发，罗马尼亚语→中文等，需登录） |
 | `POST /api/fbe-shipments` | `routes/fbeShipment.ts` | 创建 FBE 发货单（**shopId 必填**，含跨店铺防呆校验；shipmentNumber 可选自定义） |
 | `GET /api/fbe-shipments` | `routes/fbeShipment.ts` | 发货单列表（分页 + 明细 + `productCount`/`totalQuantity` 聚合字段）|
-| `PUT /api/fbe-shipments/:id` | `routes/fbeShipment.ts` | 编辑发货单（改单号/备注/明细数量，**仅 PENDING/ALLOCATING 可编辑**） |
+| `GET /api/fbe-shipments/counts` | `routes/fbeShipment.ts` | 各状态发货单数量（`groupBy status`）；**必须注册在 `GET /:id` 之前**，否则 `counts` 会被误匹配为 `:id` |
+| `PUT /api/fbe-shipments/:id` | `routes/fbeShipment.ts` | 编辑发货单（改单号/备注/明细数量；**支持追加新SKU行**；仅 PENDING/ALLOCATING 可编辑）。`items` 数组两种元素：`{id, quantity}` 更新已有行；`{storeProductId, quantity}` 追加新行（同一事务内执行锁仓）。**无合法 `id` 且无合法 `storeProductId` 的元素 → 400，禁止静默跳过**。 |
 | `GET /api/fbe-shipments/:id` | `routes/fbeShipment.ts` | 发货单详情 |
 | `PUT /api/fbe-shipments/:id/status` | `routes/fbeShipment.ts` | **4阶段状态机（核心）**：PENDING→ALLOCATING(仅改状态)，ALLOCATING→SHIPPED(**★强校验 stockActual≥qty 否则400回滚**，-stockActual+FBE_OUT流水,+inTransitQty)，SHIPPED→ARRIVED(-inTransitQty+receivedQty)，PENDING/ALLOCATING→CANCELLED(无库存变动)，SHIPPED→CANCELLED(-inTransitQty,+stockActual归还) |
 | `PATCH /api/fbe-shipments/:id/costs` | `routes/fbeShipment.ts` | 登记/更新运费：接收 `overseasFreight`（海外头程）和 `domesticFreight`（国内运费），任意状态可更新；返回含 `totalCost = totalProductValue + overseasFreight + domesticFreight` 的汇总 |

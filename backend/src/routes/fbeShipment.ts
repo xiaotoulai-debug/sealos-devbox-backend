@@ -351,6 +351,36 @@ router.get('/', async (req: Request, res: Response) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
+// ─────────────────────────────────────────────────────────────────────
+// GET /api/fbe-shipments/counts   各状态发货单数量统计
+// ★ 必须注册在 /:id 之前，否则 Express 将 "counts" 误匹配为 :id 参数
+// ─────────────────────────────────────────────────────────────────────
+router.get('/counts', async (req: Request, res: Response) => {
+  try {
+    const rows = await prisma.fbeShipment.groupBy({
+      by:     ['status'],
+      _count: { id: true },
+    });
+
+    const counts: Record<string, number> = {
+      PENDING:    0,
+      ALLOCATING: 0,
+      SHIPPED:    0,
+      ARRIVED:    0,
+      CANCELLED:  0,
+    };
+    for (const row of rows) {
+      counts[row.status] = row._count.id;
+    }
+
+    res.json({ code: 200, data: counts, message: 'success' });
+  } catch (err: any) {
+    console.error('[FBE] 统计各状态数量失败:', err?.message);
+    res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
 // GET /api/fbe-shipments/:id   发货单详情
 // ─────────────────────────────────────────────────────────────────────
 router.get('/:id', async (req: Request, res: Response) => {
@@ -408,9 +438,25 @@ router.get('/:id', async (req: Request, res: Response) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
-// PUT /api/fbe-shipments/:id   编辑发货单（单号 / 备注 / 明细数量）
-// Body: { shipmentNumber?, remark?, items?: [{ id: itemId, quantity: newQty }] }
+// PUT /api/fbe-shipments/:id   编辑发货单（单号 / 备注 / 明细数量 / 追加新SKU）
+//
+// Body: {
+//   shipmentNumber?: string,
+//   remark?: string,
+//   items?: Array<
+//     | { id: number; quantity: number }                        // ★ 更新已有行：必须带 FbeShipmentItem.id
+//     | { storeProductId: number; quantity: number }           // ★ 追加新行：带平台产品ID，无 id 字段
+//   >
+// }
+//
 // 防呆：仅 PENDING 或 ALLOCATING 状态允许编辑
+//
+// 追加新SKU逻辑（与初次建单完全对齐）：
+//   ① storeProductId → StoreProduct.mappedInventorySku → Product
+//   ② 校验 mappedInventorySku 已绑定到发货单目标 shopId
+//   ③ 若发货单有 warehouseId，校验 WarehouseStock 可用量（stockQuantity - lockedQuantity >= quantity）
+//   ④ 在同一事务内 fbeShipmentItem.create + warehouseStock.lockedQuantity += quantity
+//   ⑤ 更新 fbeShipment.totalProductValue（追加货值快照）
 // ─────────────────────────────────────────────────────────────────────
 router.put('/:id', async (req: Request, res: Response) => {
   try {
@@ -421,9 +467,10 @@ router.put('/:id', async (req: Request, res: Response) => {
       return;
     }
 
+    // 查主单：需要 warehouseId 和 shopId 用于追加新行的锁仓校验
     const current = await prisma.fbeShipment.findUnique({
-      where: { id },
-      select: { id: true, status: true, shipmentNumber: true },
+      where:  { id },
+      select: { id: true, status: true, shipmentNumber: true, warehouseId: true, shopId: true },
     });
     if (!current) {
       res.status(404).json({ code: 404, data: null, message: '发货单不存在' });
@@ -440,11 +487,40 @@ router.put('/:id', async (req: Request, res: Response) => {
       return;
     }
 
+    type UpdateItem = { id: number; quantity: number };
+    type AppendItem = { storeProductId: number; quantity: number };
+
     const { shipmentNumber, remark, items } = req.body as {
       shipmentNumber?: string;
       remark?: string;
-      items?: Array<{ id: number; quantity: number }>;
+      items?: Array<UpdateItem | AppendItem>;
     };
+
+    // ── 分拣 items：已有行（有 id）vs 新追加行（有 storeProductId，无 id）──
+    const updateItems: UpdateItem[] = [];
+    const appendItems: AppendItem[] = [];
+
+    if (Array.isArray(items) && items.length > 0) {
+      for (const item of items) {
+        if (!item.quantity || !Number.isInteger(item.quantity) || item.quantity <= 0) {
+          res.status(400).json({ code: 400, data: null, message: 'quantity 必须为正整数' });
+          return;
+        }
+        if ('id' in item && Number.isInteger((item as UpdateItem).id)) {
+          updateItems.push(item as UpdateItem);
+        } else if ('storeProductId' in item && Number.isInteger((item as AppendItem).storeProductId)) {
+          appendItems.push(item as AppendItem);
+        } else {
+          // ★ 明确拒绝：元素既没有合法 id（更新已有行），也没有合法 storeProductId（追加新行）
+          res.status(400).json({
+            code: 400,
+            data: null,
+            message: `items 元素格式非法：每个元素必须携带合法的 "id"（更新已有明细）或 "storeProductId"（追加新产品），收到：${JSON.stringify(item)}`,
+          });
+          return;
+        }
+      }
+    }
 
     // ── 单号唯一性校验 ──────────────────────────────────────────────
     const updateData: any = {};
@@ -463,26 +539,179 @@ router.put('/:id', async (req: Request, res: Response) => {
       updateData.remark = remark || null;
     }
 
-    // ── 事务：更新主单 + 更新明细数量 ────────────────────────────────
+    // ── 追加行前置校验（事务外，避免脏数据进入事务）────────────────
+    // 结构：{ productId, sku, chineseName, purchasePrice, storeProductId }
+    type ResolvedAppend = {
+      storeProductId: number;
+      productId:      number;
+      sku:            string;
+      chineseName:    string | null;
+      purchasePrice:  number;
+      quantity:       number;
+    };
+    const resolvedAppends: ResolvedAppend[] = [];
+
+    if (appendItems.length > 0) {
+      const storeProductIds = appendItems.map((i) => i.storeProductId);
+
+      // ① 查 StoreProduct，确认属于本发货单的 shopId，并拿到 mappedInventorySku
+      const storeProducts = await prisma.storeProduct.findMany({
+        where:  { id: { in: storeProductIds }, shopId: current.shopId ?? undefined },
+        select: { id: true, mappedInventorySku: true, name: true, shopId: true },
+      });
+      const storeProductMap = new Map(storeProducts.map((sp) => [sp.id, sp]));
+
+      // 找不到或不属于本店铺的 ID
+      const notFound = storeProductIds.filter((spId) => !storeProductMap.has(spId));
+      if (notFound.length > 0) {
+        res.status(400).json({
+          code: 400, data: null,
+          message: `平台产品 ID [${notFound.join(', ')}] 不存在或不属于本发货单店铺`,
+        });
+        return;
+      }
+
+      // ② 检查 mappedInventorySku 必须已绑定
+      const unmapped = storeProducts.filter((sp) => !sp.mappedInventorySku).map((sp) => sp.id);
+      if (unmapped.length > 0) {
+        res.status(400).json({
+          code: 400, data: null,
+          message: `平台产品 ID [${unmapped.join(', ')}] 尚未绑定内部库存 SKU，请先在平台产品页完成绑定`,
+        });
+        return;
+      }
+
+      // ③ 通过 mappedInventorySku 查本地 Product
+      const mappedSkus = storeProducts.map((sp) => sp.mappedInventorySku as string);
+      const products   = await prisma.product.findMany({
+        where:  { sku: { in: mappedSkus }, isDeleted: false },
+        select: { id: true, sku: true, chineseName: true, purchasePrice: true },
+      });
+      const productBySkuMap = new Map(products.map((p) => [p.sku!, p]));
+
+      // 库存 SKU 在 Product 表不存在
+      const missingSkus = mappedSkus.filter((s) => !productBySkuMap.has(s));
+      if (missingSkus.length > 0) {
+        res.status(400).json({
+          code: 400, data: null,
+          message: `SKU [${missingSkus.join(', ')}] 在本地库存中不存在，请先在【库存 SKU】页面创建对应产品`,
+        });
+        return;
+      }
+
+      // ④ 多仓可用库存强校验（仅当发货单绑定了 warehouseId）
+      const whId = current.warehouseId;
+      if (whId !== null) {
+        const productIds = products.map((p) => p.id);
+        const whStocks   = await prisma.warehouseStock.findMany({
+          where:  { warehouseId: whId, productId: { in: productIds } },
+          select: { productId: true, stockQuantity: true, lockedQuantity: true },
+        });
+        const whStockMap = new Map(whStocks.map((s) => [s.productId, s]));
+
+        const insufficient: string[] = [];
+        for (const appendItem of appendItems) {
+          const sp        = storeProductMap.get(appendItem.storeProductId)!;
+          const product   = productBySkuMap.get(sp.mappedInventorySku!)!;
+          const ws        = whStockMap.get(product.id);
+          const available = ws ? ws.stockQuantity - ws.lockedQuantity : 0;
+          if (available < appendItem.quantity) {
+            insufficient.push(
+              `SKU [${product.sku}] 仓库可用库存 ${available} < 需追加 ${appendItem.quantity}`,
+            );
+          }
+        }
+        if (insufficient.length > 0) {
+          res.status(400).json({
+            code: 400, data: null,
+            message: `库存不足，无法追加：\n${insufficient.join('\n')}`,
+          });
+          return;
+        }
+      }
+
+      // ⑤ 组装 resolvedAppends（带齐事务内所需字段）
+      for (const appendItem of appendItems) {
+        const sp      = storeProductMap.get(appendItem.storeProductId)!;
+        const product = productBySkuMap.get(sp.mappedInventorySku!)!;
+        resolvedAppends.push({
+          storeProductId: appendItem.storeProductId,
+          productId:      product.id,
+          sku:            product.sku!,
+          chineseName:    product.chineseName,
+          purchasePrice:  Number(product.purchasePrice ?? 0),
+          quantity:       appendItem.quantity,
+        });
+      }
+    }
+
+    // ── 事务：主单更新 + 已有行数量修改 + 新行追加 + 锁仓 ──────────
     await prisma.$transaction(async (tx) => {
+      // A. 更新主单头部字段（单号/备注）
       if (Object.keys(updateData).length > 0) {
         await tx.fbeShipment.update({ where: { id }, data: updateData });
       }
-      if (Array.isArray(items) && items.length > 0) {
-        for (const item of items) {
-          if (!item.id || !Number.isInteger(item.id)) continue;
-          if (!item.quantity || !Number.isInteger(item.quantity) || item.quantity <= 0) {
-            throw new Error(`明细 ID ${item.id} 的 quantity 必须为正整数`);
+
+      // B. 更新已有明细行的数量
+      for (const item of updateItems) {
+        await tx.fbeShipmentItem.update({
+          where: { id: item.id },
+          data:  { quantity: item.quantity },
+        });
+      }
+
+      // C. 追加新明细行 + 锁仓（与初次建单逻辑完全对齐）
+      if (resolvedAppends.length > 0) {
+        const whId = current.warehouseId;
+        let addedProductValue = 0;
+
+        for (const ra of resolvedAppends) {
+          // C-1. 创建 FbeShipmentItem 明细行
+          await tx.fbeShipmentItem.create({
+            data: {
+              shipmentId:       id,
+              productId:        ra.productId,
+              quantity:         ra.quantity,
+              receivedQuantity: 0,
+            },
+          });
+
+          // C-2. 锁仓：将追加数量计入 lockedQuantity（防止并发超发）
+          // ★ 与建单时完全一致：PENDING 阶段锁仓，ALLOCATING→SHIPPED 时才实际扣减 stockQuantity
+          if (whId !== null) {
+            try {
+              await tx.warehouseStock.upsert({
+                where:  { productId_warehouseId: { productId: ra.productId, warehouseId: whId } },
+                create: { productId: ra.productId, warehouseId: whId, stockQuantity: 0, lockedQuantity: ra.quantity },
+                update: { lockedQuantity: { increment: ra.quantity } },
+              });
+            } catch (lockErr: any) {
+              throw new Error(
+                `SKU [${ra.sku}] 追加锁仓失败：${lockErr?.message ?? lockErr}`,
+              );
+            }
           }
-          await tx.fbeShipmentItem.update({
-            where: { id: item.id },
-            data:  { quantity: item.quantity },
+
+          // C-3. 累计追加货值（purchasePrice 快照）
+          addedProductValue += ra.quantity * ra.purchasePrice;
+
+          console.log(
+            `[FBE] 发货单 #${id}(${current.shipmentNumber}) 追加新行：` +
+            `SKU=${ra.sku} qty=${ra.quantity} warehouseId=${whId ?? '(兼容模式)'}`,
+          );
+        }
+
+        // C-4. 更新发货单货值快照（追加部分叠加，保持历史数据完整性）
+        if (addedProductValue > 0) {
+          await tx.fbeShipment.update({
+            where: { id },
+            data:  { totalProductValue: { increment: parseFloat(addedProductValue.toFixed(2)) } },
           });
         }
       }
     });
 
-    // 返回更新后的完整数据
+    // ── 返回更新后的完整数据 ─────────────────────────────────────────
     const updated = await prisma.fbeShipment.findUnique({
       where: { id },
       include: {
@@ -492,25 +721,39 @@ router.put('/:id', async (req: Request, res: Response) => {
               select: {
                 id: true, pnk: true, sku: true, title: true, chineseName: true,
                 imageUrl: true, stockActual: true, inTransitQuantity: true,
+                warehouseStocks: {
+                  select: {
+                    warehouseId: true, stockQuantity: true,
+                    lockedQuantity: true, inTransitQuantity: true,
+                    warehouse: { select: { id: true, name: true } },
+                  },
+                },
               },
             },
           },
         },
-        shop:  { select: { id: true, shopName: true, region: true } },
-        owner: { select: { id: true, name: true } },
+        shop:      { select: { id: true, shopName: true, region: true } },
+        warehouse: { select: { id: true, name: true, type: true } },
+        owner:     { select: { id: true, name: true } },
       },
     });
 
     const result = updated ? {
       ...updated,
-      productCount:  updated.items.length,
-      totalQuantity: updated.items.reduce((sum, i) => sum + i.quantity, 0),
+      productCount:   updated.items.length,
+      totalQuantity:  updated.items.reduce((sum, i) => sum + i.quantity, 0),
+      appendedCount:  resolvedAppends.length,
+      appendedSkus:   resolvedAppends.map((r) => r.sku),
     } : null;
 
     res.json({ code: 200, data: result, message: '发货单更新成功' });
   } catch (err: any) {
     const msg = err?.message ?? '服务器内部错误';
-    if (msg.includes('quantity')) {
+    if (
+      msg.includes('quantity') ||
+      msg.includes('库存不足') ||
+      msg.includes('锁仓失败')
+    ) {
       res.status(400).json({ code: 400, data: null, message: msg });
     } else {
       console.error('[FBE] 编辑发货单失败:', msg);
