@@ -8,9 +8,10 @@
  */
 
 import { Router, Request, Response } from 'express';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { authenticate } from '../middleware/auth';
-import { createAlibabaOrder } from '../services/alibabaOrder';
+import { createAlibabaOrder, isAlibabaSpecInvalidError } from '../services/alibabaOrder';
 import { applyStockChange } from './inventory';
 import {
   syncOrderDetail,
@@ -22,6 +23,43 @@ import {
 
 const router = Router();
 router.use(authenticate);
+
+/**
+ * 从「采购计划 → 建单」请求体行解析 Product 主键。
+ * 兼容 productId / product_id / product.id；绝不把行项目自己的 id 当作产品 id。
+ */
+function resolveCreateLocalLineProductId(line: any): number | null {
+  const candidates = [line?.productId, line?.product_id, line?.product?.id];
+  for (const c of candidates) {
+    const n = parseInt(String(c), 10);
+    if (!Number.isNaN(n) && n > 0) return n;
+  }
+  return null;
+}
+
+/**
+ * 为 PurchaseOrderItem 生成应持久化的 productIds JSON。
+ * 优先保留已有合法 JSON；否则按子单 offerId 匹配 Product.externalProductId；一品一单则兜底唯一关联产品。
+ */
+function buildProductIdsJsonForItem(
+  item: { offerId?: string | null; productIds?: string | null },
+  products: Array<{ id: number; externalProductId?: string | null }>,
+): string {
+  try {
+    const parsed: unknown = JSON.parse(item.productIds ?? '[]');
+    if (Array.isArray(parsed) && parsed.length > 0) {
+      const nums = parsed.map((x) => parseInt(String(x), 10)).filter((n) => !Number.isNaN(n) && n > 0);
+      if (nums.length > 0) return JSON.stringify(nums);
+    }
+  } catch { /* ignore */ }
+  const offer = String(item.offerId ?? '').trim();
+  if (offer) {
+    const matched = products.filter((p) => String(p.externalProductId ?? '').trim() === offer);
+    if (matched.length > 0) return JSON.stringify(matched.map((m) => m.id));
+  }
+  if (products.length === 1) return JSON.stringify([products[0].id]);
+  return JSON.stringify(products.map((p) => p.id));
+}
 
 // ─────────────────────────────────────────────────────────────────────
 // POST /api/purchases/create-local
@@ -63,12 +101,15 @@ router.post('/create-local', async (req: Request, res: Response) => {
     }
     const validWarehouseId = wid;
 
-    // 校验产品存在
+    // 校验产品存在（多字段解析 productId，避免前端只传 product.id 等变体导致整单跳过写入）
     const productIds = items
-      .map((i: any) => parseInt(String(i.productId), 10))
-      .filter((id: number) => !isNaN(id) && id > 0);
+      .map((i: any) => resolveCreateLocalLineProductId(i))
+      .filter((id: number | null): id is number => id != null);
     if (productIds.length === 0) {
-      res.status(400).json({ code: 400, data: null, message: 'productId 无效' });
+      res.status(400).json({
+        code: 400, data: null,
+        message: 'productId 无效：请为每项传入 productId（或 product_id / product.id）',
+      });
       return;
     }
 
@@ -85,14 +126,30 @@ router.post('/create-local', async (req: Request, res: Response) => {
     const now     = new Date();
     const dateStr = `${now.getFullYear()}${String(now.getMonth() + 1).padStart(2, '0')}${String(now.getDate()).padStart(2, '0')}`;
     const prefix  = `PO-${dateStr}-`;
-    const todayCount = await prisma.purchaseOrder.count({ where: { orderNo: { startsWith: prefix } } });
+
+    // ★ 单号起始序号：查询当天最大 orderNo 的后缀 +1（取代 count() 防 P2002 撞号）
+    //
+    //   原逻辑 count() 在历史单被删除（rollback / DELETE）后会得到偏小的值，
+    //   导致新生成的序号与仍然存在的单号冲突，触发 Prisma P2002 Unique constraint failed。
+    //
+    //   改用 findFirst + orderBy: 'desc' 精准获取当前最大序号，天然绕开删除留下的序号空洞。
+    //   兜底：orderNo 后缀解析失败时退回 0，保证流程不断。
+    const lastOrderToday = await prisma.purchaseOrder.findFirst({
+      where:   { orderNo: { startsWith: prefix } },
+      orderBy: { orderNo: 'desc' },
+      select:  { orderNo: true },
+    });
+    const lastSeq = lastOrderToday
+      ? parseInt(lastOrderToday.orderNo.slice(prefix.length), 10) || 0
+      : 0;
 
     // ── 一品一单：为每个产品生成独立的采购单 ──────────────────────
     const createdOrders: any[] = [];
-    let seq = todayCount;
+    let seq = lastSeq;
 
     for (const item of items) {
-      const pid = parseInt(String(item.productId), 10);
+      const pid = resolveCreateLocalLineProductId(item);
+      if (pid == null) continue;
       const qty = Math.max(1, parseInt(String(item.quantity), 10) || 1);
       const prod = productMap.get(pid);
       if (!prod) continue;
@@ -170,27 +227,74 @@ router.post('/create-local', async (req: Request, res: Response) => {
       message: `成功创建 ${createdOrders.length} 张采购单`,
     });
   } catch (err: any) {
-    console.error('[POST /api/purchases/create-local]', err?.message ?? err);
-    res.status(500).json({ code: 500, data: null, message: '创建采购单失败' });
+    // ★ 结构化日志：完整记录错误码、目标字段、meta、堆栈，便于链路排查
+    console.error('[POST /api/purchases/create-local]', {
+      code:    err?.code,
+      message: err?.message,
+      meta:    err?.meta,
+      stack:   err?.stack,
+    });
+
+    // ── Prisma 已知错误：提取真实原因透传前端（遵守 .cursorrules 第 4 条）─
+    if (err instanceof Prisma.PrismaClientKnownRequestError) {
+      if (err.code === 'P2002') {
+        const target = Array.isArray(err.meta?.target)
+          ? (err.meta!.target as string[]).join(',')
+          : String(err.meta?.target ?? 'unknown');
+        res.status(409).json({
+          code: 409, data: null,
+          message: `唯一键冲突（${target}），请稍后重试；若反复出现请联系管理员`,
+        });
+        return;
+      }
+      if (err.code === 'P2003') {
+        res.status(400).json({
+          code: 400, data: null,
+          message: `外键约束冲突：${err.meta?.field_name ?? '未知字段'}（关联数据可能已被删除）`,
+        });
+        return;
+      }
+      if (err.code === 'P2025') {
+        res.status(404).json({
+          code: 404, data: null,
+          message: '关联记录不存在，可能产品/仓库已被删除，请刷新页面',
+        });
+        return;
+      }
+    }
+
+    // 兜底：透出真实 message（而非写死的"创建采购单失败"）
+    res.status(500).json({
+      code: 500, data: null,
+      message: `创建采购单失败：${err?.message ?? '未知错误'}`,
+    });
   }
 });
 
 // ─────────────────────────────────────────────────────────────────────
 // POST /api/purchases/fix-in-transit
 //
-// 【一次性历史修复】重新计算所有活跃采购单（PENDING/PLACED/IN_TRANSIT）
-// 的在途库存，并覆盖写入 WarehouseStock.inTransitQuantity。
+// 【对账式历史修复 + 幂等巡检】精准重算所有活跃采购单的在途库存，
+// 并在单个事务内覆写 WarehouseStock.inTransitQuantity，消灭孤儿脏行。
 //
-// 算法：
-//   1. 将所有受影响的 (productId, warehouseId) 的 inTransitQuantity 先清零
-//   2. 遍历全部未完结采购单，按 (productId, warehouseId) 分组累加 purchaseQuantity
-//   3. 批量 upsert 覆盖写入
+// 核心算法（"重算即正确值，单次提交无窗口"）：
+//   Phase A（事务外，只读）：
+//     1. 拉取所有活跃采购单（PENDING/PLACED/IN_TRANSIT/PARTIAL），
+//        以 PurchaseOrderItem.quantity（子单实际下单量）为权威 qty 来源，
+//        按 (productId × warehouseId) 分组求和 → correctMap（期望状态）
+//     2. 拉取当前 DB 中所有 in_transit_quantity > 0 的行 → orphanRows
+//        凡不在 correctMap 中的即为孤儿脏行，需归零
+//   Phase B（单 $transaction 内，写）：
+//     1. 将 correctMap 内每条 (pid, wid) 直接 upsert 为正确值（无中间清零步骤）
+//     2. 将孤儿脏行 in_transit_quantity 归零
+//     所有写操作在同一事务提交，利用 PostgreSQL MVCC：并发读始终见旧快照，
+//     提交瞬间原子切换为新数据，绝无脏读窗口。
 //
-// 幂等性：可重复调用，每次都以正确值覆盖。
+// 幂等性：可重复调用，结果收敛，不会叠加。
 // ─────────────────────────────────────────────────────────────────────
 router.post('/fix-in-transit', async (req: Request, res: Response) => {
   try {
-    // 查所有未完结的采购单（PENDING / PLACED / IN_TRANSIT）及其关联产品
+    // ── Phase A-1：读活跃采购单（以 items.quantity 为权威 qty 来源）────────
     const activeOrders = await prisma.purchaseOrder.findMany({
       where: {
         status:      { in: ['PENDING', 'PLACED', 'IN_TRANSIT', 'PARTIAL'] },
@@ -200,66 +304,135 @@ router.post('/fix-in-transit', async (req: Request, res: Response) => {
         id:          true,
         orderNo:     true,
         warehouseId: true,
+        // ★ 关键变更：qty 来源改为子单实际下单量，而非 Product.purchaseQuantity
+        items: {
+          select: { quantity: true, productIds: true },
+        },
+        // 保留 products 仅用于 FK 正常路径兜底（productIds 为空时降级使用）
         products: {
-          select: { id: true, sku: true, purchaseQuantity: true },
+          select: { id: true, purchaseQuantity: true },
         },
       },
     });
 
-    // 按 (productId, warehouseId) 分组累加在途数量
-    const transitMap = new Map<string, { productId: number; warehouseId: number; qty: number }>();
+    // 按 (productId × warehouseId) 分组累加，构建期望状态 correctMap
+    type TransitEntry = { productId: number; warehouseId: number; qty: number };
+    const correctMap = new Map<string, TransitEntry>();
+
     for (const order of activeOrders) {
       const wid = order.warehouseId!;
-      for (const prod of order.products) {
-        const qty = Math.max(1, prod.purchaseQuantity ?? 1);
-        const key = `${prod.id}_${wid}`;
-        if (transitMap.has(key)) {
-          transitMap.get(key)!.qty += qty;
-        } else {
-          transitMap.set(key, { productId: prod.id, warehouseId: wid, qty });
+
+      // ★ 主路径：从 PurchaseOrderItem.productIds JSON + quantity 计算（精确）
+      let coveredByItems = false;
+      for (const item of order.items) {
+        try {
+          const pids: number[] = JSON.parse(item.productIds ?? '[]');
+          if (pids.length === 0) continue;
+          for (const pid of pids) {
+            const key = `${pid}_${wid}`;
+            const existing = correctMap.get(key);
+            if (existing) {
+              existing.qty += item.quantity;
+            } else {
+              correctMap.set(key, { productId: pid, warehouseId: wid, qty: item.quantity });
+            }
+          }
+          coveredByItems = true;
+        } catch { /* 跳过格式损坏的 productIds */ }
+      }
+
+      // ★ 降级路径：items.productIds 完全为空时，回退到 Product.purchaseQuantity（FK 正常路径）
+      if (!coveredByItems) {
+        for (const prod of order.products) {
+          const qty = Math.max(1, prod.purchaseQuantity ?? 1);
+          const key = `${prod.id}_${wid}`;
+          const existing = correctMap.get(key);
+          if (existing) {
+            existing.qty += qty;
+          } else {
+            correctMap.set(key, { productId: prod.id, warehouseId: wid, qty });
+          }
         }
       }
     }
 
-    // 先清零所有受影响记录，再批量写入正确值（事务保证原子性）
-    const entries = Array.from(transitMap.values());
-    let upsertCount = 0;
-
-    await prisma.$transaction(async (tx) => {
-      // 将所有涉及的 (productId, warehouseId) 的在途库存归零
-      for (const e of entries) {
-        await tx.warehouseStock.upsert({
-          where:  { productId_warehouseId: { productId: e.productId, warehouseId: e.warehouseId } },
-          create: { productId: e.productId, warehouseId: e.warehouseId, inTransitQuantity: e.qty },
-          update: { inTransitQuantity: e.qty },   // 覆盖（非增量），幂等安全
-        });
-        upsertCount++;
-      }
+    // ── Phase A-2：拉取孤儿脏行（有在途但不在任何活跃采购单中的行）─────────
+    const orphanRows = await prisma.warehouseStock.findMany({
+      where: { inTransitQuantity: { gt: 0 } },
+      select: { id: true, productId: true, warehouseId: true, inTransitQuantity: true },
     });
+    const orphans = orphanRows.filter(
+      (r) => !correctMap.has(`${r.productId}_${r.warehouseId}`),
+    );
 
-    const summary = entries.map((e) => ({
-      productId:    e.productId,
-      warehouseId:  e.warehouseId,
-      inTransitQty: e.qty,
+    // ── Phase B：单事务内精准覆写（无清零-写入两步，MVCC 保证无脏读窗口）────
+    const entries = Array.from(correctMap.values());
+    let upsertCount  = 0;
+    let orphanZeroed = 0;
+
+    await prisma.$transaction(
+      async (tx) => {
+        // B-1：将每个活跃 (pid × wid) 直接 upsert 为正确值（单步到位）
+        for (const e of entries) {
+          await tx.warehouseStock.upsert({
+            where:  { productId_warehouseId: { productId: e.productId, warehouseId: e.warehouseId } },
+            create: { productId: e.productId, warehouseId: e.warehouseId, inTransitQuantity: e.qty },
+            update: { inTransitQuantity: e.qty },  // 精确覆盖，非增量，幂等
+          });
+          upsertCount++;
+        }
+
+        // B-2：孤儿脏行归零（有在途但已无对应活跃采购单的 SKU）
+        for (const orphan of orphans) {
+          await tx.warehouseStock.update({
+            where: { id: orphan.id },
+            data:  { inTransitQuantity: 0 },
+          });
+          orphanZeroed++;
+        }
+      },
+      {
+        // 超时保护：条数庞大时给足余量（默认 5s 太短）
+        timeout: 30_000,
+      },
+    );
+
+    const diffLines = orphans.map((o) => ({
+      productId:    o.productId,
+      warehouseId:  o.warehouseId,
+      before:       Number(o.inTransitQuantity),
+      after:        0,
+      reason:       '无活跃采购单，孤儿脏行归零',
     }));
 
     console.log(
       `[fix-in-transit] 修复完成：扫描 ${activeOrders.length} 张活跃采购单，` +
-      `更新 ${upsertCount} 条 (productId × warehouseId) 在途库存记录`,
+      `upsert ${upsertCount} 条正确值，归零孤儿 ${orphanZeroed} 条`,
     );
 
     res.json({
       code: 200,
       data: {
-        scannedOrders: activeOrders.length,
-        updatedRecords: upsertCount,
-        detail: summary,
+        scannedOrders:  activeOrders.length,
+        upsertedRecords: upsertCount,
+        orphanZeroed,
+        correctDetail:  entries.map((e) => ({
+          productId:    e.productId,
+          warehouseId:  e.warehouseId,
+          inTransitQty: e.qty,
+        })),
+        orphanDetail: diffLines,
       },
-      message: `在途库存修复完成：${activeOrders.length} 张活跃采购单，${upsertCount} 条库存记录已重算`,
+      message:
+        `在途库存修复完成：${activeOrders.length} 张活跃采购单，` +
+        `${upsertCount} 条已精准覆写，${orphanZeroed} 条孤儿脏行已归零`,
     });
   } catch (err: any) {
     console.error('[POST /api/purchases/fix-in-transit]', err?.message ?? err);
-    res.status(500).json({ code: 500, data: null, message: '在途库存修复失败' });
+    res.status(500).json({
+      code: 500, data: null,
+      message: `在途库存修复失败：${err?.message ?? '未知错误'}`,
+    });
   }
 });
 
@@ -309,6 +482,7 @@ router.get('/', async (req: Request, res: Response) => {
       case 'IN_TRANSIT':  statusFilter = 'IN_TRANSIT';  break;
       case 'PARTIAL':     statusFilter = 'PARTIAL';     break;
       case 'RECEIVED':    statusFilter = 'RECEIVED';    break;
+      case 'CANCELLED':   statusFilter = 'CANCELLED';   break;
       // ALL / 空值 / 未知值 → statusFilter = undefined（返回全部）
     }
 
@@ -418,10 +592,11 @@ router.get('/', async (req: Request, res: Response) => {
     ]);
 
     // ── 各 Tab 计数（一次性返回，前端可直接渲染徽标）──────────────
-    const [cntPending, cntPurchasing, cntCompleted] = await prisma.$transaction([
+    const [cntPending, cntPurchasing, cntCompleted, cntCancelled] = await prisma.$transaction([
       prisma.purchaseOrder.count({ where: { status: 'PENDING' } }),
       prisma.purchaseOrder.count({ where: { status: { in: ['PLACED', 'IN_TRANSIT', 'PARTIAL'] } } }),
       prisma.purchaseOrder.count({ where: { status: 'RECEIVED' } }),
+      prisma.purchaseOrder.count({ where: { status: 'CANCELLED' } }),
     ]);
 
     // ── 兜底补查：收集 items.productIds 中引用但 products 关联缺失的产品 ──
@@ -456,7 +631,7 @@ router.get('/', async (req: Request, res: Response) => {
     }
 
     // ── 合并 products 信息进 items，前端子表直接读 items[i].* ─────
-    const list = rawList.map((o) => {
+    const list = await Promise.all(rawList.map(async (o) => {
       const rawItems    = (o as any).items    as any[] ?? [];
       const rawProducts = (o as any).products as any[] ?? [];
       const prodById    = new Map<number, any>(rawProducts.map((p: any) => [p.id, p]));
@@ -467,11 +642,39 @@ router.get('/', async (req: Request, res: Response) => {
 
       const mergedItems = rawItems.map((item: any, idx: number) => {
         let prod: any = null;
+        let productId: number | null = null;
         try {
           const pids: number[] = JSON.parse(item.productIds ?? '[]');
-          if (pids.length > 0) prod = prodById.get(pids[0]);
+          if (pids.length > 0) {
+            productId = pids[0];
+            prod = prodById.get(pids[0]) ?? null;
+          }
         } catch { /* ignore */ }
         if (!prod) prod = rawProducts[idx] ?? null;
+        // 兜底：若 JSON 解析失败但 prod 已通过 rawProducts 兜底拿到，确保 productId 同步
+        if (productId == null && prod?.id != null) productId = prod.id;
+        // 坏账兜底①：productIds 空/脏时，用子单 offerId 对齐 Product.externalProductId（含 fallbackProdMap 补查到的产品）
+        if (productId == null) {
+          const offerTrim = String(item.offerId ?? '').trim();
+          if (offerTrim) {
+            const p = Array.from(prodById.values()).find(
+              (rp: any) => String(rp.externalProductId ?? '').trim() === offerTrim,
+            );
+            if (p) {
+              productId = p.id;
+              prod = prod ?? p;
+            }
+          }
+        }
+        // 坏账兜底②：一品一单：当前单关联产品唯一时直接对齐
+        if (productId == null) {
+          const allProds = Array.from(prodById.values());
+          if (allProds.length === 1) {
+            const only = allProds[0];
+            productId = only.id;
+            prod = prod ?? only;
+          }
+        }
 
         return {
           id:                 item.id,
@@ -485,7 +688,7 @@ router.get('/', async (req: Request, res: Response) => {
           logisticsCompany:   item.logisticsCompany   ?? null,
           logisticsNo:        item.logisticsNo        ?? null,
           // ★ 合并进来的产品字段，前端直接读
-          productId:          prod?.id                ?? null,
+          productId,                                           // ★ 产品真实主键（解析自 productIds JSON，前端绑定接口必须用此值）
           sku:                prod?.sku               ?? null,
           chineseName:        prod?.chineseName       ?? null,
           imageUrl:           prod?.imageUrl          ?? null,
@@ -501,11 +704,75 @@ router.get('/', async (req: Request, res: Response) => {
         };
       });
 
+      // 坏账兜底③：仍缺 productId 时，按 purchaseOrderId 反查产品（重下单释放 FK 后 include.products 常为空）
+      if (mergedItems.some((mi) => mi.productId == null)) {
+        const extra = await prisma.product.findMany({
+          where: { purchaseOrderId: o.id },
+          select: {
+            id: true, sku: true, chineseName: true, imageUrl: true,
+            purchasePrice: true, purchaseQuantity: true, purchaseUrl: true,
+            externalProductId: true, externalSkuId: true, externalSkuIdNum: true,
+            externalSynced: true, externalOrderId: true,
+          },
+        });
+        const patchMi = (mi: any, p: any) => {
+          mi.productId = p.id;
+          mi.sku = mi.sku ?? p.sku ?? null;
+          mi.chineseName = mi.chineseName ?? p.chineseName ?? null;
+          mi.imageUrl = mi.imageUrl ?? p.imageUrl ?? null;
+          if (mi.purchasePrice == null && p.purchasePrice != null) mi.purchasePrice = Number(p.purchasePrice);
+          mi.purchaseUrl = mi.purchaseUrl ?? p.purchaseUrl ?? null;
+          mi.externalProductId = mi.externalProductId ?? p.externalProductId ?? null;
+          mi.externalSkuId = mi.externalSkuId ?? p.externalSkuId ?? null;
+          mi.externalSkuIdNum = mi.externalSkuIdNum ?? p.externalSkuIdNum ?? null;
+          mi.externalSynced = Boolean(mi.externalSynced) || Boolean(p.externalSynced);
+          mi.externalOrderId = mi.externalOrderId ?? p.externalOrderId ?? null;
+        };
+        for (const mi of mergedItems) {
+          if (mi.productId != null) continue;
+          if (extra.length === 1) {
+            patchMi(mi, extra[0]);
+          } else if (extra.length > 1 && mi.offerId) {
+            const ot = String(mi.offerId).trim();
+            const hit = extra.find((x) => String(x.externalProductId ?? '').trim() === ot);
+            if (hit) patchMi(mi, hit);
+          }
+        }
+        // 最后手段：本单已无 purchaseOrderId 挂载（如 CANCELLED 释放后），按子单 offerId 全局唯一定位产品
+        for (const mi of mergedItems) {
+          if (mi.productId != null) continue;
+          const ot = String(mi.offerId ?? '').trim();
+          if (!ot) continue;
+          const one = await prisma.product.findFirst({
+            where: { externalProductId: ot, isDeleted: false },
+            select: {
+              id: true, sku: true, chineseName: true, imageUrl: true,
+              purchasePrice: true, purchaseQuantity: true, purchaseUrl: true,
+              externalProductId: true, externalSkuId: true, externalSkuIdNum: true,
+              externalSynced: true, externalOrderId: true,
+            },
+          });
+          if (one) patchMi(mi, one);
+        }
+      }
+
+      // ★ 聚合 1688 实际金额到父级（一品一单：直取 items[0] 的值）
+      //   mergedItems 为空（历史脏数据）或字段未回填（PENDING 状态）时安全兜底 null。
+      const firstItem = mergedItems[0] ?? null;
+      const alibabaTotalAmount = firstItem?.alibabaTotalAmount != null
+        ? firstItem.alibabaTotalAmount
+        : null;
+      const shippingFee = firstItem?.shippingFee != null
+        ? firstItem.shippingFee
+        : null;
+
       return {
         id:              o.id,
         orderNo:         o.orderNo,
         operator:        o.operator,
-        totalAmount:     Number(o.totalAmount),
+        totalAmount:        Number(o.totalAmount),  // 本地参考总金额（建单时快照：采购价 × 数量）
+        alibabaTotalAmount,                          // 1688 实际下单总金额（含运费，1688 接口回填）
+        shippingFee,                                 // 1688 实际运费
         itemCount:       o.itemCount,
         status:          o.status,
         remark:          (o as any).remark           ?? null,
@@ -520,17 +787,18 @@ router.get('/', async (req: Request, res: Response) => {
         products:        Array.from(prodById.values()),  // ← 含兜底补查，向后兼容
         warehouse:       (o as any).warehouse ?? null,
       };
-    });
+    }));
 
     res.json({
       code: 200,
       data: {
         total, page, pageSize, list,
         tabCounts: {
-          ALL:        cntPending + cntPurchasing + cntCompleted,
+          ALL:        cntPending + cntPurchasing + cntCompleted + cntCancelled,
           PENDING:    cntPending,
           PURCHASING: cntPurchasing,
           COMPLETED:  cntCompleted,
+          CANCELLED:  cntCancelled,
         },
       },
       message: 'success',
@@ -1239,7 +1507,11 @@ router.get('/:id', async (req: Request, res: Response) => {
           select: {
             id: true, sku: true, chineseName: true, title: true, imageUrl: true,
             purchasePrice: true, purchaseQuantity: true, purchaseUrl: true,
-            externalProductId: true, externalSkuId: true, externalOrderId: true,
+            externalProductId: true,
+            externalSkuId:     true,
+            externalSkuIdNum:  true,   // 1688 skuId 纯数字兜底
+            externalSynced:    true,   // 换链失效标识（false = 需重新绑规格）
+            externalOrderId:   true,
           },
         },
         warehouse: { select: { id: true, name: true, type: true, status: true } },
@@ -1251,7 +1523,119 @@ router.get('/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    res.json({ code: 200, data: order, message: 'success' });
+    // ── 将 products 建 Map，为 items 补充干净的 productId 整数字段 ──────────
+    // 背景：PurchaseOrderItem 通过 productIds JSON 字符串（如 "[12345]"）关联产品，
+    //   没有直接的 productId 外键字段。前端下单弹窗需要产品真实 ID 调用绑定接口，
+    //   必须在此处解析并输出，否则前端只能读到 item.id（子单主键）而误用。
+    let prodById = new Map<number, any>(
+      ((order as any).products as any[] ?? []).map((p: any) => [p.id, p]),
+    );
+
+    const itemsRaw = ((order as any).items as any[] ?? []);
+
+    const mergeDetailItems = (prodMap: Map<number, any>) =>
+      itemsRaw.map((item: any) => {
+        let prod: any = null;
+        let productId: number | null = null;
+        try {
+          const pids: number[] = JSON.parse(item.productIds ?? '[]');
+          if (pids.length > 0) {
+            productId = pids[0];
+            prod = prodMap.get(pids[0]) ?? null;
+          }
+        } catch { /* ignore */ }
+        if (productId == null && prod?.id != null) productId = prod.id;
+        const vals = Array.from(prodMap.values());
+        if (productId == null) {
+          const offerTrim = String(item.offerId ?? '').trim();
+          if (offerTrim) {
+            const p = vals.find((rp: any) => String(rp.externalProductId ?? '').trim() === offerTrim);
+            if (p) {
+              productId = p.id;
+              prod = prod ?? p;
+            }
+          }
+        }
+        if (productId == null && vals.length === 1) {
+          const only = vals[0];
+          productId = only.id;
+          prod = prod ?? only;
+        }
+        return {
+          ...item,
+          productId,
+          sku:               prod?.sku               ?? null,
+          chineseName:       prod?.chineseName       ?? null,
+          imageUrl:          prod?.imageUrl          ?? null,
+          purchasePrice:     prod?.purchasePrice != null ? Number(prod.purchasePrice) : null,
+          purchaseUrl:       prod?.purchaseUrl       ?? null,
+          externalProductId: prod?.externalProductId ?? null,
+          externalSkuId:     prod?.externalSkuId     ?? null,
+          externalSkuIdNum:  prod?.externalSkuIdNum  ?? null,
+          externalSynced:    prod?.externalSynced    ?? false,
+          externalOrderId:   prod?.externalOrderId   ?? null,
+        };
+      });
+
+    let itemsWithProductId = mergeDetailItems(prodById);
+    if (itemsWithProductId.some((r) => r.productId == null)) {
+      const extra = await prisma.product.findMany({
+        where: { purchaseOrderId: id },
+        select: {
+          id: true, sku: true, chineseName: true, title: true, imageUrl: true,
+          purchasePrice: true, purchaseQuantity: true, purchaseUrl: true,
+          externalProductId: true,
+          externalSkuId:     true,
+          externalSkuIdNum:  true,
+          externalSynced:    true,
+          externalOrderId:   true,
+        },
+      });
+      for (const p of extra) {
+        if (!prodById.has(p.id)) prodById.set(p.id, p);
+      }
+      itemsWithProductId = mergeDetailItems(prodById);
+    }
+
+    if (itemsWithProductId.some((r) => r.productId == null)) {
+      for (const row of itemsWithProductId) {
+        if (row.productId != null) continue;
+        const ot = String((row as any).offerId ?? '').trim();
+        if (!ot) continue;
+        const one = await prisma.product.findFirst({
+          where: { externalProductId: ot, isDeleted: false },
+          select: {
+            id: true, sku: true, chineseName: true, title: true, imageUrl: true,
+            purchasePrice: true, purchaseQuantity: true, purchaseUrl: true,
+            externalProductId: true,
+            externalSkuId:     true,
+            externalSkuIdNum:  true,
+            externalSynced:    true,
+            externalOrderId:   true,
+          },
+        });
+        if (!one) continue;
+        (row as any).productId = one.id;
+        (row as any).sku = (row as any).sku ?? one.sku ?? null;
+        (row as any).chineseName = (row as any).chineseName ?? one.chineseName ?? null;
+        (row as any).imageUrl = (row as any).imageUrl ?? one.imageUrl ?? null;
+        if ((row as any).purchasePrice == null && one.purchasePrice != null) {
+          (row as any).purchasePrice = Number(one.purchasePrice);
+        }
+        (row as any).purchaseUrl = (row as any).purchaseUrl ?? one.purchaseUrl ?? null;
+        (row as any).externalProductId = (row as any).externalProductId ?? one.externalProductId ?? null;
+        (row as any).externalSkuId = (row as any).externalSkuId ?? one.externalSkuId ?? null;
+        (row as any).externalSkuIdNum = (row as any).externalSkuIdNum ?? one.externalSkuIdNum ?? null;
+        (row as any).externalSynced = Boolean((row as any).externalSynced) || Boolean(one.externalSynced);
+        (row as any).externalOrderId = (row as any).externalOrderId ?? one.externalOrderId ?? null;
+      }
+    }
+
+    res.json({
+      code: 200,
+      data: { ...order, items: itemsWithProductId },
+      message: 'success',
+    });
   } catch (err: any) {
     console.error('[GET /api/purchases/:id]', err?.message ?? err);
     res.status(500).json({ code: 500, data: null, message: '获取采购单详情失败' });
@@ -1286,7 +1670,11 @@ router.post('/:id/place-1688-order', async (req: Request, res: Response) => {
     const order = await prisma.purchaseOrder.findUnique({
       where: { id },
       include: {
-        items:    { select: { id: true, offerId: true, quantity: true, alibabaOrderId: true } },
+        items: {
+          select: {
+            id: true, offerId: true, productIds: true, quantity: true, alibabaOrderId: true,
+          },
+        },
         products: {
           select: {
             id: true, sku: true, chineseName: true,
@@ -1384,25 +1772,11 @@ router.post('/:id/place-1688-order', async (req: Request, res: Response) => {
     if (!result.success) {
       console.error(`[place-1688-order] 1688 下单失败 PO#${id}:`, result.errorMessage);
 
-      // ★ SPEC_NOT_FOUND 防御：若 1688 返回规格不存在/已下架，自动重置本地规格映射
-      // 1688 规格串货错误码：500_003；也扫描 raw 响应中的中文描述（errorMessage 可能是兜底"未知错误"）
-      const rawErrStr = JSON.stringify(result.raw ?? '').toLowerCase();
-      const errStr    = `${result.errorCode ?? ''} ${result.errorMessage ?? ''} ${rawErrStr}`.toLowerCase();
-      const isSpecError =
-        result.errorCode === '500_003'      ||   // 1688：规格不属于该商品（最常见）
-        errStr.includes('spec_not_found')   ||
-        errStr.includes('spec not found')   ||
-        errStr.includes('cargo_not_match')  ||
-        errStr.includes('cargo not match')  ||
-        errStr.includes('invalid_specid')   ||
-        errStr.includes('invalid specid')   ||
-        errStr.includes('specid')           ||
-        errStr.includes('不属于商品')        ||   // "规格[xxx] 不属于商品[xxx]"
-        errStr.includes('规格不存在')        ||
-        errStr.includes('规格已下架')        ||
-        errStr.includes('规格.*不属于')      ||
-        errStr.includes('sku不存在')         ||
-        errStr.includes('sku not exist');
+      // ★ 精准 SPEC_INVALID 防御：
+      // 只有 1688 明确返回 offer/spec/sku 不存在、不匹配、商品已下架等“绑定失效”语义时，
+      // 才允许自动清空本地规格绑定。余额不足、地址错误、专供品声明、起批量等业务错误
+      // 必须原样返回前端，绝对禁止篡改本地 SKU 绑定状态。
+      const isSpecError = isAlibabaSpecInvalidError(result);
 
       if (isSpecError) {
         const affectedIds = validProducts.map((p) => p.id);
@@ -1435,6 +1809,7 @@ router.post('/:id/place-1688-order', async (req: Request, res: Response) => {
           errorCode:    result.errorCode,
           errorMessage: result.errorMessage,
           raw:          result.raw,
+          autoReset:    false,
         },
         message: `1688 下单失败: ${result.errorMessage}`,
       });
@@ -1452,14 +1827,16 @@ router.post('/:id/place-1688-order', async (req: Request, res: Response) => {
 
     // ── 回填数据库 ────────────────────────────────────────────────
     await prisma.$transaction(async (tx) => {
-      // 更新子单
+      // 更新子单（★ 同步补全 productIds JSON，避免历史/异常路径下子单缺关联导致前端 productId 恒为 null）
       for (const item of order.items) {
+        const productIdsJson = buildProductIdsJsonForItem(item, order.products);
         await tx.purchaseOrderItem.update({
           where: { id: item.id },
           data: {
             alibabaOrderId:     aliOrderId,
             alibabaOrderStatus: 'waitbuyerpay',
             alibabaTotalAmount: aliTotalAmount > 0 ? aliTotalAmount : undefined,
+            productIds:         productIdsJson,
           },
         });
       }
@@ -1538,8 +1915,10 @@ router.post('/:id/bind-1688-order', async (req: Request, res: Response) => {
     const order = await prisma.purchaseOrder.findUnique({
       where: { id },
       include: {
-        items:    { select: { id: true, alibabaOrderId: true } },
-        products: { select: { id: true } },
+        items: {
+          select: { id: true, alibabaOrderId: true, offerId: true, productIds: true },
+        },
+        products: { select: { id: true, externalProductId: true } },
       },
     });
 
@@ -1576,6 +1955,15 @@ router.post('/:id/bind-1688-order', async (req: Request, res: Response) => {
           alibabaOrderStatus: 'waitbuyerpay',   // 线下下单默认为待付款
         },
       });
+
+      // 1b. 逐子单补全 productIds（与 place-1688-order 一致，修复坏账）
+      for (const item of order.items) {
+        const productIdsJson = buildProductIdsJsonForItem(item, order.products);
+        await tx.purchaseOrderItem.update({
+          where: { id: item.id },
+          data:  { productIds: productIdsJson },
+        });
+      }
 
       // 2. 主单状态 → PLACED，同步回填 1688 订单号 + 供应商至主单
       await tx.purchaseOrder.update({
@@ -2338,6 +2726,160 @@ router.post('/:id/rollback', async (req: Request, res: Response) => {
 });
 
 // ─────────────────────────────────────────────────────────────────────
+// POST /api/purchases/:id/cancel-and-release
+//
+// 1688 交易取消后：冻结旧采购单 + 释放产品需求回采购计划
+//
+// 业务背景：1688 订单被取消（alibabaOrderStatus = 'cancelled'/'closed'）后，
+//   不能复用旧 PO ID 去绑定新的 1688 订单（财务对账需要旧凭据完整保留）。
+//   本接口将旧 PO 冻结为 CANCELLED 状态（保留全部 1688 订单信息作为历史凭据），
+//   同时释放关联产品需求，使其重新出现在采购计划列表，由业务员重新建单下单。
+//
+// 前置条件：
+//   ① PO 必须存在
+//   ② PO 状态必须为 PLACED（已下单过 1688）
+//   ③ 至少一个 PurchaseOrderItem 的 alibabaOrderStatus 为 'cancelled' 或 'closed'
+//
+// 事务逻辑：
+//   ① 主单：status → CANCELLED（旧单完整冻结，alibabaOrderId 等信息绝不清空）
+//   ② 关联产品：purchaseOrderId → null，status → PURCHASING，externalOrderId → null
+//      ★ 绝对不清空 externalSynced / externalSkuId（保留用户规格绑定成果）
+//   ③ PurchaseOrderItem：保持不变（历史凭据，一字不改）
+// ─────────────────────────────────────────────────────────────────────
+router.post('/:id/cancel-and-release', async (req: Request, res: Response) => {
+  try {
+    const id = parseInt(String(req.params.id), 10);
+    if (isNaN(id) || id <= 0) {
+      res.status(400).json({ code: 400, data: null, message: '采购单 ID 无效' });
+      return;
+    }
+
+    // ── 查主单 + items（取消校验 + 在途扣减用）+ products（释放用）────────────────
+    const order = await prisma.purchaseOrder.findUnique({
+      where: { id },
+      include: {
+        items:    { select: { id: true, alibabaOrderStatus: true, quantity: true } },
+        products: { select: { id: true, sku: true } },
+      },
+    });
+
+    if (!order) {
+      res.status(404).json({ code: 404, data: null, message: '采购单不存在' });
+      return;
+    }
+
+    // ① 状态校验：只允许 PLACED 状态执行取消释放
+    if (order.status !== 'PLACED') {
+      const statusLabel: Record<string, string> = {
+        PENDING:    '待下单',
+        IN_TRANSIT: '运输中',
+        PARTIAL:    '部分入库',
+        RECEIVED:   '已全部入库',
+        CANCELLED:  '已取消',
+      };
+      const label = statusLabel[order.status] ?? order.status;
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: `该采购单当前状态为「${label}」，仅"已下单（PLACED）"状态的采购单支持取消释放操作`,
+      });
+      return;
+    }
+
+    // ② 子单取消状态校验：至少一条 item 的 1688 状态为 cancelled 或 closed
+    const CANCEL_STATUSES = new Set(['cancelled', 'closed']);
+    const hasCancelledItem = order.items.some(
+      (item) => item.alibabaOrderStatus && CANCEL_STATUSES.has(item.alibabaOrderStatus),
+    );
+    if (!hasCancelledItem) {
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: '该采购单的 1688 订单尚未取消（alibabaOrderStatus 不是 cancelled/closed），请先在 1688 平台确认取消后再操作',
+      });
+      return;
+    }
+
+    const username = req.user!.username ?? 'unknown';
+    const warehouseId = order.warehouseId ?? null;
+
+    // 统计各产品应扣减的在途数量（按 item.quantity 汇总，一品一单通常只有一条）
+    const totalQtyByProductId = new Map<number, number>();
+    for (const item of order.items) {
+      // productIds JSON → 解析出关联产品 ID，与 items.quantity 对应
+      // 一品一单场景：每个 item 对应唯一产品，直接按 order.products 映射（若 productIds 为空）
+      // 此处保守策略：将 totalQty 均摊给本单所有产品（一品一单下 products.length === 1，安全）
+    }
+    // 一品一单铁律：item 数量 = 产品采购数量；多 item 场景按各自 quantity 汇总给对应产品
+    const totalItemQty = order.items.reduce((s, item) => s + (item.quantity ?? 0), 0);
+
+    await prisma.$transaction(async (tx) => {
+      // ① 冻结主单：status → CANCELLED，历史 1688 信息原封不动保留
+      await tx.purchaseOrder.update({
+        where: { id },
+        data: { status: 'CANCELLED' },
+      });
+
+      // ② 扣减在途库存（★ 核心修复：PLACED 状态建单时 create-local 已 increment inTransitQuantity，
+      //    取消时必须 decrement，否则产品重建新采购单后会被再次 increment，造成双倍在途）
+      if (warehouseId && order.products.length > 0) {
+        for (const prod of order.products) {
+          // 一品一单：单产品 qty = 该产品对应 item 的 quantity；取全部 items 之和作为安全上界
+          const qty = totalItemQty > 0 ? totalItemQty : 1;
+          await tx.warehouseStock.updateMany({
+            where: { productId: prod.id, warehouseId },
+            data:  { inTransitQuantity: { decrement: qty } },
+          });
+          // 同步 Product.inTransitQuantity（Product 表冗余字段，与 WarehouseStock 保持一致）
+          await tx.product.update({
+            where: { id: prod.id },
+            data:  { inTransitQuantity: { decrement: qty } },
+          });
+        }
+      }
+
+      // ③ 释放关联产品需求：解除绑定，退回采购计划
+      //    ★ externalSynced / externalSkuId / externalProductId 绝不清空（规格绑定成果保留）
+      if (order.products.length > 0) {
+        await tx.product.updateMany({
+          where: { id: { in: order.products.map((p) => p.id) } },
+          data: {
+            purchaseOrderId: null,       // 解除与旧采购单的绑定，产品重回采购计划列表
+            status:          'PURCHASING', // 退回采购中状态，出现在 GET /api/products/purchasing
+            externalOrderId: null,         // 清空已取消的 1688 订单号引用
+            // externalSynced / externalSkuId / externalProductId ← 保留，不动
+          },
+        });
+      }
+
+      // ④ PurchaseOrderItem：不做任何修改，作为完整的历史凭据冻结
+    });
+
+    console.log(
+      `[cancel-and-release] ${username} 取消采购单 #${id}(${order.orderNo})，` +
+      `释放 ${order.products.length} 个产品回采购计划，PO 历史凭据完整保留`,
+    );
+
+    res.json({
+      code: 200,
+      data: {
+        orderId:           id,
+        orderNo:           order.orderNo,
+        prevStatus:        'PLACED',
+        currentStatus:     'CANCELLED',
+        releasedCount:     order.products.length,
+        releasedSkus:      order.products.map((p) => p.sku ?? `#${p.id}`),
+        inTransitDeducted: warehouseId ? totalItemQty * order.products.length : 0,
+      },
+      message: `采购单 ${order.orderNo} 已取消冻结，${order.products.length} 个产品已退回采购计划，规格映射保留${warehouseId ? `，已扣减在途库存 ${totalItemQty} 件` : ''}`,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/purchases/:id/cancel-and-release]', err?.message ?? err);
+    res.status(500).json({ code: 500, data: null, message: `取消采购单失败：${err?.message ?? '未知错误'}` });
+  }
+});
+
+// ─────────────────────────────────────────────────────────────────────
 // DELETE /api/purchases/:id
 //
 // 作废并物理删除采购单（仅允许 PENDING 状态）
@@ -2388,79 +2930,86 @@ router.delete('/:id', async (req: Request, res: Response) => {
 
     const username = req.user!.username ?? 'unknown';
 
-    await prisma.$transaction(async (tx) => {
-      // ── 构建完整产品 ID → 数量映射（兼容 FK 断裂兜底路径）────────────────
-      // 正常路径：order.products 通过 purchaseOrderId FK 直接关联
-      const prodQuantityMap = new Map<number, number>(
-        order.products.map((p) => [p.id, Math.max(1, p.purchaseQuantity ?? 1)]),
-      );
+    // ── 构建 productId → qty 映射（事务外预计算，qty 权威来源：items.quantity）───
+    //
+    // 主路径：解析 PurchaseOrderItem.productIds JSON + item.quantity（精确下单量）
+    // 降级路径：item.productIds 为空/损坏时，从 products FK 路径兜底（purchaseQuantity）
+    // 两路合并 → allPidQtyMap：完整、精确、无遗漏的"需扣减在途量"映射
+    const allPidQtyMap = new Map<number, number>();
 
-      // 兜底路径：从 items.productIds JSON 中提取可能因 FK 覆盖而断裂的产品 ID
-      const allPidSet = new Set<number>(order.products.map((p) => p.id));
-      for (const item of (order as any).items as Array<{ productIds: string | null; quantity: number }>) {
-        try {
-          const pids: number[] = JSON.parse(item.productIds ?? '[]');
-          for (const pid of pids) allPidSet.add(pid);
-        } catch { /* ignore malformed JSON */ }
-      }
-      const missingPids = [...allPidSet].filter((pid) => !prodQuantityMap.has(pid));
-      if (missingPids.length > 0) {
-        const fallbackProds = await tx.product.findMany({
-          where:  { id: { in: missingPids } },
-          select: { id: true, purchaseQuantity: true },
-        });
-        for (const fp of fallbackProds) {
-          prodQuantityMap.set(fp.id, Math.max(1, fp.purchaseQuantity ?? 1));
+    for (const item of order.items) {
+      try {
+        const pids: number[] = JSON.parse(item.productIds ?? '[]');
+        if (pids.length > 0) {
+          for (const pid of pids) {
+            allPidQtyMap.set(pid, (allPidQtyMap.get(pid) ?? 0) + item.quantity);
+          }
+          continue;  // 主路径成功，跳过降级
         }
+      } catch { /* productIds 格式损坏，降级 */ }
+    }
+    // 降级：FK 路径中存在但主路径未覆盖的产品
+    for (const prod of order.products) {
+      if (!allPidQtyMap.has(prod.id)) {
+        allPidQtyMap.set(prod.id, Math.max(1, prod.purchaseQuantity ?? 1));
       }
+    }
 
-      // ② 释放关联产品：解除采购单绑定，状态退回采购计划（PURCHASING）
-      //    purchaseOrderId: null → 产品重新出现在 GET /api/products/purchasing 列表
-      if (order.products.length > 0) {
-        await tx.product.updateMany({
-          where: { id: { in: order.products.map((p) => p.id) } },
-          data: {
-            purchaseOrderId: null,
-            status:          'PURCHASING',
-          },
-        });
-      }
+    // 用于 product.updateMany 的完整产品 ID 集合（主路径 + FK 路径的并集）
+    const allPidList = [...new Set([
+      ...allPidQtyMap.keys(),
+      ...order.products.map((p) => p.id),
+    ])];
 
-      // ★ 扣减在途库存：精准 + else 兜底，绝对不依赖 warehouseId 非空
-      //   - 精准路径：order.warehouseId 存在 → 只 UPDATE 目标仓，避免误扣其他仓
-      //   - 兜底路径：warehouseId 为 null（历史脏数据）→ 扫描该产品所有在途 > 0 的仓库记录
-      //   PostgreSQL UPDATE 在事务内对匹配行自动加行级锁，防并发重复扣减
-      for (const [pid, qty] of prodQuantityMap) {
-        if (order.warehouseId) {
-          await tx.$executeRaw`
-            UPDATE warehouse_stocks
-            SET    in_transit_quantity = GREATEST(0, in_transit_quantity - ${qty})
-            WHERE  product_id = ${pid}
-            AND    warehouse_id = ${order.warehouseId}
-          `;
-        } else {
-          // warehouseId 为 null 的历史脏数据：全仓扫描，扣减所有有在途记录的行
-          await tx.$executeRaw`
-            UPDATE warehouse_stocks
-            SET    in_transit_quantity = GREATEST(0, in_transit_quantity - ${qty})
-            WHERE  product_id = ${pid}
-            AND    in_transit_quantity > 0
-          `;
+    await prisma.$transaction(
+      async (tx) => {
+        // ① 释放关联产品：purchaseOrderId → null，status → PURCHASING
+        //    覆盖完整 allPidList（含 FK 断裂兜底到的产品），确保无遗漏
+        if (allPidList.length > 0) {
+          await tx.product.updateMany({
+            where: { id: { in: allPidList } },
+            data: {
+              purchaseOrderId: null,
+              status:          'PURCHASING',
+            },
+          });
         }
-      }
 
-      // ③ 删除子单（FK 约束：必须先于主单删除）
-      await tx.purchaseOrderItem.deleteMany({
-        where: { purchaseOrderId: id },
-      });
+        // ② 扣减在途库存（权威 qty 来自 items.quantity，精确扣减，GREATEST 防负数）
+        //    精准路径：order.warehouseId 非空 → 只操作目标仓（行级锁防并发双扣）
+        //    兜底路径：warehouseId 为 null（历史脏数据）→ 扫全仓所有在途 > 0 的行
+        for (const [pid, qty] of allPidQtyMap) {
+          if (order.warehouseId) {
+            await tx.$executeRaw`
+              UPDATE warehouse_stocks
+              SET    in_transit_quantity = GREATEST(0, in_transit_quantity - ${qty})
+              WHERE  product_id   = ${pid}
+              AND    warehouse_id = ${order.warehouseId}
+            `;
+          } else {
+            await tx.$executeRaw`
+              UPDATE warehouse_stocks
+              SET    in_transit_quantity = GREATEST(0, in_transit_quantity - ${qty})
+              WHERE  product_id        = ${pid}
+              AND    in_transit_quantity > 0
+            `;
+          }
+        }
 
-      // ④ 物理删除主单
-      await tx.purchaseOrder.delete({ where: { id } });
-    });
+        // ③ 删除子单（FK Cascade 约束：必须先于主单执行）
+        await tx.purchaseOrderItem.deleteMany({ where: { purchaseOrderId: id } });
+
+        // ④ 物理删除主单
+        await tx.purchaseOrder.delete({ where: { id } });
+
+        // 四步均在同一 PostgreSQL 事务内：任一步抛错立即 ROLLBACK，绝无半程脏数据
+      },
+      { timeout: 15_000 },
+    );
 
     console.log(
       `[DELETE /api/purchases/${id}] ${username} 作废采购单 ${order.orderNo}，` +
-      `释放 ${order.products.length} 个产品回采购计划`,
+      `释放 ${allPidList.length} 个产品回采购计划，扣减在途 ${[...allPidQtyMap.values()].reduce((s, q) => s + q, 0)} 件`,
     );
 
     res.json({
@@ -2468,14 +3017,17 @@ router.delete('/:id', async (req: Request, res: Response) => {
       data: {
         deletedId:      id,
         orderNo:        order.orderNo,
-        releasedCount:  order.products.length,
+        releasedCount:  allPidList.length,
         releasedSkus:   order.products.map((p) => p.sku ?? `#${p.id}`),
       },
-      message: `采购单 ${order.orderNo} 已作废，${order.products.length} 个产品已退回采购计划`,
+      message: `采购单 ${order.orderNo} 已作废，${allPidList.length} 个产品已退回采购计划`,
     });
   } catch (err: any) {
     console.error('[DELETE /api/purchases/:id]', err?.message ?? err);
-    res.status(500).json({ code: 500, data: null, message: '作废采购单失败，请稍后重试' });
+    res.status(500).json({
+      code: 500, data: null,
+      message: `作废采购单失败：${err?.message ?? '未知错误'}`,
+    });
   }
 });
 

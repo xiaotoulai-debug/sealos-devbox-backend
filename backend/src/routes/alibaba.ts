@@ -598,10 +598,12 @@ router.patch('/quick-map', async (req: Request, res: Response) => {
       data: {
         externalSkuId:    cleanSpecId,
         externalSkuIdNum: externalSkuIdNum ? String(externalSkuIdNum).trim() : undefined,
+        externalSynced:   true,   // 规格重新绑定后恢复有效状态，解除换链死锁
       },
       select: {
         id: true, sku: true,
         externalProductId: true, externalSkuId: true, externalSkuIdNum: true,
+        externalSynced: true,     // 返回最新状态供前端刷新徽章
       },
     });
 
@@ -811,8 +813,17 @@ router.put('/bind', async (req: Request, res: Response) => {
 
     console.log('[PUT /api/alibaba/bind] 收到 payload:', JSON.stringify({ productId, offerId, specId: specId ? `${String(specId).slice(0, 8)}...` : undefined, skuId }));
 
-    if (!productId || !offerId) {
-      res.status(400).json({ code: 400, data: null, message: '缺少产品 ID 或 1688 商品 ID' });
+    const pidNum = Number(productId);
+    if (!Number.isFinite(pidNum) || pidNum <= 0) {
+      res.status(400).json({
+        code: 400, data: null,
+        message:
+          '缺少有效的 productId（须为正整数）。请从采购单列表/详情 items[].productId 读取，勿使用子单行 id（PurchaseOrderItem.id）。',
+      });
+      return;
+    }
+    if (!offerId) {
+      res.status(400).json({ code: 400, data: null, message: '缺少 1688 商品 ID（offerId）' });
       return;
     }
     if (!specId || typeof specId !== 'string') {
@@ -833,10 +844,9 @@ router.put('/bind', async (req: Request, res: Response) => {
       return;
     }
 
-    const userId = req.user!.userId;
-    const product = await prisma.product.findFirst({ where: { id: Number(productId), ownerId: userId } });
+    const product = await prisma.product.findUnique({ where: { id: pidNum } });
     if (!product) {
-      res.status(404).json({ code: 404, data: null, message: '产品不存在' });
+      res.status(404).json({ code: 404, data: null, message: `产品不存在（productId=${pidNum}）` });
       return;
     }
 
@@ -846,8 +856,9 @@ router.put('/bind', async (req: Request, res: Response) => {
       where: { id: product.id },
       data: {
         externalProductId: String(offerId),
-        externalSkuId: finalSpecId,
-        externalSkuIdNum: finalSkuIdNum || null,
+        externalSkuId:     finalSpecId,
+        externalSkuIdNum:  finalSkuIdNum || null,
+        externalSynced:    true,   // offerId+specId 同时写入，映射完整，解除换链死锁
       },
     });
 

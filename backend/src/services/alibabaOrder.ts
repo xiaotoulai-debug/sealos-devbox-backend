@@ -20,6 +20,49 @@ export interface AlibabaOrderDebugPayload {
   addressParam: string;
   cargoParamList: string;
   flow: string;
+  fenxiaoChannel: string;
+  message: string;
+}
+
+/**
+ * 只有这些“明确表示 offer/spec/sku 不存在或不匹配”的错误，才允许触发本地规格失效处理。
+ * 严禁把余额不足、地址错误、专供品声明、起批量、权限等业务错误误判为规格失效。
+ */
+export function isAlibabaSpecInvalidError(result: Pick<AlibabaAPIResult<unknown>, 'errorCode' | 'errorMessage' | 'raw'>): boolean {
+  const code = String(result.errorCode ?? '').trim();
+  const message = String(result.errorMessage ?? '');
+  const raw = JSON.stringify(result.raw ?? '');
+  const text = `${code} ${message} ${raw}`.toLowerCase();
+
+  const hasSpecKeyword =
+    text.includes('spec_not_found') ||
+    text.includes('spec not found') ||
+    text.includes('invalid_specid') ||
+    text.includes('invalid specid') ||
+    text.includes('cargo_not_match') ||
+    text.includes('cargo not match') ||
+    text.includes('规格不存在') ||
+    text.includes('规格已下架') ||
+    text.includes('不属于商品') ||
+    text.includes('sku不存在') ||
+    text.includes('sku not exist') ||
+    text.includes('offerid empty or not exist') ||
+    text.includes('商品不存在') ||
+    text.includes('商品已下架');
+
+  const hasBusinessOnlyKeyword =
+    text.includes('专供品') ||
+    text.includes('声明') ||
+    text.includes('availablequota') ||
+    text.includes('余额不足') ||
+    text.includes('地址') ||
+    text.includes('起批') ||
+    text.includes('订购量') ||
+    text.includes('权限') ||
+    text.includes('unsupported');
+
+  // 500_003 是 1688 的宽泛业务错误码，必须同时命中规格/商品失效语义才允许重置。
+  return hasSpecKeyword && !hasBusinessOnlyKeyword;
 }
 
 // ── 构建下单 Payload 并调用 1688 创建订单 ─────────────────────
@@ -70,8 +113,22 @@ export async function createAlibabaOrder(
   const cargoParamList = JSON.stringify(cargoItems);
   console.log('=== FINAL 1688 ORDER PAYLOAD ===', JSON.stringify(JSON.parse(cargoParamList), null, 2));
 
-  const orderData = { flow: 'general', addressParam, cargoParamList };
-  const debugPayload: AlibabaOrderDebugPayload = { flow: 'general', addressParam, cargoParamList };
+  // 1688 官方 fastCreateOrder 支持 fenxiaoChannel，下游平台枚举含“跨境-kuajing”。
+  // 对跨境专供货源，补充该声明型参数，避免“专供品购买未勾选声明”类拦截。
+  const orderData = {
+    flow: 'general',
+    fenxiaoChannel: 'kuajing',
+    message: '跨境采购专供品声明已确认',
+    addressParam,
+    cargoParamList,
+  };
+  const debugPayload: AlibabaOrderDebugPayload = {
+    flow: 'general',
+    fenxiaoChannel: 'kuajing',
+    message: '跨境采购专供品声明已确认',
+    addressParam,
+    cargoParamList,
+  };
 
   console.log('=== 1688 ORDER SUBMIT PAYLOAD ===', JSON.stringify(orderData, null, 2));
   console.log('[alibabaOrder] addressParam:', addressParam);

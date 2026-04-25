@@ -421,6 +421,7 @@ enum OrderStatus {
   IN_TRANSIT    // 运输中
   PARTIAL       // 部分入库（实到数量 < 计划数量，等待剩余货物或人工强制结单）
   RECEIVED      // 已全部入库
+  CANCELLED     // 已取消（1688 交易取消后冻结，历史凭据保留，需求已释放回采购计划）
 }
 
 /// 库存流水类型

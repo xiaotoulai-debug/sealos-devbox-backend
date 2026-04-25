@@ -980,3 +980,260 @@ const vendorSku = (extPn && extPn.length > 0) ? extPn : sku;
 | 代理恢复后全量重同步 | ⏳ 待执行 | 执行 `DRY_RUN=false npx tsx scripts/clean-dirty-vendor-sku.ts`，验证 `ext_part_number` 字段覆盖全量产品 |
 
 **新同步行为**：代理恢复 + 产品雷达 Cron 触发后，所有产品的 `vendorSku` 将自动由 `ext_part_number` 填充（无值则降级至 `part_number`），本次 Bug 的影响范围将被彻底消除。
+
+---
+
+## 11. 采购单号生成与错误透出规范（2026-04-21 重构）
+
+### 11.1 背景与故障根因
+
+线上出现 P0：用户对 SKU（如 `JKC001`）重新关联 1688 链接后，`POST /api/purchases/create-local` 反复返回 HTTP 500，前端兜底文案"创建采购单失败"无法暴露真实原因。
+
+从真实运行日志提取到的错误堆栈：
+
+```
+prisma:error
+Invalid `tx.purchaseOrder.create()` invocation in
+/home/devbox/project/backend/src/routes/purchase.ts:106:43
+Unique constraint failed on the fields: (`order_no`)
+```
+
+**根因**：旧实现使用 `prisma.purchaseOrder.count({ where: { orderNo: { startsWith: prefix } } })` 作为序号起点。一旦当天有单被 `rollback` 或物理删除（`DELETE /api/purchases/:id`），`count()` 返回的值就**小于实际最大序号**，`seq++` 会命中仍然存在的单号，触发 Prisma `P2002` 唯一键冲突。
+
+### 11.2 Layer 3 —— 单号生成铁律（废弃 `count()`）
+
+**绝对禁止**使用 `count()` 生成任何业务单号。所有带日前缀 + 自增后缀的单号（`PO-yyyymmdd-XXX`、未来可能新增的 `FBE-*`、`STK-*` 等）必须统一使用下面的 "最大序号 +1" 模式：
+
+```ts
+const lastRecord = await prisma.xxx.findFirst({
+  where:   { orderNo: { startsWith: prefix } },
+  orderBy: { orderNo: 'desc' },
+  select:  { orderNo: true },
+});
+const lastSeq = lastRecord
+  ? parseInt(lastRecord.orderNo.slice(prefix.length), 10) || 0
+  : 0;
+let seq = lastSeq;
+```
+
+- 正确性：`findFirst + orderBy desc` 直接拿当前最大值，天然绕开历史删除留下的序号空洞。
+- 兜底：`parseInt(...) || 0` 防异常格式（例如人为改单号）导致 `NaN`。
+- 并发：若未来需求遇到每秒多建单的高并发，再叠加"创建失败自动重试 +1"循环即可（当前一品一单场景无需）。
+
+### 11.3 Layer 1 —— Prisma 错误分级透出规范
+
+所有关键写入接口的 `catch` 块**必须**按 Prisma 错误码分级返回，取代写死的兜底文案。统一范式：
+
+```ts
+import { Prisma } from '@prisma/client';
+
+} catch (err: any) {
+  console.error('[接口名]', {
+    code: err?.code, message: err?.message, meta: err?.meta, stack: err?.stack,
+  });
+
+  if (err instanceof Prisma.PrismaClientKnownRequestError) {
+    if (err.code === 'P2002') { // 唯一键冲突
+      const target = Array.isArray(err.meta?.target)
+        ? (err.meta!.target as string[]).join(',')
+        : String(err.meta?.target ?? 'unknown');
+      return res.status(409).json({ code: 409, data: null, message: `唯一键冲突（${target}），请稍后重试` });
+    }
+    if (err.code === 'P2003') { // 外键约束
+      return res.status(400).json({ code: 400, data: null, message: `外键约束冲突：${err.meta?.field_name ?? '未知字段'}` });
+    }
+    if (err.code === 'P2025') { // 记录不存在
+      return res.status(404).json({ code: 404, data: null, message: '关联记录不存在，请刷新页面' });
+    }
+  }
+
+  res.status(500).json({ code: 500, data: null, message: `操作失败：${err?.message ?? '未知错误'}` });
+}
+```
+
+**铁律**：严禁将错误 message 写死为"XX 失败"一类的无信息文案（除非发生非 `Error` 的兜底情况）。所有写接口的 `catch` 必须**透传真实 `err.message`**，这与 `.cursorrules` 第 4 条"失败返回真实后端错误信息"完全一致。
+
+### 11.4 本次修复落地记录
+
+| 项目 | 状态 | 说明 |
+|---|---|---|
+| `backend/src/routes/purchase.ts` L10-L12 | ✅ 已完成 | 新增 `import { Prisma } from '@prisma/client'` |
+| `create-local` 单号生成重构 | ✅ 已完成 | `count()` → `findFirst + orderBy desc`，L85-L108 |
+| `create-local` catch 块升级 | ✅ 已完成 | P2002→409 / P2003→400 / P2025→404，兜底透出 `err.message`，L188-L228 |
+| 服务重启验证 | ✅ 已完成 | Devbox 直接重启 `npm run dev` 进程；生产 PM2 需 `pm2 delete emag-backend && pm2 start ecosystem.config.cjs`（避免 tsx 模块缓存残留） |
+| Layer 2（`externalSynced=false` 前置拦截） | ❎ 本次不做 | 线下采购 `mark-purchasing` 路径允许无 1688 规格建单，硬拦会误伤业务。保留 `place-1688-order` L1338 已有的 Layer 2。 |
+
+---
+
+## 12. 采购单取消释放机制（2026-04-22 新增）
+
+### 12.1 业务背景
+
+当 1688 交易取消（`alibabaOrderStatus = 'cancelled' / 'closed'`）时，业务方需要重新建单下单。由于旧 `PurchaseOrder` 涉及财务退款对账，**绝对禁止清空 `alibabaOrderId` 等 1688 痕迹**，旧单须完整冻结作为历史凭据。
+
+### 12.2 状态机扩展
+
+`prisma/schema.prisma` 的 `OrderStatus` 枚举新增 `CANCELLED` 状态：
+
+| 状态 | 含义 |
+|---|---|
+| `PENDING` | 待下单（本地建单，尚未提交 1688） |
+| `PLACED` | 已下单（1688 订单已创建） |
+| `IN_TRANSIT` | 运输中 |
+| `PARTIAL` | 部分入库 |
+| `RECEIVED` | 已全部入库 |
+| `CANCELLED` | **已取消冻结**（1688 交易取消后写入，历史信息完整保留，需求已释放） |
+
+### 12.3 新增 API
+
+**`POST /api/purchases/:id/cancel-and-release`**
+
+| 步骤 | 操作 | 说明 |
+|---|---|---|
+| ① 前置校验 | 订单存在 + `status === 'PLACED'` + 存在 `alibabaOrderStatus in ['cancelled','closed']` 的子单 | 防止误操作；保证一定经历过 1688 下单环节 |
+| ② 冻结主单 | `PurchaseOrder.status → CANCELLED` | **绝不清空** `alibabaOrderId`、`supplierName`、`logisticsCompany` 等任何 1688 字段 |
+| ③ 释放需求 | `Product.purchaseOrderId → null`，`Product.status → 'PURCHASING'`，`Product.externalOrderId → null` | 产品重回采购计划列表（`GET /api/products/purchasing`） |
+| ④ 保留规格 | `Product.externalSynced / externalSkuId / externalProductId` **原封不动** | 保留用户绑定 1688 规格的劳动成果，下次建单可直接复用 |
+| ⑤ 子单冻结 | `PurchaseOrderItem` 不做任何修改 | 子单作为历史凭据，alibabaOrderId 等信息一字不改 |
+
+### 12.4 列表接口兼容
+
+`GET /api/purchases` 的 `tabCounts` 新增 `CANCELLED` 字段，`statusFilter` switch 新增 `CANCELLED` 分支，前端可通过 `?tab=CANCELLED` 单独查看已取消的历史凭据单。
+
+### 12.5 数据同步命令
+
+```bash
+# 此次使用 db push（非交互式环境）
+cd backend && npx prisma db push
+```
+
+> 生产部署注意：若需要生成迁移文件（版本管理），在可交互终端执行：
+> `npx prisma migrate dev --name add_cancelled_status`
+
+---
+
+## 13. 仓库库存统计重构与明细接口（2026-04-23）
+
+### 13.1 问题诊断
+
+`GET /api/warehouses` 旧版使用 Prisma `include.stocks` + Node.js `.filter(stockQuantity > 0)`，
+等效 `INNER JOIN + 内存过滤`：`warehouse_stocks` 表按需写入（稀疏），未经过操作的 SKU 无行，
+导致仓库卡片的 `skuCount` 严重偏小（如 EMAG备货仓只显示 3）。
+
+### 13.2 统计口径
+
+采用**口径 B（全局覆盖）**：以全局未删除 Product（`is_deleted = false`）为基准，
+CROSS JOIN 每个仓库，LEFT JOIN warehouse_stocks，无记录时 COALESCE 为 0。
+
+### 13.3 修改文件
+
+| 接口 | 文件 | 变更说明 |
+|---|---|---|
+| `GET /api/warehouses` | `warehouse.ts` | 改用 `$queryRaw` CROSS JOIN + GROUP BY，一次聚合全部仓库，零 N+1 |
+| `GET /api/warehouses/:id/inventory` | `warehouse.ts`（新增） | 全局 SKU × 仓库 LEFT JOIN，Promise.all 双查询（count + data），排序/分页全下推 PG |
+
+`GET /api/warehouses` 额外返回 `inTransitTotalValue`（在途总货值），公式为：
+
+```sql
+SUM(
+  COALESCE(ws.in_transit_quantity, 0)
+    * COALESCE(NULLIF(ws.unit_cost, 0), p.purchase_price::float, 0)
+)
+```
+
+该字段必须复用库存明细的智能成本兜底逻辑，禁止直接使用 `in_transit_quantity * unit_cost`。
+
+`GET /api/warehouses/:id/inventory` 的 `totalValue` 表示库存总货值，口径为：
+
+```sql
+(COALESCE(ws.stock_quantity, 0) + COALESCE(ws.locked_quantity, 0))
+  * COALESCE(NULLIF(ws.unit_cost, 0), p.purchase_price::float, 0)
+```
+
+即“物理库存（可用 + 锁定）× 智能兜底成本价”；`sortBy=totalValue` 映射 SQL 别名 `total_value`，排序必须保留 `p.id ASC` 作为分页稳定 tie-breaker。
+
+SKU 级 `inTransitTotalValue` 表示在途总货值，口径为：
+
+```sql
+COALESCE(ws.in_transit_quantity, 0)
+  * COALESCE(NULLIF(ws.unit_cost, 0), p.purchase_price::float, 0)
+```
+
+`sortBy=inTransitTotalValue` 映射 SQL 别名 `in_transit_total_value`，同样必须保留 `p.id ASC` 作为分页稳定 tie-breaker。
+
+### 13.4 新接口 Query 参数
+
+```
+page, pageSize, sortBy（SORT_WHITELIST 白名单防注入）, sortOrder, keyword, onlyActive
+```
+
+### 13.5 架构铁律
+
+- 禁止 `COUNT(*) OVER()` 窗口函数（大表 OFFSET 触发全表 Sort）→ 改用 `Promise.all` 双查询
+- 排序字段必须通过 `SORT_WHITELIST` 白名单过滤后再 `Prisma.raw` 拼接
+- BigInt / Decimal 在 DTO 层统一转 `Number`
+
+---
+
+## 14. FBE 发货单延迟锁库状态机（2026-04-23）
+
+### 14.1 核心口径
+
+FBE 发货单支持“无库存预建单，延迟锁库”：
+
+- `POST /api/fbe-shipments`：只创建 `PENDING` 单据和明细，不校验库存、不增加 `lockedQuantity`。
+- `PENDING → ALLOCATING`：唯一锁库点。在 Prisma `$transaction` 内校验 `warehouse_stocks.stock_quantity >= quantity`，满足后执行 `stockQuantity -= quantity`、`lockedQuantity += quantity`，再更新状态。
+- `ALLOCATING → SHIPPED`：只释放 `lockedQuantity` 并增加 `Product.inTransitQuantity`，禁止再次扣减 `stockQuantity`。
+- `PENDING → CANCELLED`：无库存动作。
+- `ALLOCATING → CANCELLED` / 强删：`lockedQuantity` 退回 `stockQuantity`，并同步 `Product.stockActual`。
+
+### 14.2 并发红线
+
+延迟锁库的实际扣减必须使用条件更新：
+
+```sql
+UPDATE warehouse_stocks
+SET stock_quantity = stock_quantity - :qty,
+    locked_quantity = locked_quantity + :qty
+WHERE product_id = :productId
+  AND warehouse_id = :warehouseId
+  AND stock_quantity >= :qty;
+```
+
+若影响行数不是 1，视为库存被并发占用，抛出业务异常并回滚事务。
+
+---
+
+## 15. 1688 下单错误分类与专供品声明（2026-04-23）
+
+### 15.1 错误分类红线
+
+`POST /api/purchases/:id/place-1688-order` 调用 1688 失败时，禁止把所有错误兜底视为规格失效。
+
+- 只有 `isAlibabaSpecInvalidError()` 明确命中 `spec_not_found` / `invalid_specid` / `cargo_not_match` / `规格不存在` / `不属于商品` / `商品已下架` 等绑定失效语义时，才允许清空 `Product.externalSkuId / externalSkuIdNum` 并设置 `externalSynced=false`。
+- `专供品购买未勾选声明`、余额不足、地址错误、起批量、权限等业务错误必须原样返回前端，`autoReset=false`，不得篡改本地规格绑定。
+
+### 15.2 跨境专供声明
+
+1688 下单 payload 统一在 `src/services/alibabaOrder.ts` 注入：
+
+```ts
+{
+  flow: 'general',
+  fenxiaoChannel: 'kuajing',
+  message: '跨境采购专供品声明已确认',
+  addressParam,
+  cargoParamList,
+}
+```
+
+其中 `fenxiaoChannel=kuajing` 对齐 1688 官方 fastCreateOrder 的下游平台枚举“跨境-kuajing”。
+
+### 12.6 PurchaseOrderItem.productIds（JSON）铁律与坏账修复（2026-04-23）
+
+- **唯一关联桥**：子表无 `productId` 外键，必须通过 `product_ids` 存 `"[123]"` 形式 JSON；列表/详情 Mapper 由此解析出顶层 `items[].productId` 供前端调用 `PUT /api/alibaba/bind`。
+- **建单**：`POST /api/purchases/create-local` 写入 `JSON.stringify([pid])`，并兼容请求体 `productId` / `product_id` / `product.id`（不使用行项目自身的 `id`）。
+- **回填**：`POST .../place-1688-order` 与 `POST .../bind-1688-order` 在落库 1688 单号时**同步**调用 `buildProductIdsJsonForItem`，保证子单与产品 ID 链不断裂。
+- **只读兜底**：`GET /api/purchases`（含按单 `purchaseOrderId` 补查、`offerId` 全局匹配）与 `GET /api/purchases/:id` 在 `product_ids` 为空时仍尽量解析出 `productId`（已释放 FK 的旧单依赖子单 `offerId` ↔ `Product.externalProductId`）。
+- **数据补救脚本**：`backend/scripts/backfill-purchase-order-item-product-ids.ts`（`npx tsx scripts/backfill-purchase-order-item-product-ids.ts`）。
+- **绑定接口**：`PUT /api/alibaba/bind` 对非法/缺失 `productId` 返回 **400** 与明确文案，避免误传子单 id 时出现含混的 404。

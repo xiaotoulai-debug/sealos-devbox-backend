@@ -2,16 +2,17 @@
  * FBE 发货单 API（4 阶段仓储状态机）
  *
  * 状态机流转规则：
- *   PENDING     → ALLOCATING  : 仅改单据状态，无库存变动
- *   ALLOCATING  → SHIPPED     : ★强校验 stockActual >= quantity；通过后扣本地库存 + 加在途
+ *   PENDING     → ALLOCATING  : ★延迟锁库点；校验仓库 stockQuantity 足量后转入 lockedQuantity
+ *   ALLOCATING  → SHIPPED     : 释放 lockedQuantity + 加 FBE 在途；禁止再次扣 stockQuantity
  *   SHIPPED     → ARRIVED     : 扣在途库存（inTransitQuantity -），回填 receivedQuantity
- *   PENDING/ALLOCATING → CANCELLED : 无库存变动
+ *   PENDING     → CANCELLED : 无库存变动
+ *   ALLOCATING  → CANCELLED : lockedQuantity 退回 stockQuantity
  *   SHIPPED     → CANCELLED   : 撤销在途（inTransitQuantity -），归还本地库存（stockActual +）
  *
- * 进销存联动（ALLOCATING→SHIPPED）：
- *   ① 检查每个 SKU: stockActual >= 发货数量，否则 throw，事务回滚
- *   ② stockActual -= quantity，写 FBE_OUT InventoryLog 流水
- *   ③ inTransitQuantity += quantity
+ * 进销存联动：
+ *   ① PENDING→ALLOCATING：检查 WarehouseStock.stockQuantity >= quantity，否则 throw，事务回滚
+ *   ② PENDING→ALLOCATING：stockQuantity -= quantity，lockedQuantity += quantity
+ *   ③ ALLOCATING→SHIPPED：lockedQuantity -= quantity，FBE inTransitQuantity += quantity
  */
 
 import { Router, Request, Response } from 'express';
@@ -57,15 +58,14 @@ const ALL_STATUSES = ['PENDING', 'ALLOCATING', 'SHIPPED', 'ARRIVED', 'CANCELLED'
 // POST /api/fbe-shipments   创建发货单
 // Body:
 //   shopId: number                必填，发货目标店铺
-//   warehouseId?: number          出库仓库 ID（多仓架构，传入时执行 WarehouseStock 强校验+锁定）
+//   warehouseId?: number          出库仓库 ID（多仓架构；建单不锁库，PENDING→ALLOCATING 时锁库）
 //   shipmentNumber?: string       自定义单号（不传则自动生成）
 //   remark?: string
 //   items: [{ sku, quantity, productId? }]
 //
 // 防呆①: 所有 SKU 必须在本地 Product 表中存在
 // 防呆②: 所有 SKU 必须已绑定到目标 shopId 的平台产品
-// 防呆③(多仓): 若传 warehouseId，检查 WarehouseStock.stockQuantity - lockedQuantity >= quantity
-// 锁仓: 创建成功后将 PENDING 阶段的出库量锁入 lockedQuantity，防止并发超发
+// 防呆③: 建单阶段不检查库存、不锁库，支持无库存预建单
 // ─────────────────────────────────────────────────────────────────────
 router.post('/', async (req: Request, res: Response) => {
   try {
@@ -162,38 +162,8 @@ router.post('/', async (req: Request, res: Response) => {
       return;
     }
 
-    // ── 多仓强校验：检查指定仓库的可用库存（stockQuantity - lockedQuantity）──
     const skuToProductId    = new Map(products.map((p) => [p.sku!, p.id]));
     const skuToPurchasePrice = new Map(products.map((p) => [p.sku!, Number(p.purchasePrice ?? 0)]));
-
-    if (validWarehouseId !== null) {
-      const productIds = products.map((p) => p.id);
-      const whStocks = await prisma.warehouseStock.findMany({
-        where: { warehouseId: validWarehouseId, productId: { in: productIds } },
-        select: { productId: true, stockQuantity: true, lockedQuantity: true },
-      });
-      const whStockMap = new Map(whStocks.map((s) => [s.productId, s]));
-
-      // SKU → productId → WarehouseStock 可用量校验
-      const insufficient: string[] = [];
-      for (const item of items) {
-        const productId = skuToProductId.get(item.sku.trim())!;
-        const ws        = whStockMap.get(productId);
-        const available = ws ? ws.stockQuantity - ws.lockedQuantity : 0;
-        if (available < item.quantity) {
-          insufficient.push(
-            `SKU [${item.sku}] 仓库可用库存 ${available.toFixed(0)} < 需出库 ${item.quantity}`,
-          );
-        }
-      }
-      if (insufficient.length > 0) {
-        res.status(400).json({
-          code: 400, data: null,
-          message: `库存不足，无法建单：\n${insufficient.join('\n')}`,
-        });
-        return;
-      }
-    }
 
     // ── 自定义单号去重 ────────────────────────────────────────────────
     let finalNumber: string;
@@ -215,54 +185,34 @@ router.post('/', async (req: Request, res: Response) => {
       return sum + item.quantity * price;
     }, 0);
 
-    // ── 事务：创建发货单 + 锁定 WarehouseStock.lockedQuantity ────────
-    const shipment = await prisma.$transaction(async (tx) => {
-      const s = await tx.fbeShipment.create({
-        data: {
-          shipmentNumber:    finalNumber,
-          shopId,
-          warehouseId:       validWarehouseId,
-          totalProductValue: parseFloat(totalProductValue.toFixed(2)),
-          remark:            remark ?? null,
-          ownerId:           userId,
-          items: {
-            create: items.map((i) => ({
-              productId:        skuToProductId.get(i.sku.trim())!,
-              quantity:         i.quantity,
-              receivedQuantity: 0,
-            })),
+    // ── 纯建单：PENDING 阶段不校验库存、不锁库，允许无库存预建单 ─────
+    const shipment = await prisma.fbeShipment.create({
+      data: {
+        shipmentNumber:    finalNumber,
+        status:            'PENDING',
+        shopId,
+        warehouseId:       validWarehouseId,
+        totalProductValue: parseFloat(totalProductValue.toFixed(2)),
+        remark:            remark ?? null,
+        ownerId:           userId,
+        items: {
+          create: items.map((i) => ({
+            productId:        skuToProductId.get(i.sku.trim())!,
+            quantity:         i.quantity,
+            receivedQuantity: 0,
+          })),
+        },
+      },
+      include: {
+        items: {
+          include: {
+            product: { select: { id: true, sku: true, chineseName: true, imageUrl: true, stockActual: true } },
           },
         },
-        include: {
-          items: {
-            include: {
-              product: { select: { id: true, sku: true, chineseName: true, imageUrl: true, stockActual: true } },
-            },
-          },
-          shop:      { select: { id: true, shopName: true, region: true } },
-          warehouse: { select: { id: true, name: true, type: true } },
-          owner:     { select: { id: true, name: true } },
-        },
-      });
-
-      // 锁仓：PENDING 阶段将出库量计入 lockedQuantity，防止并发超发
-      if (validWarehouseId !== null) {
-        for (const item of items) {
-          const productId = skuToProductId.get(item.sku.trim())!;
-          try {
-            await tx.warehouseStock.upsert({
-              where:  { productId_warehouseId: { productId, warehouseId: validWarehouseId } },
-              create: { productId, warehouseId: validWarehouseId, stockQuantity: 0, lockedQuantity: item.quantity },
-              update: { lockedQuantity: { increment: item.quantity } },
-            });
-          } catch (lockErr: any) {
-            console.error(`[FBE] 创建发货单锁仓失败 | SKU [${item.sku}]:`, lockErr?.message ?? lockErr);
-            throw new Error(`SKU [${item.sku}] 锁定仓库库存失败：${lockErr?.message ?? lockErr}`);
-          }
-        }
-      }
-
-      return s;
+        shop:      { select: { id: true, shopName: true, region: true } },
+        warehouse: { select: { id: true, name: true, type: true } },
+        owner:     { select: { id: true, name: true } },
+      },
     });
 
     res.json({ code: 200, data: shipment, message: '发货单创建成功' });
@@ -599,13 +549,13 @@ router.put('/:id', async (req: Request, res: Response) => {
         return;
       }
 
-      // ④ 多仓可用库存强校验（仅当发货单绑定了 warehouseId）
+      // ④ 延迟锁库：PENDING 追加不校验库存；ALLOCATING 追加才校验实时可用库存
       const whId = current.warehouseId;
-      if (whId !== null) {
+      if (current.status === 'ALLOCATING' && whId !== null) {
         const productIds = products.map((p) => p.id);
         const whStocks   = await prisma.warehouseStock.findMany({
           where:  { warehouseId: whId, productId: { in: productIds } },
-          select: { productId: true, stockQuantity: true, lockedQuantity: true },
+          select: { productId: true, stockQuantity: true },
         });
         const whStockMap = new Map(whStocks.map((s) => [s.productId, s]));
 
@@ -614,7 +564,7 @@ router.put('/:id', async (req: Request, res: Response) => {
           const sp        = storeProductMap.get(appendItem.storeProductId)!;
           const product   = productBySkuMap.get(sp.mappedInventorySku!)!;
           const ws        = whStockMap.get(product.id);
-          const available = ws ? ws.stockQuantity - ws.lockedQuantity : 0;
+          const available = ws ? ws.stockQuantity : 0;
           if (available < appendItem.quantity) {
             insufficient.push(
               `SKU [${product.sku}] 仓库可用库存 ${available} < 需追加 ${appendItem.quantity}`,
@@ -645,22 +595,77 @@ router.put('/:id', async (req: Request, res: Response) => {
       }
     }
 
-    // ── 事务：主单更新 + 已有行数量修改 + 新行追加 + 锁仓 ──────────
+    // ── 事务：主单更新 + 明细修改；PENDING 不锁库，ALLOCATING 做差额锁库 ─────
     await prisma.$transaction(async (tx) => {
       // A. 更新主单头部字段（单号/备注）
       if (Object.keys(updateData).length > 0) {
         await tx.fbeShipment.update({ where: { id }, data: updateData });
       }
 
-      // B. 更新已有明细行的数量
+      // B. 更新已有明细行的数量；ALLOCATING 状态下同步调整锁库差额
       for (const item of updateItems) {
+        const existing = await tx.fbeShipmentItem.findUnique({
+          where:  { id: item.id },
+          select: { id: true, shipmentId: true, productId: true, quantity: true },
+        });
+        if (!existing || existing.shipmentId !== id) {
+          throw new Error(`发货明细 #${item.id} 不存在或不属于当前发货单`);
+        }
+
+        const delta = item.quantity - existing.quantity;
+        if (current.status === 'ALLOCATING' && current.warehouseId !== null && delta !== 0) {
+          if (delta > 0) {
+            const ws = await tx.warehouseStock.findUnique({
+              where:  { productId_warehouseId: { productId: existing.productId, warehouseId: current.warehouseId } },
+              select: { stockQuantity: true },
+            });
+            const available = ws?.stockQuantity ?? 0;
+            if (available < delta) {
+              throw new Error(`库存不足，无法增加配货数量：SKU #${existing.productId} 可用 ${available} < 需追加 ${delta}`);
+            }
+            const locked = await tx.warehouseStock.updateMany({
+              where: {
+                productId:     existing.productId,
+                warehouseId:   current.warehouseId,
+                stockQuantity: { gte: delta },
+              },
+              data:  {
+                stockQuantity:  { decrement: delta },
+                lockedQuantity: { increment: delta },
+              },
+            });
+            if (locked.count !== 1) {
+              throw new Error(`库存不足，无法增加配货数量：SKU #${existing.productId} 库存已被并发占用，请刷新后重试`);
+            }
+          } else {
+            const releaseQty = Math.abs(delta);
+            await tx.warehouseStock.updateMany({
+              where: { productId: existing.productId, warehouseId: current.warehouseId },
+              data:  {
+                stockQuantity:  { increment: releaseQty },
+                lockedQuantity: { decrement: releaseQty },
+              },
+            });
+          }
+
+          const allWs = await tx.warehouseStock.findMany({
+            where:  { productId: existing.productId },
+            select: { stockQuantity: true },
+          });
+          const totalStock = allWs.reduce((s, w) => s + w.stockQuantity, 0);
+          await tx.product.update({
+            where: { id: existing.productId },
+            data:  { stockActual: totalStock },
+          });
+        }
+
         await tx.fbeShipmentItem.update({
           where: { id: item.id },
           data:  { quantity: item.quantity },
         });
       }
 
-      // C. 追加新明细行 + 锁仓（与初次建单逻辑完全对齐）
+      // C. 追加新明细行；PENDING 不锁库，ALLOCATING 立即锁新增量
       if (resolvedAppends.length > 0) {
         const whId = current.warehouseId;
         let addedProductValue = 0;
@@ -676,14 +681,31 @@ router.put('/:id', async (req: Request, res: Response) => {
             },
           });
 
-          // C-2. 锁仓：将追加数量计入 lockedQuantity（防止并发超发）
-          // ★ 与建单时完全一致：PENDING 阶段锁仓，ALLOCATING→SHIPPED 时才实际扣减 stockQuantity
-          if (whId !== null) {
+          // C-2. 只有 ALLOCATING 状态追加新行时才锁库
+          if (current.status === 'ALLOCATING' && whId !== null) {
             try {
-              await tx.warehouseStock.upsert({
-                where:  { productId_warehouseId: { productId: ra.productId, warehouseId: whId } },
-                create: { productId: ra.productId, warehouseId: whId, stockQuantity: 0, lockedQuantity: ra.quantity },
-                update: { lockedQuantity: { increment: ra.quantity } },
+              const locked = await tx.warehouseStock.updateMany({
+                where:  {
+                  productId:     ra.productId,
+                  warehouseId:   whId,
+                  stockQuantity: { gte: ra.quantity },
+                },
+                data: {
+                  stockQuantity:  { decrement: ra.quantity },
+                  lockedQuantity: { increment: ra.quantity },
+                },
+              });
+              if (locked.count !== 1) {
+                throw new Error(`库存不足，无法追加：SKU [${ra.sku}] 库存已被并发占用，请刷新后重试`);
+              }
+              const allWs = await tx.warehouseStock.findMany({
+                where:  { productId: ra.productId },
+                select: { stockQuantity: true },
+              });
+              const totalStock = allWs.reduce((s, w) => s + w.stockQuantity, 0);
+              await tx.product.update({
+                where: { id: ra.productId },
+                data:  { stockActual: totalStock },
               });
             } catch (lockErr: any) {
               throw new Error(
@@ -752,6 +774,8 @@ router.put('/:id', async (req: Request, res: Response) => {
     if (
       msg.includes('quantity') ||
       msg.includes('库存不足') ||
+      msg.includes('无法增加配货数量') ||
+      msg.includes('发货明细') ||
       msg.includes('锁仓失败')
     ) {
       res.status(400).json({ code: 400, data: null, message: msg });
@@ -820,24 +844,83 @@ router.put('/:id/status', async (req: Request, res: Response) => {
 
     // ─── 事务执行状态更新 + 库存联动 ──────────────────────────────
     const updated = await prisma.$transaction(async (tx) => {
-      // ── 更新单据状态 ─────────────────────────────────────────────
-      const shipment = await tx.fbeShipment.update({
-        where: { id },
-        data: { status: newStatus },
-      });
-
       const whId = current.warehouseId;   // 出库仓库（null = 老数据兼容，走旧逻辑）
+      const productIds = current.items.map((i) => i.productId);
+      let shipment: any = current;
 
       if (newStatus === 'ALLOCATING') {
-        // ① PENDING → ALLOCATING：仅改状态，无库存变动
-        console.log(`[FBE] #${id}(${current.shipmentNumber}) PENDING→ALLOCATING，等待配货`);
+        // ① PENDING → ALLOCATING：延迟锁库核心节点
+        // 必须在同一个事务中完成：查实时库存 → 扣 stockQuantity → 加 lockedQuantity → 改状态。
+        if (whId === null) {
+          throw new Error('发货单未指定出库仓库，无法进入配货中');
+        }
+
+        const prodSkuMap = new Map(
+          (await tx.product.findMany({ where: { id: { in: productIds } }, select: { id: true, sku: true } }))
+            .map((p) => [p.id, p.sku]),
+        );
+        const whStocks = await tx.warehouseStock.findMany({
+          where:  { warehouseId: whId, productId: { in: productIds } },
+          select: { productId: true, stockQuantity: true },
+        });
+        const whStockMap = new Map(whStocks.map((s) => [s.productId, s]));
+
+        const insufficient: string[] = [];
+        for (const item of current.items) {
+          const stock = whStockMap.get(item.productId)?.stockQuantity ?? 0;
+          if (stock < item.quantity) {
+            insufficient.push(
+              `SKU [${prodSkuMap.get(item.productId) ?? `#${item.productId}`}] ` +
+              `仓库可用库存 ${stock} < 需配货 ${item.quantity}`,
+            );
+          }
+        }
+        if (insufficient.length > 0) {
+          throw new Error(`库存不足，无法进入配货中：\n${insufficient.join('\n')}`);
+        }
+
+        for (const item of current.items) {
+          const locked = await tx.warehouseStock.updateMany({
+            where: {
+              productId:     item.productId,
+              warehouseId:   whId,
+              stockQuantity: { gte: item.quantity },
+            },
+            data: {
+              stockQuantity:  { decrement: item.quantity },
+              lockedQuantity: { increment: item.quantity },
+            },
+          });
+          if (locked.count !== 1) {
+            throw new Error(
+              `库存不足，无法进入配货中：SKU [${prodSkuMap.get(item.productId) ?? `#${item.productId}`}] ` +
+              `库存已被并发占用，请刷新后重试`,
+            );
+          }
+
+          // stockActual 继续表示全仓可用库存合计，锁库后要同步减少。
+          const allWs = await tx.warehouseStock.findMany({
+            where:  { productId: item.productId },
+            select: { stockQuantity: true },
+          });
+          const totalStock = allWs.reduce((s, w) => s + w.stockQuantity, 0);
+          await tx.product.update({
+            where: { id: item.productId },
+            data:  { stockActual: totalStock },
+          });
+        }
+
+        shipment = await tx.fbeShipment.update({
+          where: { id },
+          data:  { status: newStatus },
+        });
+        console.log(`[FBE] #${id}(${current.shipmentNumber}) PENDING→ALLOCATING，已完成延迟锁库`);
 
       } else if (newStatus === 'SHIPPED') {
         // ② ALLOCATING → SHIPPED（★ 核心出库路径）
-        const productIds = current.items.map((i) => i.productId);
 
         if (whId !== null) {
-          // ── 多仓模式：基于 WarehouseStock 强校验 + 扣减 ────────────
+          // ── 多仓模式：只释放 lockedQuantity + 推入 FBE 在途，禁止再次扣 stockQuantity ──
           const whStocks = await tx.warehouseStock.findMany({
             where:  { warehouseId: whId, productId: { in: productIds } },
             select: { productId: true, stockQuantity: true, lockedQuantity: true },
@@ -868,14 +951,14 @@ router.put('/:id/status', async (req: Request, res: Response) => {
             throw new Error(`库存锁定量不足，无法发货：\n${insufficient.join('\n')}`);
           }
 
-          // b. 扣减 WarehouseStock + 释放本次锁定 + 同步 Product.stockActual + 写流水
+          // b. 释放本次锁定 + 推入 Product.inTransitQuantity + 写流水
           //
           // ★ 架构说明：多仓模式下不使用 applyStockChange()，因为该函数会在 product.update
           //   之后再次读取 stockActual（已被修改），导致 InventoryLog.beforeQuantity 记录的是
           //   中间态而非出库前的真实库存，产生审计账单污染。此处直接写 inventoryLog。
           //
-          // 出库前快照：在任何 warehouseStock.update 之前统一读取 stockActual，
-          // 确保 beforeQuantity 反映真实的出库前状态。
+          // 出库前快照：延迟锁库模型下 stockActual 已在 PENDING→ALLOCATING 时扣减。
+          // 这里的流水按“物理库存离仓”表达：before = 当前可用 + 本次锁定，after = 当前可用。
           const beforeStockMap = new Map(
             (await tx.product.findMany({
               where:  { id: { in: productIds } },
@@ -889,16 +972,15 @@ router.put('/:id/status', async (req: Request, res: Response) => {
             try {
               const beforeStock = beforeStockMap.get(item.productId) ?? 0;
 
-              // 扣减仓库库存，同时释放锁定量
+              // 仅释放锁定量，绝对禁止二次扣减 stockQuantity
               await tx.warehouseStock.update({
                 where: { productId_warehouseId: { productId: item.productId, warehouseId: whId } },
                 data: {
-                  stockQuantity:  { decrement: item.quantity },
                   lockedQuantity: { decrement: item.quantity },
                 },
               });
 
-              // 重新汇总全仓 → 同步 Product.stockActual
+              // 重新汇总全仓可用库存，正常情况下与锁库后保持一致
               const allWs = await tx.warehouseStock.findMany({
                 where:  { productId: item.productId },
                 select: { stockQuantity: true },
@@ -916,7 +998,7 @@ router.put('/:id/status', async (req: Request, res: Response) => {
                   warehouseId:    whId,
                   type:           'FBE_OUT',
                   changeQuantity: -item.quantity,
-                  beforeQuantity: beforeStock,
+                  beforeQuantity: beforeStock + item.quantity,
                   afterQuantity:  totalStock,
                   referenceId:    String(id),
                   remark:         `FBE 发货单 ${current.shipmentNumber} 出库（仓库 #${whId}）`,
@@ -980,6 +1062,11 @@ router.put('/:id/status', async (req: Request, res: Response) => {
           console.log(`[FBE] #${id}(${current.shipmentNumber}) ALLOCATING→SHIPPED（兼容模式），合计出库 ${totalQty}`);
         }
 
+        shipment = await tx.fbeShipment.update({
+          where: { id },
+          data:  { status: newStatus },
+        });
+
       } else if (newStatus === 'ARRIVED') {
         // ③ SHIPPED → ARRIVED：扣在途库存 + 回填实收数量
         let totalQty = 0;
@@ -1000,6 +1087,10 @@ router.put('/:id/status', async (req: Request, res: Response) => {
           totalQty += safeDecrement;
         }
         console.log(`[FBE] #${id}(${current.shipmentNumber}) SHIPPED→ARRIVED，在途清账 -${totalQty}`);
+        shipment = await tx.fbeShipment.update({
+          where: { id },
+          data:  { status: newStatus },
+        });
 
       } else if (newStatus === 'CANCELLED') {
         if (currentStatus === 'SHIPPED') {
@@ -1012,6 +1103,8 @@ router.put('/:id/status', async (req: Request, res: Response) => {
             });
             const safeDecrement = Math.min(item.quantity, prod?.inTransitQuantity ?? 0);
 
+            let beforeQuantity = 0;
+            let afterQuantity = 0;
             if (whId !== null) {
               // 多仓：归还至 WarehouseStock
               await tx.warehouseStock.update({
@@ -1023,41 +1116,83 @@ router.put('/:id/status', async (req: Request, res: Response) => {
                 select: { stockQuantity: true },
               });
               const totalStock = allWs.reduce((s, w) => s + w.stockQuantity, 0);
+              beforeQuantity = totalStock - item.quantity;
+              afterQuantity = totalStock;
               await tx.product.update({
                 where: { id: item.productId },
                 data:  { stockActual: totalStock, inTransitQuantity: { decrement: safeDecrement } },
               });
             } else {
+              const changed = await applyStockChange(tx, {
+                productId:      item.productId,
+                changeQuantity: +item.quantity,
+                type:           'MANUAL_ADJUST',
+                referenceId:    String(id),
+                remark:         `FBE 发货单 ${current.shipmentNumber} 取消，退回本地库存`,
+                createdBy:      userId,
+              });
+              beforeQuantity = changed.before;
+              afterQuantity = changed.after;
               await tx.product.update({
                 where: { id: item.productId },
                 data:  { inTransitQuantity: { decrement: safeDecrement } },
               });
             }
-            await applyStockChange(tx, {
-              productId:      item.productId,
-              warehouseId:    whId,
-              changeQuantity: +item.quantity,
-              type:           'MANUAL_ADJUST',
-              referenceId:    String(id),
-              remark:         `FBE 发货单 ${current.shipmentNumber} 取消，退回本地库存`,
-              createdBy:      userId,
-            });
+            if (whId !== null) {
+              // 多仓模式已手动归还 WarehouseStock 并同步 Product.stockActual；
+              // 这里只写审计流水，避免 applyStockChange 二次增加 Product.stockActual。
+              await tx.inventoryLog.create({
+                data: {
+                  productId:      item.productId,
+                  warehouseId:    whId,
+                  type:           'MANUAL_ADJUST',
+                  changeQuantity: +item.quantity,
+                  beforeQuantity,
+                  afterQuantity,
+                  referenceId:    String(id),
+                  remark:         `FBE 发货单 ${current.shipmentNumber} 取消，退回本地库存`,
+                  createdBy:      userId,
+                },
+              });
+            }
             totalQty += item.quantity;
           }
           console.log(`[FBE] #${id}(${current.shipmentNumber}) SHIPPED→CANCELLED，在途撤销 -${totalQty}，库存 +${totalQty}`);
 
-        } else {
-          // ④b PENDING/ALLOCATING → CANCELLED：释放锁定量（多仓模式）
+        } else if (currentStatus === 'ALLOCATING') {
+          // ④b ALLOCATING → CANCELLED：锁定库存退回可用库存
           if (whId !== null) {
             for (const item of current.items) {
               await tx.warehouseStock.updateMany({
                 where: { productId: item.productId, warehouseId: whId },
-                data:  { lockedQuantity: { decrement: item.quantity } },
+                data:  {
+                  stockQuantity:  { increment: item.quantity },
+                  lockedQuantity: { decrement: item.quantity },
+                },
+              });
+
+              const allWs = await tx.warehouseStock.findMany({
+                where:  { productId: item.productId },
+                select: { stockQuantity: true },
+              });
+              const totalStock = allWs.reduce((s, w) => s + w.stockQuantity, 0);
+              await tx.product.update({
+                where: { id: item.productId },
+                data:  { stockActual: totalStock },
               });
             }
           }
-          console.log(`[FBE] #${id}(${current.shipmentNumber}) ${currentStatus}→CANCELLED，锁定量已释放`);
+          console.log(`[FBE] #${id}(${current.shipmentNumber}) ALLOCATING→CANCELLED，锁定量已退回可用库存`);
+
+        } else {
+          // ④c PENDING → CANCELLED：PENDING 未锁库，无库存动作
+          console.log(`[FBE] #${id}(${current.shipmentNumber}) PENDING→CANCELLED，无库存动作`);
         }
+
+        shipment = await tx.fbeShipment.update({
+          where: { id },
+          data:  { status: newStatus },
+        });
       }
 
       return shipment;
@@ -1067,7 +1202,11 @@ router.put('/:id/status', async (req: Request, res: Response) => {
   } catch (err: any) {
     const msg: string = err?.message ?? '未知错误';
     console.error('[FBE] 更新发货单状态失败:', err);
-    if (msg.startsWith('库存不足') || msg.startsWith('库存锁定量不足')) {
+    if (
+      msg.startsWith('库存不足') ||
+      msg.startsWith('库存锁定量不足') ||
+      msg.startsWith('发货单未指定')
+    ) {
       res.status(400).json({ code: 400, data: null, message: msg });
     } else {
       res.status(500).json({ code: 500, data: null, message: `发货单状态更新失败：${msg}` });
@@ -1164,7 +1303,8 @@ router.patch('/:id/costs', async (req: Request, res: Response) => {
 // 权限：requireSuperAdmin — 非超管直接 403
 //
 // 库存回滚规则（按当前状态）：
-//   PENDING / ALLOCATING → 释放 WarehouseStock.lockedQuantity
+//   PENDING             → 未锁库，无库存动作
+//   ALLOCATING          → lockedQuantity 退回 stockQuantity
 //   SHIPPED              → 归还 WarehouseStock.stockQuantity + 扣减 inTransitQuantity
 //   ARRIVED / CANCELLED  → 库存已结算，无需回滚
 //
@@ -1202,15 +1342,32 @@ router.delete('/:id', requireSuperAdmin, async (req: Request, res: Response) => 
       // ① 库存回滚：根据当前状态决定回滚方式
       if (warehouseId !== null) {
         // ── 多仓模式 ─────────────────────────────────────────────
-        if (status === 'PENDING' || status === 'ALLOCATING') {
-          // 释放锁定量（创建时已 lockedQuantity += qty）
+        if (status === 'PENDING') {
+          // 延迟锁库模型：PENDING 仅为业务草单，未占用库存
+          console.log(`[FBE-DEL] #${id}(${shipmentNumber}) PENDING，未锁库，无库存回滚`);
+
+        } else if (status === 'ALLOCATING') {
+          // 配货中已锁库：删除时把 lockedQuantity 退回 stockQuantity
           for (const item of items) {
             await tx.warehouseStock.updateMany({
               where: { productId: item.productId, warehouseId },
-              data:  { lockedQuantity: { decrement: item.quantity } },
+              data:  {
+                stockQuantity:  { increment: item.quantity },
+                lockedQuantity: { decrement: item.quantity },
+              },
+            });
+
+            const allWs = await tx.warehouseStock.findMany({
+              where:  { productId: item.productId },
+              select: { stockQuantity: true },
+            });
+            const totalStock = allWs.reduce((s, w) => s + w.stockQuantity, 0);
+            await tx.product.update({
+              where: { id: item.productId },
+              data:  { stockActual: totalStock },
             });
           }
-          console.log(`[FBE-DEL] #${id}(${shipmentNumber}) ${status}，释放 lockedQuantity`);
+          console.log(`[FBE-DEL] #${id}(${shipmentNumber}) ALLOCATING，锁定量已退回可用库存`);
 
         } else if (status === 'SHIPPED') {
           // 归还实物库存 + 扣减在途（SHIPPED 时已 stockQuantity - / inTransitQuantity +）
@@ -1228,6 +1385,7 @@ router.delete('/:id', requireSuperAdmin, async (req: Request, res: Response) => 
             const prod = await tx.product.findUnique({
               where: { id: item.productId }, select: { inTransitQuantity: true },
             });
+            const beforeQuantity = totalStock - item.quantity;
             await tx.product.update({
               where: { id: item.productId },
               data: {
@@ -1235,15 +1393,20 @@ router.delete('/:id', requireSuperAdmin, async (req: Request, res: Response) => 
                 inTransitQuantity: { decrement: Math.min(item.quantity, prod?.inTransitQuantity ?? 0) },
               },
             });
-            // 写一条 MANUAL_ADJUST 流水标记管理员强删回滚
-            await applyStockChange(tx, {
-              productId:      item.productId,
-              warehouseId,
-              changeQuantity: +item.quantity,
-              type:           'MANUAL_ADJUST',
-              referenceId:    String(id),
-              remark:         `超管删除 FBE 发货单 ${shipmentNumber}，库存回滚`,
-              createdBy:      req.user!.userId,
+            // 多仓模式已手动归还 WarehouseStock 并同步 Product.stockActual；
+            // 这里只写审计流水，避免 applyStockChange 二次增加 Product.stockActual。
+            await tx.inventoryLog.create({
+              data: {
+                productId:      item.productId,
+                warehouseId,
+                type:           'MANUAL_ADJUST',
+                changeQuantity: +item.quantity,
+                beforeQuantity,
+                afterQuantity:  totalStock,
+                referenceId:    String(id),
+                remark:         `超管删除 FBE 发货单 ${shipmentNumber}，库存回滚`,
+                createdBy:      req.user!.userId,
+              },
             });
           }
           console.log(`[FBE-DEL] #${id}(${shipmentNumber}) SHIPPED，仓库库存已归还`);

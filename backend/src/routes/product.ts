@@ -736,6 +736,7 @@ router.get('/inventory', async (req: Request, res: Response) => {
         publishStatus:  p.publishStatus,
         externalProductId: p.externalProductId ?? null,
         externalSkuId:     p.externalSkuId     ?? null,
+        externalSynced:    p.externalSynced    ?? false,  // 换链失效标识（false = 需重新绑规格）
         updatedAt:      p.updatedAt,
         warehouseStocks: fullWarehouseStocks,         // 已补齐，长度 = ACTIVE 仓库数
       };
