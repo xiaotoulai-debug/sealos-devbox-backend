@@ -485,6 +485,7 @@ router.get('/', async (req: Request, res: Response) => {
       inTransitQuantity:  number;
     };
     const inventoryMap = new Map<string, InvEntry>();
+    const normalizeSkuKey = (value: string | null | undefined) => String(value ?? '').trim().toLowerCase();
     // 路径③ 的 pnk → InvEntry 索引（在下方单独查询后填充）
     const pnkMap = new Map<string, InvEntry>();
 
@@ -589,6 +590,71 @@ router.get('/', async (req: Request, res: Response) => {
       .filter((id): id is number => id !== null);
     const productIdsToCheck = [...new Set([...allProductIds, ...pnkProductIds])];
 
+    // ── 智能采购建议：批量聚合本地库存，避免逐行查询 ─────────────────
+    type StockAgg = { localStock: number };
+    const warehouseStockMap = new Map<number, StockAgg>();
+    if (productIdsToCheck.length > 0) {
+      const whStocks = await prisma.warehouseStock.findMany({
+        where:  { productId: { in: productIdsToCheck } },
+        select: { productId: true, stockQuantity: true },
+      });
+      for (const ws of whStocks) {
+        const agg = warehouseStockMap.get(ws.productId) ?? { localStock: 0 };
+        agg.localStock += Number(ws.stockQuantity ?? 0);
+        warehouseStockMap.set(ws.productId, agg);
+      }
+    }
+
+    // ── 智能采购建议：批量聚合采购在途（当前店铺 + 通用备货）──────────
+    const purchasingInTransitMap = new Map<number, number>();
+    if (productIdsToCheck.length > 0) {
+      const productIdSet = new Set(productIdsToCheck);
+      const activePurchaseItems = await prisma.purchaseOrderItem.findMany({
+        where: {
+          purchaseOrder: {
+            status: { in: ['PENDING', 'PLACED', 'IN_TRANSIT', 'PARTIAL'] },
+            OR: [{ shopId }, { shopId: null }],
+          },
+        },
+        select: { productIds: true, quantity: true, receivedQuantity: true },
+      });
+      for (const item of activePurchaseItems) {
+        let pids: number[] = [];
+        try {
+          pids = JSON.parse(item.productIds ?? '[]')
+            .map((id: unknown) => Number(id))
+            .filter((id: number) => Number.isInteger(id) && productIdSet.has(id));
+        } catch { /* ignore malformed productIds */ }
+        if (pids.length === 0) continue;
+        const remainingQty = Math.max(0, Number(item.quantity ?? 0) - Number(item.receivedQuantity ?? 0));
+        if (remainingQty <= 0) continue;
+        const qtyPerProduct = remainingQty / pids.length;
+        for (const pid of pids) {
+          purchasingInTransitMap.set(pid, (purchasingInTransitMap.get(pid) ?? 0) + qtyPerProduct);
+        }
+      }
+    }
+
+    // ── 智能采购建议：批量聚合本店采购计划中数量（Product 动态计划表）──
+    const planningStockMap = new Map<string, number>();
+    const planSkuArr = [...new Set([...skusToFetch].map((sku) => sku.trim()).filter(Boolean))];
+    if (planSkuArr.length > 0) {
+      const planningProducts = await prisma.product.findMany({
+        where: {
+          sku:             { in: planSkuArr },
+          status:          'PURCHASING',
+          purchaseOrderId: null,
+          OR: [{ shopId }, { shopId: null }],
+        },
+        select: { sku: true, purchaseQuantity: true },
+      });
+      for (const prod of planningProducts) {
+        const key = normalizeSkuKey(prod.sku);
+        if (!key) continue;
+        planningStockMap.set(key, (planningStockMap.get(key) ?? 0) + Number(prod.purchaseQuantity ?? 0));
+      }
+    }
+
     // productId → 该店在途数量
     const shopInTransitMap = new Map<number, number>();
     if (productIdsToCheck.length > 0) {
@@ -626,6 +692,9 @@ router.get('/', async (req: Request, res: Response) => {
     const defaultCurrency = (region && REGION_CURRENCY[region as keyof typeof REGION_CURRENCY]) ?? 'RON';
 
     let zeroSalesDiagnosticCount = 0;
+    type InventoryTag = 'NEW' | 'DEAD' | 'HOT' | 'NORMAL';
+    const nowMs = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
     const data = list.map((p) => {
       const v = p.validationStatus ?? (p.status === 1 ? 'active' : 'rejected');
       const validationStatusDisplay = v === 'rejected' || v === 'inactive' ? '已驳回' : '已通过';
@@ -660,6 +729,35 @@ router.get('/', async (req: Request, res: Response) => {
       const compSales = parseFloat(
         (((sales_stats.d7 || 0) / 7) * 0.3 + ((sales_stats.d14 || 0) / 14) * 0.3 + ((sales_stats.d30 || 0) / 30) * 0.4).toFixed(2)
       );
+      const stockAgg = inv?.localProductId != null
+        ? warehouseStockMap.get(inv.localProductId)
+        : undefined;
+      // FBE 平台在途必须与列表「在途库存」列同源，避免明细气泡与主列不一致。
+      const fbeInTransitQuantity = Number(inv?.inTransitQuantity ?? 0);
+      const targetStock = Math.floor(compSales * 60);
+      const platformStock = stockNum;
+      const platformInTransit = fbeInTransitQuantity;
+      const localStock = stockAgg?.localStock ?? 0;
+      const purchasingInTransit = inv?.localProductId != null
+        ? purchasingInTransitMap.get(inv.localProductId) ?? 0
+        : 0;
+      const planningStock = planningStockMap.get(normalizeSkuKey(skuKey)) ?? 0;
+      const suggestAmount = Math.max(
+        0,
+        targetStock - platformStock - platformInTransit - localStock - purchasingInTransit - planningStock,
+      );
+      const daysSinceSynced = Math.floor((nowMs - p.syncedAt.getTime()) / DAY_MS);
+      let inventoryTag: InventoryTag;
+      if (daysSinceSynced <= 30) {
+        inventoryTag = 'NEW';
+      } else if (compSales === 0 && platformStock + localStock > 0) {
+        inventoryTag = 'DEAD';
+      } else if (compSales > 0) {
+        const turnoverDays = (platformStock + localStock) / compSales;
+        inventoryTag = turnoverDays < 15 ? 'HOT' : 'NORMAL';
+      } else {
+        inventoryTag = 'NORMAL';
+      }
       const productUrl = p.productUrl ?? (() => {
         const domain = (region && REGION_DOMAIN[region as keyof typeof REGION_DOMAIN]) ?? 'emag.ro';
         const name = (p.name ?? '').trim();
@@ -690,7 +788,17 @@ router.get('/', async (req: Request, res: Response) => {
         purchase_cost: purchaseCost || null,
         local_product_id:    inv?.localProductId    ?? null,
         local_chinese_name:  inv?.localChineseName  ?? null,
-        in_transit_quantity: inv?.inTransitQuantity ?? 0,
+        in_transit_quantity: fbeInTransitQuantity,
+        purchaseSuggestion: {
+          targetStock,
+          platformStock,
+          platformInTransit: fbeInTransitQuantity,
+          localStock,
+          purchasingInTransit,
+          planningStock,
+          suggestAmount,
+          inventoryTag,
+        },
         estimated_profit:     p.estimatedProfit ? Number(p.estimatedProfit) : null,
         estimated_profit_cny: p.estimatedProfitCny ? Number(p.estimatedProfitCny) : null,
         profit_margin_pct:    p.profitMarginPct ?? null,

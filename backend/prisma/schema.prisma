@@ -122,8 +122,10 @@ model Product {
   updatedAt         DateTime       @updatedAt @map("updated_at")
   ownerId           Int?           @map("owner_id")
   purchaseOrderId   Int?           @map("purchase_order_id")
+  shopId            Int?           @map("shop_id") // 采购计划归属店铺（从平台产品发起采购时透传，老数据可为空）
   owner             User?          @relation(fields: [ownerId], references: [id])
   purchaseOrder     PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
+  shop              ShopAuthorization? @relation(fields: [shopId], references: [id], onDelete: SetNull)
 
   @@index([status, createdAt(sort: Desc)])
   @@index([category])
@@ -131,6 +133,7 @@ model Product {
   @@index([title])
   @@index([status, ownerId, collectedAt(sort: Desc)])
   @@index([purchaseOrderId])
+  @@index([shopId])
   @@index([sku])
   @@index([externalProductId])
   @@map("products")
@@ -149,6 +152,8 @@ model PurchaseOrder {
   itemCount        Int                   @default(0) @map("item_count")
   status           OrderStatus           @default(PENDING)
   warehouseId      Int?                  @map("warehouse_id")       // 目标入库仓
+  shopId           Int?                  @map("shop_id")            // 采购单归属店铺（仓库收货物理区分用，老数据可为空）
+  shopNameSnapshot String?               @map("shop_name_snapshot") // 建单时店铺名快照，避免店铺改名影响历史单据展示
   remark           String?
   // ── 1688 订单信息（从子单提取上移，主单维度冗余存储便于列表展示）──
   alibabaOrderId   String?               @map("alibaba_order_id")   // 1688 主订单号
@@ -160,6 +165,7 @@ model PurchaseOrder {
   createdAt        DateTime              @default(now()) @map("created_at")
   updatedAt        DateTime              @default(now()) @updatedAt @map("updated_at")
   warehouse        Warehouse?            @relation(fields: [warehouseId], references: [id])
+  shop             ShopAuthorization?    @relation(fields: [shopId], references: [id], onDelete: SetNull)
   products         Product[]
   items            PurchaseOrderItem[]
 
@@ -167,6 +173,7 @@ model PurchaseOrder {
   @@index([operator])
   @@index([status])
   @@index([warehouseId])
+  @@index([shopId])
   @@index([alibabaOrderId])
   @@map("purchase_orders")
 }
@@ -223,6 +230,8 @@ model ShopAuthorization {
   storeProducts   StoreProduct[]
   platformOrders  PlatformOrder[]
   fbeShipments    FbeShipment[]
+  purchaseOrders  PurchaseOrder[]
+  purchasePlanProducts Product[]
 
   @@index([platform])
   @@index([status])

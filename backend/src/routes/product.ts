@@ -29,6 +29,12 @@ function extractOfferIdFromUrl(url: string | null | undefined): string | null {
   return m ? m[1] : null;
 }
 
+function parseOptionalPositiveInt(value: unknown): number | null | 'INVALID' {
+  if (value === undefined || value === null || String(value).trim() === '') return null;
+  const n = Number(value);
+  return Number.isInteger(n) && n > 0 ? n : 'INVALID';
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // 工具：构建 purchaseUrl 变更时的附加字段集
 //
@@ -503,10 +509,26 @@ router.put('/:id/publish', async (req: Request, res: Response) => {
       return;
     }
 
-    const { sku, cnName, stock, handlingTime, price, length: pLen, width: pWid, height: pHei, weight: pWgt, purchaseType } = req.body ?? {};
+    const { sku, cnName, stock, handlingTime, price, length: pLen, width: pWid, height: pHei, weight: pWgt, purchaseType, shopId } = req.body ?? {};
     if (!sku || typeof sku !== 'string' || !sku.trim()) {
       res.status(400).json({ code: 400, data: null, message: 'SKU 不能为空' });
       return;
+    }
+
+    const parsedShopId = parseOptionalPositiveInt(shopId);
+    if (parsedShopId === 'INVALID') {
+      res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+      return;
+    }
+    if (parsedShopId !== null) {
+      const shop = await prisma.shopAuthorization.findUnique({
+        where:  { id: parsedShopId },
+        select: { id: true, status: true },
+      });
+      if (!shop || shop.status !== 'active') {
+        res.status(400).json({ code: 400, data: null, message: '归属店铺不存在或已停用' });
+        return;
+      }
     }
 
     await prisma.product.update({
@@ -526,6 +548,7 @@ router.put('/:id/publish', async (req: Request, res: Response) => {
         purchaseType:     typeof purchaseType === 'string' && purchaseType.trim() ? purchaseType.trim() : 'FIRST',
         publishStatus:    'PUBLISHED',
         status:           'PURCHASING',
+        ...(parsedShopId !== null ? { shopId: parsedShopId } : {}),
         // ★ 进入采购计划时清空旧采购单关联，确保能出现在采购计划列表
         purchaseOrderId:  null,
       },
@@ -581,6 +604,9 @@ router.get('/purchasing', async (req: Request, res: Response) => {
         orderBy: [{ updatedAt: 'desc' }],
         skip,
         take: pageSize,
+        include: {
+          shop: { select: { id: true, shopName: true, region: true } },
+        },
       }),
     ]);
 
@@ -602,6 +628,9 @@ router.get('/purchasing', async (req: Request, res: Response) => {
       purchaseQuantity: p.purchaseQuantity ?? null,
       purchasePeriod:   p.purchasePeriod   ?? null,
       purchaseType:     p.purchaseType     ?? 'FIRST',
+      shopId:           p.shopId           ?? null,
+      shopName:         p.shop?.shopName    ?? null,
+      shop:             p.shop             ?? null,
       length:           p.length        ? Number(p.length)        : null,
       width:            p.width         ? Number(p.width)         : null,
       height:           p.height        ? Number(p.height)        : null,
@@ -990,6 +1019,7 @@ router.put('/batch-rollback', async (req: Request, res: Response) => {
       data: {
         status:        'SELECTED',
         publishStatus: 'UNPUBLISHED',
+        shopId:        null,
       },
     });
 
@@ -1051,6 +1081,7 @@ async function batchDiscardHandler(req: Request, res: Response): Promise<void> {
         purchasePeriod:   null,
         purchaseType:     null,
         purchaseOrderId:  null,
+        shopId:           null,
       },
     });
 
@@ -1072,11 +1103,11 @@ router.put('/batch-discard', batchDiscardHandler);
 
 // ── PUT /api/products/batch-to-purchasing ──────────────────────
 // 从库存 SKU 批量推送产品到采购计划（返单采购）
-// body: { items: [{ id, purchasePrice, purchaseQuantity }, ...] }
+// body: { shopId?: number, items: [{ id, purchasePrice, purchaseQuantity, shopId? }, ...] }
 // 已在采购计划中的产品执行数量累加，新产品直接推入
 router.put('/batch-to-purchasing', async (req: Request, res: Response) => {
   try {
-    const { items } = req.body ?? {};
+    const { items, shopId } = req.body ?? {};
     if (!Array.isArray(items) || items.length === 0) {
       res.status(400).json({ code: 400, data: null, message: '请选择产品' });
       return;
@@ -1084,12 +1115,51 @@ router.put('/batch-to-purchasing', async (req: Request, res: Response) => {
     const userId = req.user!.userId;
     let count = 0;
 
+    // shopId 可放在顶层作为批量默认值，也可每行单独传入；均为可选，兼容旧前端。
+    const defaultShopId = parseOptionalPositiveInt(shopId);
+    if (defaultShopId === 'INVALID') {
+      res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+      return;
+    }
+
+    const requestedShopIds = new Set<number>();
+    if (defaultShopId !== null) requestedShopIds.add(defaultShopId);
+    for (const item of items) {
+      const itemShopId = parseOptionalPositiveInt(item?.shopId);
+      if (itemShopId === 'INVALID') {
+        res.status(400).json({ code: 400, data: null, message: 'items[].shopId 无效' });
+        return;
+      }
+      if (itemShopId !== null) requestedShopIds.add(itemShopId);
+    }
+
+    const activeShopIds = new Set<number>();
+    if (requestedShopIds.size > 0) {
+      const shops = await prisma.shopAuthorization.findMany({
+        where:  { id: { in: Array.from(requestedShopIds) }, status: 'active' },
+        select: { id: true },
+      });
+      for (const shop of shops) activeShopIds.add(shop.id);
+      const invalidShopIds = Array.from(requestedShopIds).filter((id) => !activeShopIds.has(id));
+      if (invalidShopIds.length > 0) {
+        res.status(400).json({
+          code: 400, data: null,
+          message: `归属店铺不存在或已停用：${invalidShopIds.join(', ')}`,
+        });
+        return;
+      }
+    }
+
     await prisma.$transaction(async (tx) => {
       for (const item of items) {
         const id = Number(item.id);
         if (isNaN(id)) continue;
         const qty   = Math.max(0, Number(item.purchaseQuantity) || 0);
         const price = item.purchasePrice != null ? Number(item.purchasePrice) : null;
+        const itemShopId = parseOptionalPositiveInt(item.shopId);
+        const finalShopId = itemShopId !== 'INVALID' && itemShopId !== null
+          ? itemShopId
+          : defaultShopId;
 
         // 库存 SKU 是公司共有资产，不按 ownerId 过滤；
         // 任何员工都可以将任意 SKU 推入自己的采购计划
@@ -1115,6 +1185,7 @@ router.put('/batch-to-purchasing', async (req: Request, res: Response) => {
             //   它脱离了上一个采购单，purchaseOrderId: null 才能出现在
             //   GET /api/products/purchasing 的采购计划列表中
             purchaseOrderId:  null,
+            ...(finalShopId !== null ? { shopId: finalShopId } : {}),
             ...(finalPrice != null ? { purchasePrice: finalPrice } : {}),
           },
         });
@@ -1881,6 +1952,7 @@ router.post('/remove-from-plan', async (req: Request, res: Response) => {
         purchasePeriod:   null,
         purchaseType:     null,
         purchaseOrderId:  null,
+        shopId:           null,
       },
     });
 

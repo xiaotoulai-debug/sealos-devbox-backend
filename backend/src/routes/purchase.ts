@@ -70,6 +70,7 @@ function buildProductIdsJsonForItem(
 // Body: {
 //   items: [{ productId: number, quantity: number }],
 //   warehouseId?: number,   // 目标入库仓（可选）
+//   shopId?: number,        // 归属店铺（可选，老数据可为空）
 //   remark?: string
 // }
 // ─────────────────────────────────────────────────────────────────────
@@ -77,7 +78,7 @@ router.post('/create-local', async (req: Request, res: Response) => {
   try {
     const userId   = req.user!.userId;
     const username = req.user!.username ?? 'unknown';
-    const { items, warehouseId, remark } = req.body ?? {};
+    const { items, warehouseId, shopId, remark } = req.body ?? {};
 
     if (!Array.isArray(items) || items.length === 0) {
       res.status(400).json({ code: 400, data: null, message: '请提供至少一个产品' });
@@ -101,6 +102,27 @@ router.post('/create-local', async (req: Request, res: Response) => {
     }
     const validWarehouseId = wid;
 
+    // 校验归属店铺（可选）：不传保持 null，兼容存量/旧前端建单。
+    let validShopId: number | null = null;
+    let shopNameSnapshot: string | null = null;
+    if (shopId !== undefined && shopId !== null && String(shopId).trim() !== '') {
+      const sid = parseInt(String(shopId), 10);
+      if (isNaN(sid) || sid <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+        return;
+      }
+      const shop = await prisma.shopAuthorization.findUnique({
+        where:  { id: sid },
+        select: { id: true, shopName: true, status: true },
+      });
+      if (!shop || shop.status !== 'active') {
+        res.status(400).json({ code: 400, data: null, message: '归属店铺不存在或已停用' });
+        return;
+      }
+      validShopId = shop.id;
+      shopNameSnapshot = shop.shopName;
+    }
+
     // 校验产品存在（多字段解析 productId，避免前端只传 product.id 等变体导致整单跳过写入）
     const productIds = items
       .map((i: any) => resolveCreateLocalLineProductId(i))
@@ -118,6 +140,8 @@ router.post('/create-local', async (req: Request, res: Response) => {
       select: {
         id: true, sku: true, chineseName: true, title: true,
         purchasePrice: true, externalProductId: true, externalSkuId: true,
+        shopId: true,
+        shop:   { select: { id: true, shopName: true, region: true } },
       },
     });
     const productMap = new Map(products.map((p) => [p.id, p]));
@@ -158,6 +182,8 @@ router.post('/create-local', async (req: Request, res: Response) => {
       const orderNo     = `${prefix}${String(seq).padStart(3, '0')}`;
       const unitPrice   = Number(prod.purchasePrice ?? 0);
       const totalAmount = parseFloat((qty * unitPrice).toFixed(2));
+      const orderShopId = validShopId ?? prod.shopId ?? null;
+      const orderShopNameSnapshot = shopNameSnapshot ?? prod.shop?.shopName ?? null;
 
       const order = await prisma.$transaction(async (tx) => {
         const po = await tx.purchaseOrder.create({
@@ -168,6 +194,8 @@ router.post('/create-local', async (req: Request, res: Response) => {
             itemCount:   1,
             status:      'PENDING',
             warehouseId: validWarehouseId,
+            shopId:      orderShopId,
+            shopNameSnapshot: orderShopNameSnapshot,
             remark:      remark ?? null,
             items: {
               create: {
@@ -180,6 +208,7 @@ router.post('/create-local', async (req: Request, res: Response) => {
           include: {
             items: true,
             warehouse: { select: { id: true, name: true } },
+            shop:      { select: { id: true, shopName: true, region: true } },
           },
         });
 
@@ -207,6 +236,9 @@ router.post('/create-local', async (req: Request, res: Response) => {
         sku:         prod.sku,
         chineseName: prod.chineseName,
         warehouse:   order.warehouse,
+        shopId:      order.shopId,
+        shopName:    order.shopNameSnapshot ?? order.shop?.shopName ?? null,
+        shop:        order.shop,
         has1688:     !!(prod.externalProductId && prod.externalSkuId),
       });
     }
@@ -585,6 +617,7 @@ router.get('/', async (req: Request, res: Response) => {
             },
           },
           warehouse: { select: { id: true, name: true, type: true } },
+          shop:      { select: { id: true, shopName: true, region: true } },
         },
         // 新增字段直接从主单查（无需额外 join）
         // Prisma 默认已包含主表所有字段，此处仅记录用于文档自解释
@@ -782,10 +815,14 @@ router.get('/', async (req: Request, res: Response) => {
         logisticsCompany:(o as any).logisticsCompany  ?? null,
         trackingNumber:  (o as any).trackingNumber    ?? null,
         logisticsStatus: (o as any).logisticsStatus   ?? null,
+        shopId:          (o as any).shopId             ?? null,
+        shopNameSnapshot:(o as any).shopNameSnapshot   ?? null,
+        shopName:        (o as any).shopNameSnapshot ?? (o as any).shop?.shopName ?? null,
         createdAt:       o.createdAt,
         items:           mergedItems,    // ← 已合并产品信息，前端子表直接用
         products:        Array.from(prodById.values()),  // ← 含兜底补查，向后兼容
         warehouse:       (o as any).warehouse ?? null,
+        shop:            (o as any).shop      ?? null,
       };
     }));
 
@@ -1515,6 +1552,7 @@ router.get('/:id', async (req: Request, res: Response) => {
           },
         },
         warehouse: { select: { id: true, name: true, type: true, status: true } },
+        shop:      { select: { id: true, shopName: true, region: true } },
       },
     });
 
@@ -1633,7 +1671,13 @@ router.get('/:id', async (req: Request, res: Response) => {
 
     res.json({
       code: 200,
-      data: { ...order, items: itemsWithProductId },
+      data: {
+        ...order,
+        shopId:   (order as any).shopId ?? null,
+        shopName: (order as any).shopNameSnapshot ?? (order as any).shop?.shopName ?? null,
+        shop:     (order as any).shop ?? null,
+        items:    itemsWithProductId,
+      },
       message: 'success',
     });
   } catch (err: any) {

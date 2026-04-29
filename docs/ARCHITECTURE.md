@@ -69,8 +69,8 @@ backend/
 │   │   │                      #   GET /api/permissions       — 权限平铺列表（供角色回显已选权限）
 │   │   ├── shop.ts            # 店铺授权（增删改查）+ GET /api/shops/authorized（仪表盘下拉专用）
 │   │   ├── emag.ts            # eMAG 业务（类目、发布、同步触发）
-│   │   ├── storeProducts.ts   # 店铺在售产品（同步、补图、综合日销回填、库存绑定）
-│   │   │                      #   GET  /api/store-products          — 分页列表（mappingStatus=mapped/unmapped/all 筛选；优先 Product 表查图片/成本）
+│   │   ├── storeProducts.ts   # 店铺在售产品（同步、补图、综合日销回填、库存绑定、采购建议）
+│   │   │                      #   GET  /api/store-products          — 分页列表（mappingStatus=mapped/unmapped/all 筛选；优先 Product 表查图片/成本；批量聚合 purchaseSuggestion）
 │   │   │                      #   POST /api/store-products/sync     — 手动全量同步
 │   │   │                      #   POST /api/store-products/map      — 绑定库存 SKU（★ SKU 字符串优先匹配，inventorySkuId 兜底；pnk+shopId 或 storeProductId 定位平台产品）
 │   │   ├── dashboard.ts       # 业绩看板（stats、shops 下拉）
@@ -291,7 +291,92 @@ req.query.sortOrder = 'descend'
 
 默认排序：`syncedAt: 'desc'`（最新同步优先）。
 
-### 4.5 多站点数据一致性保障
+### 4.5 智能采购建议（`GET /api/store-products`）
+
+平台产品列表在 DTO 中返回 `purchaseSuggestion`，用于前端展示建议采购量。为避免 N+1 查询，接口在当前分页 `StoreProduct` 拉取后批量构建以下 Map：
+
+- `mappedInventorySku / sku / vendorSku` → `Product`，拿到本地 `productId`。
+- `WarehouseStock.findMany(productId in ...)`：聚合 `stockQuantity` 为本地可用。
+- `PurchaseOrderItem.findMany(purchaseOrder.status in 活跃状态, purchaseOrder.shopId=当前店铺 OR null)`：按 `productIds` JSON 汇总未入库剩余量为采购在途，兼容老采购单/通用备货。
+- `Product.findMany(sku in ..., status=PURCHASING, purchaseOrderId=null, shopId=当前店铺 OR null)`：按 SKU 汇总采购计划中数量，兼容通用备货计划。
+- `FbeShipmentItem.findMany(productId in ..., shipment.shopId=当前店铺, shipment.status=SHIPPED)`：沿用店铺隔离的 FBE 在途汇总。
+
+计算公式：
+
+```typescript
+targetStock = Math.floor(comprehensiveSales * 60);
+suggestAmount = Math.max(
+  0,
+  targetStock
+    - platformStock
+    - platformInTransit
+    - localStock
+    - purchasingInTransit
+    - planningStock,
+);
+```
+
+库存健康度标签 `inventoryTag` 采用四步漏斗：
+
+1. `syncedAt` 距当前时间 `<= 30` 天 → `NEW`（ERP 新同步入库保护期，优先级最高）。
+2. `comprehensiveSales === 0 && (platformStock + localStock) > 0` → `DEAD`。
+3. `comprehensiveSales > 0` 且 `(platformStock + localStock) / comprehensiveSales < 15` → `HOT`。
+4. 其他 → `NORMAL`。
+
+DTO 字段：
+
+```typescript
+purchaseSuggestion: {
+  targetStock,
+  platformStock,
+  platformInTransit,
+  localStock,
+  purchasingInTransit,
+  planningStock,
+  suggestAmount,
+  inventoryTag,
+}
+```
+
+#### 4.5.1 采购与库存智能分析引擎 V1.0
+
+**业务背景**：平台产品列表通过智能采购建议解决业务员凭感觉补货、重复下单、忽略在途资产的问题；库存健康度打标用于直观暴露资金滞压风险与潜在断货风险。
+
+**批量聚合查询（防 N+1）**：`GET /api/store-products` 在拿到当前分页 `StoreProduct` 后，不逐行查库，而是一次性聚合当前页关联 SKU / 产品的资产数据：
+
+- `WarehouseStock`：按本地产品汇总 `stockQuantity`，作为本地可用库存。
+- `PurchaseOrderItem + PurchaseOrder`：按活跃采购单状态汇总未入库数量，作为采购在途。
+- `Product`：按 `status=PURCHASING` 且 `purchaseOrderId=null` 汇总 `purchaseQuantity`，作为计划中数量。
+- `FbeShipmentItem`：按当前店铺的 `SHIPPED` FBE 发货单汇总平台在途。
+
+**核心算账公式**：
+
+```typescript
+suggestAmount = Math.max(
+  0,
+  Math.floor(comprehensiveSales * 60)
+    - platformStock
+    - platformInTransit
+    - localStock
+    - purchasingInTransit
+    - planningStock,
+);
+```
+
+**通用备货容错**：计算“采购在途”和“计划中”资产时，必须同时纳入当前店铺与无归属的通用备货，避免历史采购单或通用计划漏算导致缺口虚高：
+
+```typescript
+OR: [{ shopId: currentShopId }, { shopId: null }]
+```
+
+**库存健康度四步漏斗（严格顺序）**：
+
+1. **新品豁免**：`syncedAt` 距当前时间不足或等于 30 天，标记 `NEW`。因当前无平台真实上架时间，历史老数据首次接入时会获得 30 天 ERP 同步保护期。
+2. **滞销警报**：过保护期后，`comprehensiveSales === 0` 且 `(platformStock + localStock) > 0`，标记 `DEAD`。
+3. **热销/断货预警**：有日销且 `(platformStock + localStock) / comprehensiveSales < 15`，标记 `HOT`。
+4. **正常周转**：其他情况标记 `NORMAL`。
+
+### 4.6 多站点数据一致性保障
 
 ```mermaid
 graph TD
@@ -307,7 +392,7 @@ graph TD
 
 **防回归机制**：`salesStats.ts` 诊断日志仅输出当前 shopId 下销量最高的 Top3 SKU（动态取值），严禁出现任何硬编码 SKU 或 region 字符串。
 
-### 4.6 双轮防漏单扫描机制（2026-04-03 启用）
+### 4.7 双轮防漏单扫描机制（2026-04-03 启用）
 
 **问题根因**：eMAG 订单在创建后如果买家不操作（状态不变化），`modified` 字段保持为 null，仅靠 `modifiedAfter` 无法命中此类订单，导致漏单。
 
@@ -356,6 +441,7 @@ graph TD
 ```
 采购计划页（GET /api/products/purchasing）
   │  只显示: status=PURCHASING + purchaseOrderId=null + ownerId=当前用户
+  │  ★ Product.shopId 记录采购计划归属店铺；老数据可为空，查询 DTO 返回 shopId/shopName/shop
   │
   ├── 移除产品: POST /api/products/remove-from-plan
   │     MAN- → 物理删除  |  真实产品 → SELECTED（退意向池）
@@ -363,8 +449,9 @@ graph TD
   ├── 修改数量: PATCH /api/products/:id/plan-quantity
   │     只操作计划中(purchaseOrderId=null)的产品
   │
-  ▼  POST /api/purchases/create-local（warehouseId 必传，纯本地 DB，绝不调 1688）
+  ▼  POST /api/purchases/create-local（warehouseId 必传，shopId 可选，纯本地 DB，绝不调 1688）
   │  ★ 一品一单：每个产品独立一条 PurchaseOrder + PurchaseOrderItem
+  │  ★ 若传 shopId：写入 PurchaseOrder.shopId + shopNameSnapshot；未传时从 Product.shopId 自动透传
   │  ★ 产品状态 PURCHASING → ORDERED，purchaseOrderId=PO.id（进入采购管理）
   │  ★ rollback 时：ORDERED → PURCHASING，purchaseOrderId=null（重回计划列表）
   │  ★ 【在途联动】事务内 WarehouseStock.upsert(inTransitQuantity += qty)
@@ -392,19 +479,27 @@ RECEIVED（已全部入库）
   ★ 写 PURCHASE_IN 库存流水 + 产品 status 回归 SELECTED
 ```
 
+### 6.1.1 采购单归属店铺物理隔离（Phase 1）
+
+**业务背景**：多店铺集中采购后进入同一仓库，仓库收货需要按店铺物理区分归属，避免同 SKU 跨店混放导致后续 FBE 发货、补货判断和资产统计污染。
+
+**底层设计**：`PurchaseOrder` 增加可选 `shopId Int? @map("shop_id")` 关联 `ShopAuthorization`，并增加 `shopNameSnapshot String? @map("shop_name_snapshot")` 保存建单时店铺名快照，避免店铺改名影响历史单据展示。
+
+**兼容性逻辑**：存量老采购单和“通用备货”单据允许 `shopId=null`。采购单列表与详情查询不强制过滤 `shopId`，DTO 对 `shop/shopName` 做空值兜底；库存建议计算在统计采购在途和计划中资产时同时纳入 `shopId=null` 的通用资产，保证历史数据平稳过渡。
+
 ### 6.2 新增 API
 
 | 接口 | 文件 | 说明 |
 |------|------|------|
-| `GET /api/products/purchasing` | `routes/product.ts` | 采购计划列表（动态视图）：查 `status=PURCHASING AND purchaseOrderId IS NULL`；**已通过 create-local 建单的产品自动隐藏** |
-| `PUT /api/products/batch-to-purchasing` | `routes/product.ts` | 从库存SKU/平台产品批量推入采购计划；**★ 必须同时清空 `purchaseOrderId: null`**，防止二次入计划的产品因残留旧采购单ID被过滤掉 |
-| `PUT /api/products/:id/publish` | `routes/product.ts` | 意向产品确认采购（SELECTED→PURCHASING）；**★ 同上，需清空 `purchaseOrderId`** |
+| `GET /api/products/purchasing` | `routes/product.ts` | 采购计划列表（动态视图）：查 `status=PURCHASING AND purchaseOrderId IS NULL`；返回 `shopId/shopName/shop`；**已通过 create-local 建单的产品自动隐藏** |
+| `PUT /api/products/batch-to-purchasing` | `routes/product.ts` | 从库存SKU/平台产品批量推入采购计划；支持顶层 `shopId` 或每行 `items[].shopId` 写入 `Product.shopId`；**★ 必须同时清空 `purchaseOrderId: null`**，防止二次入计划的产品因残留旧采购单ID被过滤掉 |
+| `PUT /api/products/:id/publish` | `routes/product.ts` | 意向产品确认采购（SELECTED→PURCHASING）；支持可选 `shopId` 写入采购计划归属店铺；**★ 同上，需清空 `purchaseOrderId`** |
 | `POST /api/products/remove-from-plan` | `routes/product.ts` | **从采购计划移除产品**（body: `{ productIds: number[] }`）；只操作 `status=PURCHASING + purchaseOrderId=null` 的计划中产品；MAN- 手工产品物理删除，真实 eMAG 产品退回 SELECTED |
 | `PATCH /api/products/:id/plan-quantity` | `routes/product.ts` | **修改计划中产品的预定采购数量**（body: `{ quantity: number }`）；只允许修改 `PURCHASING + purchaseOrderId=null` 的产品，已建单的拒绝修改 |
-| `POST /api/purchases/create-local` | `routes/purchase.ts` | **采购计划→建单（warehouseId 必传）**；一品一单；建单后产品 `status→ORDERED + purchaseOrderId=PO.id`，从计划列表彻底消失进入采购管理；**★ 同时 `WarehouseStock.inTransitQuantity += qty`（在途库存+）** |
+| `POST /api/purchases/create-local` | `routes/purchase.ts` | **采购计划→建单（warehouseId 必传，shopId 可选）**；若请求传 `shopId`，校验活跃店铺并写入 `PurchaseOrder.shopId + shopNameSnapshot`；若未传则从计划商品 `Product.shopId` 自动透传；一品一单；建单后产品 `status→ORDERED + purchaseOrderId=PO.id`，从计划列表彻底消失进入采购管理；**★ 同时 `WarehouseStock.inTransitQuantity += qty`（在途库存+）** |
 | `POST /api/purchases/fix-in-transit` | `routes/purchase.ts` | **【历史修复接口】** 遍历所有 `status IN (PENDING,PLACED,IN_TRANSIT)` 的活跃采购单，按 `(productId, warehouseId)` 分组重算在途数量，幂等覆盖写入 `WarehouseStock.inTransitQuantity` |
-| `GET /api/purchases` | `routes/purchase.ts` | 采购单分页列表（含子单、关联产品、仓库信息），支持 `tabStatus`/`keyword` 过滤搜索，返回 `tabCounts` 徽标计数 |
-| `GET /api/purchases/:id` | `routes/purchase.ts` | 采购单详情（深度 include items + products + warehouse） |
+| `GET /api/purchases` | `routes/purchase.ts` | 采购单分页列表（含子单、关联产品、仓库、归属店铺信息），支持 `tabStatus`/`keyword` 过滤搜索，返回 `tabCounts` 徽标计数；老数据 `shopId=null` 时返回 `shop/shopName=null` |
+| `GET /api/purchases/:id` | `routes/purchase.ts` | 采购单详情（深度 include items + products + warehouse + shop），`shopName` 优先取 `shopNameSnapshot`，为空时安全返回 null |
 | `POST /api/purchases/:id/place-1688-order` | `routes/purchase.ts` | 手动触发 1688 真实下单，仅 PENDING 状态可执行；调用 `createAlibabaOrder` → 回填订单号 → PLACED |
 | `POST /api/purchases/:id/bind-1688-order` | `routes/purchase.ts` | 手动绑定 1688 订单号（线下已下单回填），事务更新 item.alibabaOrderId + PO.status→PLACED + Product.externalOrderId |
 | `POST /api/purchases/:id/mark-purchasing` | `routes/purchase.ts` | 线下采购标记：直接 PENDING→PLACED，无需 1688 交互，可选回填外部单号 |
@@ -443,7 +538,8 @@ RECEIVED（已全部入库）
 - `OrderStatus` 新增 `PENDING` 值（待下单，内部建单完成，尚未调 1688）
 - `OrderStatus` 新增 `PARTIAL` 值（部分入库，累计已收 < 计划数量，等待剩余货物或人工强制结单）
 - `PurchaseOrderItem` 新增 `receivedQuantity Int @default(0)`（累计已入库数量，支持分批到货追踪）
-- `PurchaseOrder` 新增：`warehouseId`（目标入库仓）、`remark`、`updatedAt`
+- `Product` 新增 `shopId Int? @map("shop_id")`，作为采购计划归属店铺字段；关联 `ShopAuthorization` 且 `onDelete: SetNull`，存量老计划可为空。
+- `PurchaseOrder` 新增：`warehouseId`（目标入库仓）、`shopId`（可选归属店铺，关联 `ShopAuthorization`，`onDelete: SetNull`）、`shopNameSnapshot`（建单时店铺名快照，老数据为空）、`remark`、`updatedAt`
 - `PurchaseOrder` 扩充物流与供应商字段：`alibabaOrderId`（1688 主订单号）、`supplierName`（供应商名称）、`logisticsCompany`（物流公司）、`trackingNumber`（运单号）、`logisticsStatus`（物流状态文本）
 - 新建 `src/services/alibabaService.ts`：封装五个 1688 服务函数：
   - `syncOrderDetail`（`alibaba.trade.get.buyerView`）— 同步订单状态 + 供应商 + 物流单号；**物流解析路径已修正**：1688 实际字段为 `result.nativeLogistics.logisticsItems[]`（而非 `result.logisticsOrders[]`），每项取 `logisticsBillNo`（运单号）和 `logisticsCompanyName`
