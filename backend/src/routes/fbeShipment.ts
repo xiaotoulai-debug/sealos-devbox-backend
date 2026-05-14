@@ -61,11 +61,12 @@ const ALL_STATUSES = ['PENDING', 'ALLOCATING', 'SHIPPED', 'ARRIVED', 'CANCELLED'
 //   warehouseId?: number          出库仓库 ID（多仓架构；建单不锁库，PENDING→ALLOCATING 时锁库）
 //   shipmentNumber?: string       自定义单号（不传则自动生成）
 //   remark?: string
-//   items: [{ sku, quantity, productId? }]
+//   items: [{ storeProductId, quantity, sku? }]
 //
-// 防呆①: 所有 SKU 必须在本地 Product 表中存在
-// 防呆②: 所有 SKU 必须已绑定到目标 shopId 的平台产品
-// 防呆③: 建单阶段不检查库存、不锁库，支持无库存预建单
+// 防呆①: 优先通过 storeProductId 批量解析 StoreProduct.mappedInventorySku
+// 防呆②: 兼容旧前端只传 sku 时，按 StoreProduct.sku/vendorSku/pnk/mappedInventorySku 降级匹配
+// 防呆③: mappedInventorySku 必须在本地 Product 表中存在
+// 防呆④: 建单阶段不检查库存、不锁库，支持无库存预建单
 // ─────────────────────────────────────────────────────────────────────
 router.post('/', async (req: Request, res: Response) => {
   try {
@@ -75,7 +76,7 @@ router.post('/', async (req: Request, res: Response) => {
       warehouseId?: number;
       shipmentNumber?: string;
       remark?: string;
-      items: Array<{ sku: string; quantity: number; productId?: number }>;
+      items: Array<{ storeProductId?: number; sku?: string; quantity: number; productId?: number }>;
     };
 
     // ── 必填校验 ─────────────────────────────────────────────────────
@@ -87,15 +88,34 @@ router.post('/', async (req: Request, res: Response) => {
       res.status(400).json({ code: 400, data: null, message: '请至少添加一个发货明细' });
       return;
     }
-    for (const item of items) {
-      if (!item.sku || typeof item.sku !== 'string' || !item.sku.trim()) {
-        res.status(400).json({ code: 400, data: null, message: 'items 中每条记录必须提供有效的 sku' });
-        return;
-      }
+    type ParsedItem = {
+      index: number;
+      storeProductId: number | null;
+      sku: string | null;
+      quantity: number;
+    };
+    const parsedItems: ParsedItem[] = [];
+
+    for (let index = 0; index < items.length; index++) {
+      const item = items[index];
       if (!item.quantity || !Number.isInteger(item.quantity) || item.quantity <= 0) {
         res.status(400).json({ code: 400, data: null, message: 'quantity 必须为正整数' });
         return;
       }
+      const storeProductIdRaw = item.storeProductId ?? null;
+      const storeProductId = storeProductIdRaw !== null && storeProductIdRaw !== undefined && String(storeProductIdRaw).trim() !== ''
+        ? Number(storeProductIdRaw)
+        : null;
+      if (storeProductId !== null && (!Number.isInteger(storeProductId) || storeProductId <= 0)) {
+        res.status(400).json({ code: 400, data: null, message: 'items 中 storeProductId 必须为有效平台商品 ID' });
+        return;
+      }
+      const sku = typeof item.sku === 'string' && item.sku.trim() ? item.sku.trim() : null;
+      if (storeProductId === null && !sku) {
+        res.status(400).json({ code: 400, data: null, message: 'items 中每条记录必须提供 storeProductId，或兼容传入有效 sku' });
+        return;
+      }
+      parsedItems.push({ index, storeProductId, sku, quantity: item.quantity });
     }
 
     // ── 校验店铺存在 ──────────────────────────────────────────────────
@@ -128,41 +148,122 @@ router.post('/', async (req: Request, res: Response) => {
       }
     }
 
-    // ── 以 SKU 为桥梁查询本地 Product 表 ────────────────────────────
-    const skus = [...new Set(items.map((i) => i.sku.trim()))];
+    // ── 批量解析平台产品 → 本地库存 SKU ─────────────────────────────
+    const requestedStoreProductIds = [
+      ...new Set(parsedItems.map((i) => i.storeProductId).filter((id): id is number => id !== null)),
+    ];
+    const fallbackSkus = [
+      ...new Set(parsedItems.filter((i) => i.storeProductId === null && i.sku).map((i) => i.sku as string)),
+    ];
+
+    const [storeProductsByIdRows, fallbackStoreProductRows] = await Promise.all([
+      requestedStoreProductIds.length > 0
+        ? prisma.storeProduct.findMany({
+            where:  { id: { in: requestedStoreProductIds }, shopId, isArchived: false },
+            select: { id: true, sku: true, vendorSku: true, pnk: true, mappedInventorySku: true, name: true },
+          })
+        : Promise.resolve([]),
+      fallbackSkus.length > 0
+        ? prisma.storeProduct.findMany({
+            where: {
+              shopId,
+              isArchived: false,
+              OR: [
+                { sku:                { in: fallbackSkus } },
+                { vendorSku:          { in: fallbackSkus } },
+                { pnk:                { in: fallbackSkus } },
+                { mappedInventorySku: { in: fallbackSkus } },
+              ],
+            },
+            orderBy: { id: 'asc' },
+            select: { id: true, sku: true, vendorSku: true, pnk: true, mappedInventorySku: true, name: true },
+          })
+        : Promise.resolve([]),
+    ]);
+
+    const storeProductById = new Map(storeProductsByIdRows.map((sp) => [sp.id, sp]));
+    const fallbackStoreProductBySku = new Map<string, typeof fallbackStoreProductRows[number]>();
+    for (const sp of fallbackStoreProductRows) {
+      for (const key of [sp.sku, sp.vendorSku, sp.pnk, sp.mappedInventorySku]) {
+        const normalized = String(key ?? '').trim();
+        if (normalized && !fallbackStoreProductBySku.has(normalized)) {
+          fallbackStoreProductBySku.set(normalized, sp);
+        }
+      }
+    }
+
+    const missingStoreProductIds = requestedStoreProductIds.filter((id) => !storeProductById.has(id));
+    if (missingStoreProductIds.length > 0) {
+      res.status(400).json({
+        code: 400, data: null,
+        message: `平台商品 ID [${missingStoreProductIds.join(', ')}] 不存在或不属于店铺「${shop.shopName}」`,
+      });
+      return;
+    }
+
+    type ResolvedLine = {
+      productSku: string;
+      quantity: number;
+      storeProductId: number;
+    };
+    const resolvedLines: ResolvedLine[] = [];
+    const fallbackMissingSkus: string[] = [];
+    const unmappedStoreProducts: string[] = [];
+
+    for (const item of parsedItems) {
+      const sp = item.storeProductId !== null
+        ? storeProductById.get(item.storeProductId)
+        : fallbackStoreProductBySku.get(item.sku as string);
+
+      if (!sp) {
+        if (item.sku) fallbackMissingSkus.push(item.sku);
+        continue;
+      }
+
+      const mappedSku = String(sp.mappedInventorySku ?? '').trim();
+      if (!mappedSku) {
+        unmappedStoreProducts.push(`ID ${sp.id}${sp.sku ? ` / ${sp.sku}` : ''}`);
+        continue;
+      }
+
+      resolvedLines.push({
+        productSku:      mappedSku,
+        quantity:        item.quantity,
+        storeProductId:  sp.id,
+      });
+    }
+
+    if (fallbackMissingSkus.length > 0) {
+      res.status(400).json({
+        code: 400, data: null,
+        message: `平台 SKU [${[...new Set(fallbackMissingSkus)].join(', ')}] 未同步或不属于店铺「${shop.shopName}」`,
+      });
+      return;
+    }
+    if (unmappedStoreProducts.length > 0) {
+      res.status(400).json({
+        code: 400, data: null,
+        message: `该平台商品尚未绑定本地库存 SKU，请先在平台产品页面完成关联：${unmappedStoreProducts.join(', ')}`,
+      });
+      return;
+    }
+
+    const mappedInventorySkus = [...new Set(resolvedLines.map((line) => line.productSku))];
     const products = await prisma.product.findMany({
-      where: { sku: { in: skus }, isDeleted: false },
+      where: { sku: { in: mappedInventorySkus }, isDeleted: false },
       select: { id: true, sku: true, chineseName: true, stockActual: true, purchasePrice: true },
     });
-
-    const foundSkuSet = new Set(products.map((p) => p.sku!));
-    const missingSkus = skus.filter((s) => !foundSkuSet.has(s));
-    if (missingSkus.length > 0) {
+    const skuToProduct = new Map(products.map((p) => [p.sku!, p]));
+    const missingProductSkus = mappedInventorySkus.filter((sku) => !skuToProduct.has(sku));
+    if (missingProductSkus.length > 0) {
       res.status(400).json({
         code: 400, data: null,
-        message: `SKU [${missingSkus.join(', ')}] 在本地库存中不存在，请先在【库存 SKU】页面创建对应产品`,
+        message: `绑定的本地库存 SKU [${missingProductSkus.join(', ')}] 不存在`,
       });
       return;
     }
 
-    // ── 跨店铺防呆：SKU 必须已绑定到目标店铺 ───────────────────────
-    const skusInShop = await prisma.storeProduct.findMany({
-      where: { shopId, mappedInventorySku: { in: skus } },
-      select: { mappedInventorySku: true },
-    });
-    const mappedSkuSet = new Set(skusInShop.map((s) => s.mappedInventorySku as string));
-    const notMapped = products
-      .filter((p) => !mappedSkuSet.has(p.sku!))
-      .map((p) => `SKU [${p.sku}]（${p.chineseName ?? '无中文名'}）`);
-    if (notMapped.length > 0) {
-      res.status(400).json({
-        code: 400, data: null,
-        message: `以下产品未关联到店铺「${shop.shopName}」，请先在平台产品页绑定 SKU 后再建单：\n${notMapped.join('\n')}`,
-      });
-      return;
-    }
-
-    const skuToProductId    = new Map(products.map((p) => [p.sku!, p.id]));
+    const skuToProductId = new Map(products.map((p) => [p.sku!, p.id]));
     const skuToPurchasePrice = new Map(products.map((p) => [p.sku!, Number(p.purchasePrice ?? 0)]));
 
     // ── 自定义单号去重 ────────────────────────────────────────────────
@@ -180,8 +281,8 @@ router.post('/', async (req: Request, res: Response) => {
 
     // ── 快照货值：Σ(item.quantity × product.purchasePrice)────────────
     // 建单时冻结，防止未来采购价变动影响历史单据核算
-    const totalProductValue = items.reduce((sum, item) => {
-      const price = skuToPurchasePrice.get(item.sku.trim()) ?? 0;
+    const totalProductValue = resolvedLines.reduce((sum, item) => {
+      const price = skuToPurchasePrice.get(item.productSku) ?? 0;
       return sum + item.quantity * price;
     }, 0);
 
@@ -196,8 +297,8 @@ router.post('/', async (req: Request, res: Response) => {
         remark:            remark ?? null,
         ownerId:           userId,
         items: {
-          create: items.map((i) => ({
-            productId:        skuToProductId.get(i.sku.trim())!,
+          create: resolvedLines.map((i) => ({
+            productId:        skuToProductId.get(i.productSku)!,
             quantity:         i.quantity,
             receivedQuantity: 0,
           })),
@@ -506,7 +607,7 @@ router.put('/:id', async (req: Request, res: Response) => {
 
       // ① 查 StoreProduct，确认属于本发货单的 shopId，并拿到 mappedInventorySku
       const storeProducts = await prisma.storeProduct.findMany({
-        where:  { id: { in: storeProductIds }, shopId: current.shopId ?? undefined },
+        where:  { id: { in: storeProductIds }, shopId: current.shopId ?? undefined, isArchived: false },
         select: { id: true, mappedInventorySku: true, name: true, shopId: true },
       });
       const storeProductMap = new Map(storeProducts.map((sp) => [sp.id, sp]));

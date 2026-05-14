@@ -42,7 +42,7 @@ const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
  */
 export async function recalcProfitForShop(shopId: number): Promise<number> {
   const products = await prisma.storeProduct.findMany({
-    where: { shopId },
+    where: { shopId, isArchived: false },
     select: {
       id: true, salePrice: true, currency: true,
       commissionRate: true, mappedInventorySku: true, pnk: true,
@@ -70,6 +70,7 @@ export async function recalcProfitForShop(shopId: number): Promise<number> {
     ? await prisma.storeProduct.findMany({
         where: {
           pnk:               { in: unmappedPnks },
+          isArchived:        false,
           mappedInventorySku: { not: null },
           shopId:            { not: shopId },  // 排除本店自身
         },
@@ -318,7 +319,7 @@ export async function recalcProfitBySkus(skus: string[]): Promise<number> {
 
   // 找出所有映射了这些 SKU 的 StoreProduct 所在的 shopId
   const affected = await prisma.storeProduct.findMany({
-    where: { mappedInventorySku: { in: skus } },
+    where: { mappedInventorySku: { in: skus }, isArchived: false },
     select: { shopId: true },
     distinct: ['shopId'],
   });

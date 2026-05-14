@@ -26,6 +26,68 @@ const EAN_DELAY_MS = 200;
 const CATALOG_BATCH_SIZE = 50; // 第二阶段每批 SKU 数
 const CATALOG_DELAY_MS = 300;
 
+function normalizeBusinessKey(value: string | null | undefined): string | null {
+  const trimmed = String(value ?? '').trim();
+  return trimmed ? trimmed : null;
+}
+
+function buildStoreProductIdentityWhere(
+  shopId: number,
+  np: ReturnType<typeof normalizeEmagProduct>,
+): Prisma.StoreProductWhereInput {
+  const or: Prisma.StoreProductWhereInput[] = [];
+  const emagOfferId = normalizeBusinessKey(np.emagOfferId);
+  const sku = normalizeBusinessKey(np.sku);
+  const vendorSku = normalizeBusinessKey(np.vendorSku);
+  const ean = normalizeBusinessKey(np.ean);
+
+  if (emagOfferId) or.push({ emagOfferId });
+  if (sku) or.push({ sku });
+  if (vendorSku) or.push({ vendorSku });
+  if (ean) or.push({ ean });
+  if (np.pnk) or.push({ pnk: np.pnk });
+
+  return {
+    shopId,
+    isArchived: false,
+    OR: or,
+  };
+}
+
+async function saveStoreProductByBusinessIdentity(
+  shopId: number,
+  np: ReturnType<typeof normalizeEmagProduct>,
+  data: Prisma.StoreProductUncheckedCreateInput,
+  updateData: Prisma.StoreProductUpdateInput,
+): Promise<void> {
+  const identityWhere = buildStoreProductIdentityWhere(shopId, np);
+  const existing = await prisma.storeProduct.findFirst({
+    where: identityWhere,
+    orderBy: [
+      { mappedInventorySku: 'desc' },
+      { syncedAt: 'desc' },
+      { id: 'desc' },
+    ],
+    select: { id: true, pnk: true },
+  });
+
+  if (existing) {
+    if (existing.pnk !== np.pnk) {
+      console.log(
+        `[StoreProduct Identity] shop=${shopId} SKU=${np.sku ?? np.vendorSku ?? '(none)'} ` +
+        `Offer=${np.emagOfferId ?? '(none)'} PNK ${existing.pnk} -> ${np.pnk}`,
+      );
+    }
+    await prisma.storeProduct.update({
+      where: { id: existing.id },
+      data: updateData,
+    });
+    return;
+  }
+
+  await prisma.storeProduct.create({ data });
+}
+
 function isJpgOrPngUrl(u: string): boolean {
   const lower = u.toLowerCase();
   return lower.includes('.jpg') || lower.includes('.jpeg') || lower.includes('.png') || lower.includes('.jpg?') || lower.includes('.png?');
@@ -149,6 +211,7 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
           validationStatus: np.validationStatus,
           docErrors: np.docErrors ?? undefined,
           rejectionReason: np.rejectionReason,
+          isArchived: false,
         };
 
         const updateData: Record<string, any> = { ...data };
@@ -160,11 +223,12 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
           delete updateData.mainImage;
         }
 
-        await prisma.storeProduct.upsert({
-          where: { shopId_pnk: { shopId: creds.shopId, pnk: np.pnk } },
-          create: data as Prisma.StoreProductCreateInput,
-          update: updateData as Prisma.StoreProductUpdateInput,
-        });
+        await saveStoreProductByBusinessIdentity(
+          creds.shopId,
+          np,
+          data as Prisma.StoreProductUncheckedCreateInput,
+          updateData as Prisma.StoreProductUpdateInput,
+        );
 
         if (mainImage) {
           console.log(`[Global Pipeline] SKU: ${skuForLog} -> Valid Image: ${mainImage}`);
@@ -274,6 +338,7 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
     const noImageProducts = await prisma.storeProduct.findMany({
       where: {
         shopId: creds.shopId,
+        isArchived: false,
         OR: [
           { mainImage: null },
           { mainImage: '' },
@@ -307,7 +372,7 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
           const np = normalizeEmagProduct(raw as Record<string, unknown>, creds.region, { logOutput: false });
           if (!np.pnk || !np.mainImage) continue;
           await prisma.storeProduct.updateMany({
-            where: { shopId: creds.shopId, pnk: np.pnk },
+            where: { shopId: creds.shopId, pnk: np.pnk, isArchived: false },
             data: { mainImage: np.mainImage, imageUrl: np.mainImage },
           });
           batchUpdated++;
@@ -328,7 +393,7 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
   }
 
   const saved = await prisma.storeProduct.findMany({
-    where: { shopId: creds.shopId },
+    where: { shopId: creds.shopId, isArchived: false },
     orderBy: { id: 'asc' },
     take: 5,
     select: {
@@ -391,7 +456,7 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
  */
 export async function backfillProductUrls(): Promise<{ updated: number; total: number; errors: string[] }> {
   const products = await prisma.storeProduct.findMany({
-    where: { productUrl: null },
+    where: { productUrl: null, isArchived: false },
     select: { id: true, pnk: true, name: true, shopId: true, shop: { select: { shopName: true } } },
   });
 
@@ -477,6 +542,7 @@ export async function backfillProductUrls(): Promise<{ updated: number; total: n
 export async function backfillProductImages(): Promise<{ updated: number; total: number; errors: string[] }> {
   const products = await prisma.storeProduct.findMany({
     where: {
+      isArchived: false,
       OR: [
         { mainImage: null },
         { mainImage: '' },
@@ -635,7 +701,7 @@ export async function backfillComprehensiveSales(shopId?: number): Promise<{ upd
 
     // 查出所有需要回填的产品（sku 和 vendorSku 都要尝试匹配）
     const products = await prisma.storeProduct.findMany({
-      where: shopId != null ? { shopId } : {},
+      where: { isArchived: false, ...(shopId != null ? { shopId } : {}) },
       select: { id: true, shopId: true, sku: true, vendorSku: true },
     });
 

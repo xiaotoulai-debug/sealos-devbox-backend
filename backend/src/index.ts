@@ -165,6 +165,7 @@ async function start() {
       try {
         const count = await prisma.storeProduct.count({
           where: {
+            isArchived: false,
             OR: [
               { mainImage: null },
               { mainImage: '' },

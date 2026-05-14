@@ -77,6 +77,7 @@ async function buildOrderImageMap(
   const storeProducts = await prisma.storeProduct.findMany({
     where: {
       shopId: { in: shopIds },
+      isArchived: false,
       OR: [{ sku: { in: orderSkus } }, { vendorSku: { in: orderSkus } }],
     },
     select: { sku: true, vendorSku: true, mainImage: true, imageUrl: true, mappedInventorySku: true },

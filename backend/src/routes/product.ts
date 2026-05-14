@@ -73,8 +73,8 @@ function buildPurchaseUrlUpdate(
 router.post('/sync-urls', async (_req: Request, res: Response) => {
   try {
     const result = await backfillProductUrls();
-    const nullCount = await prisma.storeProduct.count({ where: { productUrl: null } });
-    const total = await prisma.storeProduct.count();
+    const nullCount = await prisma.storeProduct.count({ where: { productUrl: null, isArchived: false } });
+    const total = await prisma.storeProduct.count({ where: { isArchived: false } });
     res.json({
       code: 200,
       data: {
@@ -1275,29 +1275,50 @@ router.put('/inventory-batch-update', async (req: Request, res: Response) => {
       res.status(400).json({ code: 400, data: null, message: '没有需要更新的数据' });
       return;
     }
-    const userId = req.user!.userId;
     let count = 0;
+    let rowsWithEmptyPayload = 0;
+    let rowsWithInvalidId = 0;
     // 记录触发了利润相关字段变更的 Product.id 集合
     const idsForRecalc = new Set<number>();
 
+    // 兼容前端 snake_case / 嵌套 id（与 create-local 等接口对齐）
+    const normInventoryBatchRow = (raw: any) => ({
+      id:            raw?.id ?? raw?.productId ?? raw?.product_id,
+      chineseName:   raw?.chineseName ?? raw?.chinese_name,
+      length:        raw?.length,
+      width:         raw?.width,
+      height:        raw?.height,
+      actualWeight:  raw?.actualWeight ?? raw?.actual_weight,
+      purchasePrice: raw?.purchasePrice ?? raw?.purchase_price,
+      purchaseUrl:   raw?.purchaseUrl ?? raw?.purchase_url,
+    });
+
     // ★ 换链前置预查：收集本批次含 purchaseUrl 的 ID，查出当前 externalProductId
     //   用于 buildPurchaseUrlUpdate 判断 offerId 是否真正变化
-    const urlUpdateIds = items
-      .map((i: any) => Number(i.id))
-      .filter((id: number) => !isNaN(id) && items.find((i: any) => Number(i.id) === id && i.purchaseUrl !== undefined));
+    const urlUpdateIdSet = new Set<number>();
+    for (const raw of items) {
+      const row = normInventoryBatchRow(raw);
+      const rid = Number(row.id);
+      if (!isNaN(rid) && row.purchaseUrl !== undefined) urlUpdateIdSet.add(rid);
+    }
+    const urlUpdateIds = [...urlUpdateIdSet];
     const currentExternalMap = new Map<number, string | null>();
     if (urlUpdateIds.length > 0) {
       const existing = await prisma.product.findMany({
-        where: { id: { in: urlUpdateIds }, ownerId: userId },
+        where: { id: { in: urlUpdateIds }, sku: { not: null }, isDeleted: false },
         select: { id: true, externalProductId: true },
       });
       for (const p of existing) currentExternalMap.set(p.id, p.externalProductId ?? null);
     }
 
     await prisma.$transaction(async (tx) => {
-      for (const item of items) {
+      for (const raw of items) {
+        const item = normInventoryBatchRow(raw);
         const id = Number(item.id);
-        if (isNaN(id)) continue;
+        if (isNaN(id)) {
+          rowsWithInvalidId++;
+          continue;
+        }
         const data: Record<string, unknown> = {};
         if (item.chineseName   !== undefined) data.chineseName  = typeof item.chineseName === 'string' && item.chineseName.trim() ? item.chineseName.trim() : null;
         if (item.length        !== undefined) data.length       = item.length != null ? Number(item.length) : null;
@@ -1310,8 +1331,19 @@ router.put('/inventory-batch-update', async (req: Request, res: Response) => {
           const urlFields = buildPurchaseUrlUpdate(item.purchaseUrl, currentExternalMap.get(id) ?? null);
           Object.assign(data, urlFields);
         }
-        if (Object.keys(data).length === 0) continue;
-        const result = await tx.product.updateMany({ where: { id, ownerId: userId, sku: { not: null } }, data });
+        if (Object.keys(data).length === 0) {
+          rowsWithEmptyPayload++;
+          continue;
+        }
+        const whereClause = { id, sku: { not: null } as const, isDeleted: false };
+        console.log('[inventory-batch-update] updateMany', JSON.stringify({ where: whereClause, dataKeys: Object.keys(data) }));
+        const result = await tx.product.updateMany({
+          where: whereClause,
+          data,
+        });
+        if (result.count === 0) {
+          throw new Error(`更新失败：产品不存在或无操作权限（productId=${id}）`);
+        }
         count += result.count;
         // 仅当本次确实写入成功 & 含利润相关字段时，才加入重算队列
         if (result.count > 0 && PROFIT_RELEVANT_FIELDS.some((f) => f in data)) {
@@ -1319,6 +1351,32 @@ router.put('/inventory-batch-update', async (req: Request, res: Response) => {
         }
       }
     });
+
+    if (count === 0) {
+      if (rowsWithEmptyPayload > 0) {
+        res.status(400).json({
+          code: 400,
+          data: null,
+          message:
+            '更新失败：未解析到任何可写入字段。请使用 camelCase（purchaseUrl）或 snake_case（purchase_url），并确保传入了正确的 product id。',
+        });
+        return;
+      }
+      if (rowsWithInvalidId === items.length) {
+        res.status(400).json({
+          code: 400,
+          data: null,
+          message: '更新失败：items 中缺少有效的 product id（支持 id / productId / product_id）。',
+        });
+        return;
+      }
+      res.status(404).json({
+        code: 404,
+        data: null,
+        message: '更新失败：产品不存在或无操作权限',
+      });
+      return;
+    }
 
     res.json({ code: 200, data: { count }, message: `已更新 ${count} 个产品` });
 
@@ -1340,8 +1398,13 @@ router.put('/inventory-batch-update', async (req: Request, res: Response) => {
         }
       });
     }
-  } catch (err) {
+  } catch (err: any) {
     console.error('[PUT /api/products/inventory-batch-update]', err);
+    const message = err?.message ?? '服务器内部错误';
+    if (message.startsWith('更新失败：产品不存在或无操作权限')) {
+      res.status(404).json({ code: 404, data: null, message });
+      return;
+    }
     res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
   }
 });

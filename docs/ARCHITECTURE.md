@@ -218,12 +218,20 @@ graph TD
 | Offer API | `emagProduct.readProductOffers` | `product_offer/read` 分页拉取 SKU、价格、库存 |
 | Normalizer | `emagProductNormalizer.normalizeEmagProduct` | 唯一数据清洗管线，无条件信任 eMAG 返回的图片 URL |
 | images 主图 | `extractFirstImageFromArray` | 按 eMAG 官方文档：`display_type===1` 为主图 url，无则取首项；支持 JSON 字符串自动解析 |
-| Upsert | `prisma.storeProduct.upsert` | `shopId + pnk` 唯一键；有新图片时覆盖，API 无图时保留 DB 已有值（防止清空 1688 绑定图片） |
+| 落库身份 | `saveStoreProductByBusinessIdentity()` | 以 `shopId + emagOfferId / sku / vendorSku / ean` 定位业务售卖实体；PNK 只作为 eMAG 当前 Product 指针，若 eMAG 变更 PNK，更新旧行的 `pnk`，绝不新增脏行 |
 | 无图提取 | `StoreProduct.findMany` | `mainImage` 为 null 或空 |
 | Catalog API | `emagProduct.readProductsByPnk` | `product/read` 批量查询完整产品详情（含 images） |
 | 补全入库 | `prisma.storeProduct.updateMany` | 回写 `mainImage`、`imageUrl` |
 | **库存 SKU 绑定兜底** | `StoreProduct.mappedInventorySku` (String?) | 存储 `Product.sku` 字符串（**无 FK 约束**）；列表接口用该值去 `Product` 表查图片/成本，兜底 `Inventory` 表；图片优先级：**平台图 > 本地库存图** |
 | 列表接口 | `GET /api/store-products` | 三路图片兜底：①按 SKU 查 `Product.imageUrl`（主路径）→ ②若 Product 命中但 imageUrl 为 null，再查 `Inventory.localImage` 补图（修复漏查 Bug）→ ③按 pnk 查 Product（SKU 路径全失效时保底）；`finalImage = emagImage \|\| localImage`；统一输出 `image`/`imageUrl`/`main_image`。**`in_transit_quantity` 按当前 `shopId` 实时隔离聚合**（条件：`FbeShipmentItem.shipment.shopId === 当前店 AND status='SHIPPED'`），彻底杜绝跨店污染 |
+
+### StoreProduct 业务身份重构（2026-05-14）
+
+- **实体原则**：EAN 是物理实体标识；SKU / Offer 是店铺内售卖业务标识；PNK 是 eMAG Product 当前指针，允许随平台重建/迁移而变化。
+- **数据库约束**：`store_products` 保留 `@@unique([shopId, pnk])` 兼容旧定位，同时新增 `@@unique([shopId, sku])`、`@@unique([shopId, vendorSku])`、`@@unique([shopId, emagOfferId])`，并增加 `is_archived` 归档标记与 `shopId+ean` 检索索引。
+- **同步幂等**：`storeProductSync.ts` 不再用单纯 `shopId+pnk` upsert；每条 eMAG Offer 先按 `emagOfferId → sku → vendorSku → ean → pnk` 在本店查旧记录，命中则 `update(id)` 并刷新最新 PNK，未命中才 `create`。
+- **脏数据清洗**：一次性脚本 `npm run ops:cleanup-store-products` dry-run，`npm run ops:cleanup-store-products:fix` 执行硬删除。保留优先级：`mapped_inventory_sku` 非空 → `synced_at` 最新 → `emagOfferId` 最大 → `id` 最大。
+- **前端暴露**：`GET /api/store-products` 及补图、补 URL、利润、库存同步、订单/FBE 相关查询默认过滤 `isArchived=false`，死记录不再进入列表或业务计算。
 
 > **跟卖产品图片说明**：eMAG 的 `product_offer/read` 对跟卖(follow)产品不返回图片。采用【库存 SKU 绑定兜底策略】：通过 `POST /api/store-products/map` 手动绑定。
 >
@@ -683,7 +691,7 @@ RECEIVED（已全部入库）
 | `POST /api/alibaba/*` | `routes/alibaba.ts` | 1688 OAuth/解析/下单/子单同步 |
 | `POST /api/emag/*` | `routes/emag.ts` | eMAG 类目同步/产品发布 |
 | `POST /api/translate` | `routes/translate.ts` | 翻译代理（MyMemory API 转发，罗马尼亚语→中文等，需登录） |
-| `POST /api/fbe-shipments` | `routes/fbeShipment.ts` | 创建 FBE 发货单（**shopId 必填**，含跨店铺防呆校验；shipmentNumber 可选自定义） |
+| `POST /api/fbe-shipments` | `routes/fbeShipment.ts` | 创建 FBE 发货单（**shopId 必填**，`items[].storeProductId` 优先；批量解析 `StoreProduct.mappedInventorySku → Product.sku → Product.id`，兼容旧前端只传 `sku` 时按 `StoreProduct.sku/vendorSku/pnk/mappedInventorySku` 降级匹配；shipmentNumber 可选自定义） |
 | `GET /api/fbe-shipments` | `routes/fbeShipment.ts` | 发货单列表（分页 + 明细 + `productCount`/`totalQuantity` 聚合字段）|
 | `GET /api/fbe-shipments/counts` | `routes/fbeShipment.ts` | 各状态发货单数量（`groupBy status`）；**必须注册在 `GET /:id` 之前**，否则 `counts` 会被误匹配为 `:id` |
 | `PUT /api/fbe-shipments/:id` | `routes/fbeShipment.ts` | 编辑发货单（改单号/备注/明细数量；**支持追加新SKU行**；仅 PENDING/ALLOCATING 可编辑）。`items` 数组两种元素：`{id, quantity}` 更新已有行；`{storeProductId, quantity}` 追加新行（同一事务内执行锁仓）。**无合法 `id` 且无合法 `storeProductId` 的元素 → 400，禁止静默跳过**。 |
@@ -848,6 +856,12 @@ RECEIVED（已全部入库）
 | 成本/规格变更后 | `inventory-batch-update` | `recalcProfitBySkus()` 按 SKU 反查重算（待挂钩子） |
 | 手动触发 | `POST /api/store-products/recalc-profit` | 可指定 shopId，不传则全店铺 |
 | 汇率手动同步 | `POST /api/store-products/sync-exchange-rates` | 测试/紧急更新用 |
+
+### `PUT /api/products/inventory-batch-update` 入参兼容（2026-05-13）
+
+- **主键别名**：每行支持 `id` / `productId` / `product_id`。
+- **camelCase + snake_case**：采购链等字段同时读取两套命名（例如 `purchaseUrl` 与 `purchase_url`），避免 Body 仅带 snake_case 时组装出的 `data` 为空、循环内 `continue` 导致 **从未执行 `updateMany`**，却误报 `code:200, count:0`。
+- **空结果语义**：`count===0` 时若存在「空 payload」行 → **400** 明确提示字段名；若全部行 id 无效 → **400**；否则 → **404**（产品不存在或无权限）。调试日志：`[inventory-batch-update] updateMany` 输出 `where` 与 `dataKeys`（Prisma 默认不打印完整 SQL）。
 
 ### 冷启动兜底（v3，2026-04-09 更新）
 
@@ -1277,7 +1291,7 @@ page, pageSize, sortBy（SORT_WHITELIST 白名单防注入）, sortOrder, keywor
 
 FBE 发货单支持“无库存预建单，延迟锁库”：
 
-- `POST /api/fbe-shipments`：只创建 `PENDING` 单据和明细，不校验库存、不增加 `lockedQuantity`。
+- `POST /api/fbe-shipments`：只创建 `PENDING` 单据和明细，不校验库存、不增加 `lockedQuantity`。新建入参以 `items[].storeProductId` 为主路径，后端批量查询 `store_products` 并通过 `mapped_inventory_sku` 定位本地 `products.sku`；仅传 `sku` 的旧前端请求作为降级路径，按同店铺 `StoreProduct.sku/vendorSku/pnk/mappedInventorySku` 批量匹配，禁止逐行查库。
 - `PENDING → ALLOCATING`：唯一锁库点。在 Prisma `$transaction` 内校验 `warehouse_stocks.stock_quantity >= quantity`，满足后执行 `stockQuantity -= quantity`、`lockedQuantity += quantity`，再更新状态。
 - `ALLOCATING → SHIPPED`：只释放 `lockedQuantity` 并增加 `Product.inTransitQuantity`，禁止再次扣减 `stockQuantity`。
 - `PENDING → CANCELLED`：无库存动作。

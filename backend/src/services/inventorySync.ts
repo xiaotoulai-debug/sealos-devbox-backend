@@ -29,6 +29,7 @@ export async function syncInventoryToPlatform(): Promise<InventorySyncResult[]> 
       const storeProducts = await prisma.storeProduct.findMany({
         where: {
           shopId: shop.id,
+          isArchived: false,
           mappedInventorySku: { not: null },
         },
         select: { pnk: true, mappedInventorySku: true },

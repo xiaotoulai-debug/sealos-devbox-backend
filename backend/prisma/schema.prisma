@@ -293,14 +293,20 @@ model StoreProduct {
   profitMarginPct      Float?     @map("profit_margin_pct")        // 毛利率 % = profit / salePrice × 100
   profitCalculatedAt   DateTime?  @map("profit_calculated_at")     // 上次利润计算时间
   profitBreakdown      Json?      @map("profit_breakdown")          // 利润明细拆解 JSON（各项扣费 + 估算标识）
+  isArchived      Boolean  @default(false) @map("is_archived") // eMAG 变更 PNK/SKU 后保留审计用的归档标记；列表默认过滤
   syncedAt         DateTime @default(now()) @map("synced_at")
   shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
 
   @@unique([shopId, pnk])
+  @@unique([shopId, sku])
+  @@unique([shopId, vendorSku])
+  @@unique([shopId, emagOfferId])
   @@index([shopId])
   @@index([pnk])
+  @@index([shopId, ean])
   @@index([ean])          // EAN 条码搜索索引，支持扫码枪查询与双格式兼容搜索
   @@index([vendorSku])
+  @@index([isArchived])
   @@index([shopId, comprehensiveSales(sort: Desc)])
   @@map("store_products")
 }

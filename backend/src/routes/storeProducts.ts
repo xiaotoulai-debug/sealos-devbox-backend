@@ -103,8 +103,8 @@ const syncUrlsHandler = async (req: Request, res: Response) => {
   console.log('[POST /api/store-products/sync-urls] 收到请求，触发 backfillProductUrls');
   try {
     const result = await backfillProductUrls();
-    const nullCount = await prisma.storeProduct.count({ where: { productUrl: null } });
-    const total = await prisma.storeProduct.count();
+    const nullCount = await prisma.storeProduct.count({ where: { productUrl: null, isArchived: false } });
+    const total = await prisma.storeProduct.count({ where: { isArchived: false } });
     res.json({
       code: 200,
       data: {
@@ -135,9 +135,9 @@ const syncImagesHandler = async (req: Request, res: Response) => {
   try {
     const result = await backfillProductImages();
     const withImage = await prisma.storeProduct.count({
-      where: { AND: [{ mainImage: { not: null } }, { mainImage: { not: '' } }] },
+      where: { isArchived: false, AND: [{ mainImage: { not: null } }, { mainImage: { not: '' } }] },
     });
-    const total = await prisma.storeProduct.count();
+    const total = await prisma.storeProduct.count({ where: { isArchived: false } });
     res.json({
       code: 200,
       data: {
@@ -210,8 +210,8 @@ router.post('/map', async (req: Request, res: Response) => {
         res.status(400).json({ code: 400, data: null, message: 'pnk 或 shopId 格式无效' });
         return;
       }
-      const found = await prisma.storeProduct.findUnique({
-        where:  { shopId_pnk: { shopId, pnk } },
+      const found = await prisma.storeProduct.findFirst({
+        where:  { shopId, pnk, isArchived: false },
         select: { id: true },
       });
       if (!found) {
@@ -288,9 +288,9 @@ router.post('/map', async (req: Request, res: Response) => {
     // ── Step 3：校验平台产品存在 ──────────────────────────────────
     const sp = await prisma.storeProduct.findUnique({
       where:  { id: storeProductId },
-      select: { id: true, pnk: true, shopId: true },
+      select: { id: true, pnk: true, shopId: true, isArchived: true },
     });
-    if (!sp) {
+    if (!sp || sp.isArchived) {
       res.status(404).json({ code: 404, data: null, message: '平台产品不存在' });
       return;
     }
@@ -368,10 +368,11 @@ router.get('/', async (req: Request, res: Response) => {
     // Prisma 无法在一条 where 里同时表达「IS NULL OR = ''」，使用 OR 组合处理空字符串边界
     type WhereClause = {
       shopId: number;
+      isArchived: boolean;
       OR?: Array<Record<string, unknown>>;
       AND?: Array<Record<string, unknown>>;
     };
-    const where: WhereClause = { shopId };
+    const where: WhereClause = { shopId, isArchived: false };
 
     if (mappingStatus === 'mapped') {
       // 已关联：mappedInventorySku 不为 null 且不为空字符串
@@ -937,7 +938,7 @@ router.patch('/:pnk/cost-correction', async (req: Request, res: Response) => {
 
     // ── Step 2：查找关联的 StoreProduct（获取 shopId 列表 + mappedInventorySku）
     const storeProducts = await prisma.storeProduct.findMany({
-      where: { pnk, ...(shopId ? { shopId } : {}) },
+      where: { pnk, isArchived: false, ...(shopId ? { shopId } : {}) },
       select: { id: true, shopId: true, mappedInventorySku: true },
     });
 
@@ -949,7 +950,7 @@ router.patch('/:pnk/cost-correction', async (req: Request, res: Response) => {
     // ── Step 3a：更新 store_products.commission_rate（店铺级）──────
     if (commissionRate !== undefined) {
       await prisma.storeProduct.updateMany({
-        where: { pnk, ...(shopId ? { shopId } : {}) },
+        where: { pnk, isArchived: false, ...(shopId ? { shopId } : {}) },
         data: { commissionRate: Number(commissionRate) },
       });
     }
@@ -983,7 +984,7 @@ router.patch('/:pnk/cost-correction', async (req: Request, res: Response) => {
 
     // ── Step 5：读取最新 breakdown 返回给前端 ──────────────────────
     const refreshed = await prisma.storeProduct.findFirst({
-      where: { pnk, ...(shopId ? { shopId } : {}) },
+      where: { pnk, isArchived: false, ...(shopId ? { shopId } : {}) },
       select: {
         estimatedProfit:    true,
         estimatedProfitCny: true,
