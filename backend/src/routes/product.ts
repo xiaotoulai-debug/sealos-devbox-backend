@@ -1285,6 +1285,7 @@ router.put('/inventory-batch-update', async (req: Request, res: Response) => {
     const normInventoryBatchRow = (raw: any) => ({
       id:            raw?.id ?? raw?.productId ?? raw?.product_id,
       chineseName:   raw?.chineseName ?? raw?.chinese_name,
+      imageUrl:      raw?.imageUrl ?? raw?.image_url ?? raw?.image,
       length:        raw?.length,
       width:         raw?.width,
       height:        raw?.height,
@@ -1321,6 +1322,7 @@ router.put('/inventory-batch-update', async (req: Request, res: Response) => {
         }
         const data: Record<string, unknown> = {};
         if (item.chineseName   !== undefined) data.chineseName  = typeof item.chineseName === 'string' && item.chineseName.trim() ? item.chineseName.trim() : null;
+        if (item.imageUrl      !== undefined) data.imageUrl     = typeof item.imageUrl === 'string' && item.imageUrl.trim() ? item.imageUrl.trim() : null;
         if (item.length        !== undefined) data.length       = item.length != null ? Number(item.length) : null;
         if (item.width         !== undefined) data.width        = item.width != null ? Number(item.width) : null;
         if (item.height        !== undefined) data.height       = item.height != null ? Number(item.height) : null;

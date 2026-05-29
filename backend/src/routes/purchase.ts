@@ -37,6 +37,18 @@ function resolveCreateLocalLineProductId(line: any): number | null {
   return null;
 }
 
+function parseProductIdsJson(raw: string | null | undefined): number[] {
+  try {
+    const parsed: unknown = JSON.parse(raw ?? '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((id) => parseInt(String(id), 10))
+      .filter((id) => !Number.isNaN(id) && id > 0);
+  } catch {
+    return [];
+  }
+}
+
 /**
  * 为 PurchaseOrderItem 生成应持久化的 productIds JSON。
  * 优先保留已有合法 JSON；否则按子单 offerId 匹配 Product.externalProductId；一品一单则兜底唯一关联产品。
@@ -45,13 +57,8 @@ function buildProductIdsJsonForItem(
   item: { offerId?: string | null; productIds?: string | null },
   products: Array<{ id: number; externalProductId?: string | null }>,
 ): string {
-  try {
-    const parsed: unknown = JSON.parse(item.productIds ?? '[]');
-    if (Array.isArray(parsed) && parsed.length > 0) {
-      const nums = parsed.map((x) => parseInt(String(x), 10)).filter((n) => !Number.isNaN(n) && n > 0);
-      if (nums.length > 0) return JSON.stringify(nums);
-    }
-  } catch { /* ignore */ }
+  const nums = parseProductIdsJson(item.productIds);
+  if (nums.length > 0) return JSON.stringify(nums);
   const offer = String(item.offerId ?? '').trim();
   if (offer) {
     const matched = products.filter((p) => String(p.externalProductId ?? '').trim() === offer);
@@ -1570,6 +1577,29 @@ router.get('/:id', async (req: Request, res: Response) => {
     );
 
     const itemsRaw = ((order as any).items as any[] ?? []);
+    const missingProductIds = new Set<number>();
+    for (const item of itemsRaw) {
+      for (const pid of parseProductIdsJson(item.productIds)) {
+        if (!prodById.has(pid)) missingProductIds.add(pid);
+      }
+    }
+    if (missingProductIds.size > 0) {
+      const extraByProductIds = await prisma.product.findMany({
+        where: { id: { in: [...missingProductIds] }, isDeleted: false },
+        select: {
+          id: true, sku: true, chineseName: true, title: true, imageUrl: true,
+          purchasePrice: true, purchaseQuantity: true, purchaseUrl: true,
+          externalProductId: true,
+          externalSkuId:     true,
+          externalSkuIdNum:  true,
+          externalSynced:    true,
+          externalOrderId:   true,
+        },
+      });
+      for (const p of extraByProductIds) {
+        prodById.set(p.id, p);
+      }
+    }
 
     const mergeDetailItems = (prodMap: Map<number, any>) =>
       itemsRaw.map((item: any) => {
@@ -2798,12 +2828,19 @@ router.post('/:id/cancel-and-release', async (req: Request, res: Response) => {
       return;
     }
 
-    // ── 查主单 + items（取消校验 + 在途扣减用）+ products（释放用）────────────────
+    // ── 查主单 + items（productIds 是释放/扣减的历史凭据主路径）────────────────
     const order = await prisma.purchaseOrder.findUnique({
       where: { id },
       include: {
-        items:    { select: { id: true, alibabaOrderStatus: true, quantity: true } },
-        products: { select: { id: true, sku: true } },
+        items: {
+          select: {
+            id: true,
+            offerId: true,
+            productIds: true,
+            alibabaOrderStatus: true,
+            quantity: true,
+          },
+        },
       },
     });
 
@@ -2812,8 +2849,15 @@ router.post('/:id/cancel-and-release', async (req: Request, res: Response) => {
       return;
     }
 
-    // ① 状态校验：只允许 PLACED 状态执行取消释放
-    if (order.status !== 'PLACED') {
+    const CANCEL_STATUSES = new Set(['cancelled', 'closed', 'cancel']);
+    const hasCancelledItem = order.items.some((item) =>
+      CANCEL_STATUSES.has(String(item.alibabaOrderStatus ?? '').trim().toLowerCase()),
+    );
+    const orderHasCancelSignal = CANCEL_STATUSES.has(String(order.logisticsStatus ?? '').trim().toLowerCase());
+    const allowedStatus = order.status === 'PLACED' || (order.status === 'PENDING' && orderHasCancelSignal);
+
+    // ① 状态校验：PLACED 主路径；若主单物流状态已有取消语义，允许 PENDING 坏账释放
+    if (!allowedStatus) {
       const statusLabel: Record<string, string> = {
         PENDING:    '待下单',
         IN_TRANSIT: '运输中',
@@ -2825,21 +2869,17 @@ router.post('/:id/cancel-and-release', async (req: Request, res: Response) => {
       res.status(400).json({
         code: 400,
         data: null,
-        message: `该采购单当前状态为「${label}」，仅"已下单（PLACED）"状态的采购单支持取消释放操作`,
+        message: `该采购单当前状态为「${label}」，仅"已下单（PLACED）"状态或已带取消物流语义的坏账单支持取消释放操作`,
       });
       return;
     }
 
-    // ② 子单取消状态校验：至少一条 item 的 1688 状态为 cancelled 或 closed
-    const CANCEL_STATUSES = new Set(['cancelled', 'closed']);
-    const hasCancelledItem = order.items.some(
-      (item) => item.alibabaOrderStatus && CANCEL_STATUSES.has(item.alibabaOrderStatus),
-    );
-    if (!hasCancelledItem) {
+    // ② 取消状态校验：子单状态或主单 logisticsStatus 任一路径有取消语义即可放行
+    if (!hasCancelledItem && !orderHasCancelSignal) {
       res.status(400).json({
         code: 400,
         data: null,
-        message: '该采购单的 1688 订单尚未取消（alibabaOrderStatus 不是 cancelled/closed），请先在 1688 平台确认取消后再操作',
+        message: '该采购单的 1688 订单尚未取消（子单 alibabaOrderStatus 或主单 logisticsStatus 未体现 cancel/closed），请先在 1688 平台确认取消后再操作',
       });
       return;
     }
@@ -2847,15 +2887,38 @@ router.post('/:id/cancel-and-release', async (req: Request, res: Response) => {
     const username = req.user!.username ?? 'unknown';
     const warehouseId = order.warehouseId ?? null;
 
-    // 统计各产品应扣减的在途数量（按 item.quantity 汇总，一品一单通常只有一条）
-    const totalQtyByProductId = new Map<number, number>();
+    // ③ productIds JSON 是历史凭据主路径：即使 Product.purchaseOrderId 已释放也必须能找回产品
+    const qtyByProductId = new Map<number, number>();
     for (const item of order.items) {
-      // productIds JSON → 解析出关联产品 ID，与 items.quantity 对应
-      // 一品一单场景：每个 item 对应唯一产品，直接按 order.products 映射（若 productIds 为空）
-      // 此处保守策略：将 totalQty 均摊给本单所有产品（一品一单下 products.length === 1，安全）
+      const pids = parseProductIdsJson(item.productIds);
+      for (const pid of pids) {
+        qtyByProductId.set(pid, (qtyByProductId.get(pid) ?? 0) + Math.max(0, item.quantity ?? 0));
+      }
     }
-    // 一品一单铁律：item 数量 = 产品采购数量；多 item 场景按各自 quantity 汇总给对应产品
-    const totalItemQty = order.items.reduce((s, item) => s + (item.quantity ?? 0), 0);
+    const productIds = [...qtyByProductId.keys()];
+    if (productIds.length === 0) {
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: '采购单子单缺少 productIds 历史凭据，无法安全释放产品，请先执行数据修复脚本',
+      });
+      return;
+    }
+
+    const products = await prisma.product.findMany({
+      where: { id: { in: productIds }, isDeleted: false },
+      select: { id: true, sku: true },
+    });
+    const existingProductIds = new Set(products.map((p) => p.id));
+    const missingProductIds = productIds.filter((pid) => !existingProductIds.has(pid));
+    if (missingProductIds.length > 0) {
+      res.status(400).json({
+        code: 400,
+        data: { missingProductIds },
+        message: `采购单子单引用的产品不存在或已删除：${missingProductIds.join(', ')}`,
+      });
+      return;
+    }
 
     await prisma.$transaction(async (tx) => {
       // ① 冻结主单：status → CANCELLED，历史 1688 信息原封不动保留
@@ -2866,42 +2929,41 @@ router.post('/:id/cancel-and-release', async (req: Request, res: Response) => {
 
       // ② 扣减在途库存（★ 核心修复：PLACED 状态建单时 create-local 已 increment inTransitQuantity，
       //    取消时必须 decrement，否则产品重建新采购单后会被再次 increment，造成双倍在途）
-      if (warehouseId && order.products.length > 0) {
-        for (const prod of order.products) {
-          // 一品一单：单产品 qty = 该产品对应 item 的 quantity；取全部 items 之和作为安全上界
-          const qty = totalItemQty > 0 ? totalItemQty : 1;
-          await tx.warehouseStock.updateMany({
-            where: { productId: prod.id, warehouseId },
-            data:  { inTransitQuantity: { decrement: qty } },
-          });
-          // 同步 Product.inTransitQuantity（Product 表冗余字段，与 WarehouseStock 保持一致）
-          await tx.product.update({
-            where: { id: prod.id },
-            data:  { inTransitQuantity: { decrement: qty } },
-          });
+      for (const [productId, qty] of qtyByProductId) {
+        if (warehouseId) {
+          await tx.$executeRaw`
+            UPDATE warehouse_stocks
+            SET    in_transit_quantity = GREATEST(0, in_transit_quantity - ${qty})
+            WHERE  product_id = ${productId}
+            AND    warehouse_id = ${warehouseId}
+          `;
         }
+
+        await tx.$executeRaw`
+          UPDATE products
+          SET    in_transit_quantity = GREATEST(0, in_transit_quantity - ${qty})
+          WHERE  id = ${productId}
+        `;
       }
 
       // ③ 释放关联产品需求：解除绑定，退回采购计划
       //    ★ externalSynced / externalSkuId / externalProductId 绝不清空（规格绑定成果保留）
-      if (order.products.length > 0) {
-        await tx.product.updateMany({
-          where: { id: { in: order.products.map((p) => p.id) } },
-          data: {
-            purchaseOrderId: null,       // 解除与旧采购单的绑定，产品重回采购计划列表
-            status:          'PURCHASING', // 退回采购中状态，出现在 GET /api/products/purchasing
-            externalOrderId: null,         // 清空已取消的 1688 订单号引用
-            // externalSynced / externalSkuId / externalProductId ← 保留，不动
-          },
-        });
-      }
+      await tx.product.updateMany({
+        where: { id: { in: productIds } },
+        data: {
+          purchaseOrderId: null,       // 解除与旧采购单的绑定，产品重回采购计划列表
+          status:          'PURCHASING', // 退回采购中状态，出现在 GET /api/products/purchasing
+          externalOrderId: null,         // 清空已取消的 1688 订单号引用
+          // externalSynced / externalSkuId / externalProductId ← 保留，不动
+        },
+      });
 
       // ④ PurchaseOrderItem：不做任何修改，作为完整的历史凭据冻结
     });
 
     console.log(
       `[cancel-and-release] ${username} 取消采购单 #${id}(${order.orderNo})，` +
-      `释放 ${order.products.length} 个产品回采购计划，PO 历史凭据完整保留`,
+      `通过 productIds 释放 ${products.length} 个产品回采购计划，PO 历史凭据完整保留`,
     );
 
     res.json({
@@ -2909,13 +2971,14 @@ router.post('/:id/cancel-and-release', async (req: Request, res: Response) => {
       data: {
         orderId:           id,
         orderNo:           order.orderNo,
-        prevStatus:        'PLACED',
+        prevStatus:        order.status,
         currentStatus:     'CANCELLED',
-        releasedCount:     order.products.length,
-        releasedSkus:      order.products.map((p) => p.sku ?? `#${p.id}`),
-        inTransitDeducted: warehouseId ? totalItemQty * order.products.length : 0,
+        releasedCount:     products.length,
+        releasedSkus:      products.map((p) => p.sku ?? `#${p.id}`),
+        resolvedProductIds: productIds,
+        inTransitDeducted: [...qtyByProductId.values()].reduce((s, qty) => s + qty, 0),
       },
-      message: `采购单 ${order.orderNo} 已取消冻结，${order.products.length} 个产品已退回采购计划，规格映射保留${warehouseId ? `，已扣减在途库存 ${totalItemQty} 件` : ''}`,
+      message: `采购单 ${order.orderNo} 已取消冻结，${products.length} 个产品已退回采购计划，规格映射保留${warehouseId ? '，已扣减在途库存' : ''}`,
     });
   } catch (err: any) {
     console.error('[POST /api/purchases/:id/cancel-and-release]', err?.message ?? err);

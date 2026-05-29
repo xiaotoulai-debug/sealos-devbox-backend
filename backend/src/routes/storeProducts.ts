@@ -7,17 +7,81 @@
  */
 
 import { Router, Request, Response } from 'express';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
-import { authenticate } from '../middleware/auth';
+import { authenticate, requireSuperAdmin } from '../middleware/auth';
 import { getEmagCredentials, resolveRegion, REGION_CURRENCY, REGION_DOMAIN } from '../services/emagClient';
 import { getSalesStatsByShop, getSalesForProduct, logZeroSalesDiagnostic } from '../services/salesStats';
 import { tryAcquireLock, releaseLock } from '../lib/syncStatus';
 import { backfillProductUrls, backfillProductImages, syncStoreProducts, backfillComprehensiveSales } from '../services/storeProductSync';
 import { recalcProfitForShop, recalcProfitForAllShops } from '../services/profitCalculator';
 import { syncExchangeRates } from '../services/exchangeRateSync';
+import {
+  calculateStockStatus,
+  classifyStoreProduct,
+  isProductClass,
+  normalizeProductClassQuery,
+  PRODUCT_CLASSES,
+  recalcProductClassForAllShops,
+  recalcProductClassForShop,
+} from '../services/productClassification';
 
 const router = Router();
 router.use(authenticate);
+
+const PRODUCT_CLASS_SUMMARY_KEYS = PRODUCT_CLASSES;
+
+function buildStoreProductListWhere(shopId: number, mappingStatus: string, search: string): Prisma.StoreProductWhereInput {
+  const where: Prisma.StoreProductWhereInput = { shopId, isArchived: false };
+
+  if (mappingStatus === 'mapped') {
+    where.AND = [
+      { mappedInventorySku: { not: null } },
+      { mappedInventorySku: { not: '' } },
+    ];
+  } else if (mappingStatus === 'unmapped') {
+    where.OR = [
+      { mappedInventorySku: null },
+      { mappedInventorySku: '' },
+    ];
+  }
+
+  if (!search) return where;
+
+  const q = { contains: search, mode: 'insensitive' as const };
+  const eanSearchTerms: string[] = [search];
+  if (/^\d{12,13}$/.test(search)) {
+    const withLeadingZero = search.padStart(13, '0');
+    const withoutLeadingZero = search.replace(/^0+/, '') || search;
+    if (!eanSearchTerms.includes(withLeadingZero)) eanSearchTerms.push(withLeadingZero);
+    if (!eanSearchTerms.includes(withoutLeadingZero)) eanSearchTerms.push(withoutLeadingZero);
+  }
+  const eanOrConditions = eanSearchTerms.map((t) => ({ ean: { equals: t, mode: 'insensitive' as const } }));
+  const searchOr = [
+    { sku: q },
+    ...eanOrConditions,
+    { pnk: q },
+    { name: q },
+    { vendorSku: q },
+  ];
+
+  if (mappingStatus === 'unmapped') {
+    const existingOr = where.OR;
+    delete where.OR;
+    where.AND = [
+      { OR: existingOr } as Prisma.StoreProductWhereInput,
+      { OR: searchOr } as Prisma.StoreProductWhereInput,
+    ];
+  } else if (where.AND) {
+    const andClauses = Array.isArray(where.AND) ? where.AND : [where.AND];
+    andClauses.push({ OR: searchOr } as Prisma.StoreProductWhereInput);
+    where.AND = andClauses;
+  } else {
+    where.OR = searchOr as Prisma.StoreProductWhereInput['OR'];
+  }
+
+  return where;
+}
 
 /**
  * POST /api/store-products/sync
@@ -180,6 +244,42 @@ router.post('/backfill-comprehensive-sales', async (req: Request, res: Response)
 });
 
 /**
+ * POST /api/store-products/recalc-product-class
+ * 手动触发平台产品分类重算。默认真实写库；传 dryRun=true 可只预览。
+ * Body: { shopId?: number, dryRun?: boolean }
+ */
+router.post('/recalc-product-class', requireSuperAdmin, async (req: Request, res: Response) => {
+  try {
+    const rawShopId = req.body?.shopId ?? req.query?.shopId;
+    const rawDryRun = req.body?.dryRun ?? req.query?.dryRun;
+    const dryRun = rawDryRun === true || String(rawDryRun ?? '').toLowerCase() === 'true' || String(rawDryRun ?? '') === '1';
+
+    if (rawShopId != null) {
+      const shopId = Number(rawShopId);
+      if (!Number.isInteger(shopId) || shopId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+        return;
+      }
+      const result = await recalcProductClassForShop(shopId, { dryRun });
+      res.json({ code: 200, data: result, message: dryRun ? '产品分类 dry-run 完成' : '产品分类重算完成' });
+      return;
+    }
+
+    const results = await recalcProductClassForAllShops({ dryRun });
+    const totalScanned = results.reduce((sum, r) => sum + r.scanned, 0);
+    const totalUpdated = results.reduce((sum, r) => sum + r.updated, 0);
+    res.json({
+      code: 200,
+      data: { results, totalScanned, totalUpdated },
+      message: dryRun ? '全店铺产品分类 dry-run 完成' : '全店铺产品分类重算完成',
+    });
+  } catch (err: any) {
+    console.error('[POST /api/store-products/recalc-product-class]', err);
+    res.status(500).json({ code: 500, data: null, message: err?.message ?? '产品分类重算失败' });
+  }
+});
+
+/**
  * POST /api/store-products/map
  * 手动绑定平台产品与库存 SKU
  *
@@ -317,6 +417,62 @@ const DEFAULT_SHIPPING = 5;
 const SHIPPING_PER_KG = 2;
 
 /**
+ * GET /api/store-products/classification-summary
+ * 平台产品分类数量汇总，用于前端分类下拉框展示。
+ *
+ * Query: shopId (必填), mappingStatus/search (预留并按列表口径支持)
+ */
+router.get('/classification-summary', async (req: Request, res: Response) => {
+  try {
+    const shopId = Number(req.query.shopId);
+    if (!Number.isInteger(shopId) || shopId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: '缺少 shopId 参数' });
+      return;
+    }
+
+    const shop = await prisma.shopAuthorization.findFirst({
+      where: { id: shopId, platform: { equals: 'emag', mode: 'insensitive' } },
+      select: { id: true },
+    });
+    if (!shop) {
+      res.status(404).json({ code: 404, data: null, message: '未找到有效的 eMAG 店铺' });
+      return;
+    }
+
+    const mappingStatus = String(req.query.mappingStatus ?? 'all').trim().toLowerCase();
+    const search = String(req.query.search ?? req.query.query ?? '').trim();
+    const where = buildStoreProductListWhere(shopId, mappingStatus, search);
+
+    const grouped = await prisma.storeProduct.groupBy({
+      by: ['productClass'],
+      where,
+      _count: { _all: true },
+    });
+
+    const summary = PRODUCT_CLASS_SUMMARY_KEYS.reduce((acc, cls) => {
+      acc[cls] = 0;
+      return acc;
+    }, {} as Record<(typeof PRODUCT_CLASS_SUMMARY_KEYS)[number], number>);
+
+    for (const row of grouped) {
+      const count = row._count._all;
+      const productClass = row.productClass;
+      if (productClass && isProductClass(productClass)) {
+        summary[productClass] += count;
+      } else {
+        summary.NORMAL += count;
+      }
+    }
+
+    const total = PRODUCT_CLASS_SUMMARY_KEYS.reduce((sum, cls) => sum + summary[cls], 0);
+    res.json({ code: 200, data: { total, ...summary }, message: 'success' });
+  } catch (err) {
+    console.error('[GET /api/store-products/classification-summary] Error:', err);
+    res.status(500).json({ code: 500, data: null, message: err instanceof Error ? err.message : '分类统计失败' });
+  }
+});
+
+/**
  * GET /api/store-products
  * 查询店铺在售产品，通过 sku 与 Inventory 碰头反哺本地资料
  *
@@ -364,15 +520,22 @@ router.get('/', async (req: Request, res: Response) => {
 
     // mappingStatus 筛选：'mapped' | 'unmapped' | 'all'（默认 all）
     const mappingStatus = String(req.query.mappingStatus ?? 'all').trim().toLowerCase();
+    const rawProductClass = req.query.productClass ?? req.query.product_class;
+    const productClassFilter = normalizeProductClassQuery(rawProductClass);
+    if (rawProductClass != null && productClassFilter == null) {
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: 'productClass 无效，合法值：HOT/POTENTIAL/NORMAL/DEAD/NEW/TO_BE_ELIMINATED/all',
+      });
+      return;
+    }
 
     // Prisma 无法在一条 where 里同时表达「IS NULL OR = ''」，使用 OR 组合处理空字符串边界
-    type WhereClause = {
-      shopId: number;
-      isArchived: boolean;
-      OR?: Array<Record<string, unknown>>;
-      AND?: Array<Record<string, unknown>>;
-    };
-    const where: WhereClause = { shopId, isArchived: false };
+    const where: Prisma.StoreProductWhereInput = { shopId, isArchived: false };
+    if (productClassFilter && productClassFilter !== 'all') {
+      where.productClass = productClassFilter;
+    }
 
     if (mappingStatus === 'mapped') {
       // 已关联：mappedInventorySku 不为 null 且不为空字符串
@@ -419,15 +582,17 @@ router.get('/', async (req: Request, res: Response) => {
         const existingOr = where.OR;
         delete where.OR;
         where.AND = [
-          { OR: existingOr }  as Record<string, unknown>,
-          { OR: searchOr }    as Record<string, unknown>,
+          { OR: existingOr }  as Prisma.StoreProductWhereInput,
+          { OR: searchOr }    as Prisma.StoreProductWhereInput,
         ];
       } else {
         // mapped / all 场景：直接追加搜索 OR
         if (where.AND) {
-          where.AND.push({ OR: searchOr } as Record<string, unknown>);
+          const andClauses = Array.isArray(where.AND) ? where.AND : [where.AND];
+          andClauses.push({ OR: searchOr } as Prisma.StoreProductWhereInput);
+          where.AND = andClauses;
         } else {
-          where.OR = searchOr as WhereClause['OR'];
+          where.OR = searchOr as Prisma.StoreProductWhereInput['OR'];
         }
       }
     }
@@ -693,7 +858,7 @@ router.get('/', async (req: Request, res: Response) => {
     const defaultCurrency = (region && REGION_CURRENCY[region as keyof typeof REGION_CURRENCY]) ?? 'RON';
 
     let zeroSalesDiagnosticCount = 0;
-    type InventoryTag = 'NEW' | 'DEAD' | 'HOT' | 'NORMAL';
+    type InventoryTag = 'NEW' | 'DEAD' | 'HOT' | 'POTENTIAL' | 'NORMAL' | 'TO_BE_ELIMINATED';
     const nowMs = Date.now();
     const DAY_MS = 24 * 60 * 60 * 1000;
     const data = list.map((p) => {
@@ -735,6 +900,20 @@ router.get('/', async (req: Request, res: Response) => {
         : undefined;
       // FBE 平台在途必须与列表「在途库存」列同源，避免明细气泡与主列不一致。
       const fbeInTransitQuantity = Number(inv?.inTransitQuantity ?? 0);
+      const fallbackClassification = classifyStoreProduct({
+        stock: stockNum,
+        inTransitStock: fbeInTransitQuantity,
+        syncedAt: p.syncedAt,
+        sales7: sales_stats.d7,
+        sales14: sales_stats.d14,
+        sales30: sales_stats.d30,
+        comprehensiveSales: compSales,
+      });
+      const storedProductClass = p.productClass && isProductClass(p.productClass) ? p.productClass : null;
+      const productClass = storedProductClass ?? fallbackClassification.productClass;
+      const classificationReason = p.classificationReason ?? fallbackClassification.reason;
+      const classificationMetrics = p.classificationMetrics ?? fallbackClassification.metrics;
+      const stockStatusResult = calculateStockStatus(stockNum, compSales, sales_stats.d30);
       const targetStock = Math.floor(compSales * 60);
       const platformStock = stockNum;
       const platformInTransit = fbeInTransitQuantity;
@@ -748,8 +927,29 @@ router.get('/', async (req: Request, res: Response) => {
         targetStock - platformStock - platformInTransit - localStock - purchasingInTransit - planningStock,
       );
       const daysSinceSynced = Math.floor((nowMs - p.syncedAt.getTime()) / DAY_MS);
+      const isToBeEliminated = productClass === 'TO_BE_ELIMINATED';
+      const isNewProduct = productClass === 'NEW';
+      const isDeadProduct = productClass === 'DEAD';
+      const isNormalProduct = productClass === 'NORMAL';
+      const isHotOrPotentialOutOfStock = (productClass === 'HOT' || productClass === 'POTENTIAL') && platformStock === 0;
+      const isHotOrPotentialLowStockWarning =
+        (productClass === 'HOT' || productClass === 'POTENTIAL') &&
+        platformStock > 0 &&
+        (stockStatusResult.stockStatus === 'LOW_STOCK' || stockStatusResult.stockStatus === 'WARNING');
       let inventoryTag: InventoryTag;
-      if (daysSinceSynced <= 30) {
+      if (isToBeEliminated) {
+        inventoryTag = 'TO_BE_ELIMINATED';
+      } else if (isNewProduct) {
+        inventoryTag = 'NEW';
+      } else if (isDeadProduct) {
+        inventoryTag = 'DEAD';
+      } else if (isNormalProduct) {
+        inventoryTag = 'NORMAL';
+      } else if (isHotOrPotentialOutOfStock) {
+        inventoryTag = productClass;
+      } else if (isHotOrPotentialLowStockWarning) {
+        inventoryTag = productClass;
+      } else if (daysSinceSynced <= 30) {
         inventoryTag = 'NEW';
       } else if (compSales === 0 && platformStock + localStock > 0) {
         inventoryTag = 'DEAD';
@@ -758,6 +958,86 @@ router.get('/', async (req: Request, res: Response) => {
         inventoryTag = turnoverDays < 15 ? 'HOT' : 'NORMAL';
       } else {
         inventoryTag = 'NORMAL';
+      }
+      let purchaseSuggestionText: string | undefined;
+      let purchaseSuggestionReason: string | undefined;
+      if (isToBeEliminated) {
+        purchaseSuggestionText = '暂停补货';
+        purchaseSuggestionReason = '近30天无销量，且当前无平台库存、无在途库存，建议人工确认是否继续采购或下架。';
+      } else if (isNewProduct) {
+        if (platformStock === 0 && platformInTransit > 0) {
+          purchaseSuggestionText = '新品待到货';
+          purchaseSuggestionReason = '新品当前平台库存为0，但存在在途库存，建议等待到货后观察销售表现。';
+        } else if (platformStock > 0) {
+          purchaseSuggestionText = '新品观察';
+          purchaseSuggestionReason = '新品已有平台库存，但暂无销量，建议观察销售表现后再决定是否补货。';
+        } else {
+          purchaseSuggestionText = '待采购确认';
+          purchaseSuggestionReason = '新品暂无平台库存且无在途库存，建议确认是否需要采购或继续上架。';
+        }
+      } else if (isDeadProduct) {
+        if (platformStock >= 10) {
+          purchaseSuggestionText = '清仓处理';
+          purchaseSuggestionReason = '滞销产品近30天暂无销量，且当前仍有较多平台库存，建议降价清仓，避免继续占用库存。';
+        } else if (platformStock > 0) {
+          purchaseSuggestionText = '停止补货';
+          purchaseSuggestionReason = '滞销产品近30天暂无销量，建议停止补货，观察是否自然售出。';
+        } else {
+          purchaseSuggestionText = '停止补货';
+          purchaseSuggestionReason = '滞销产品暂无平台库存，建议不再补货，除非人工确认重新开发。';
+        }
+      } else if (isNormalProduct) {
+        if (stockStatusResult.stockStatus === 'LOW_STOCK') {
+          purchaseSuggestionText = '少量补货';
+          purchaseSuggestionReason = '普通款当前库存偏低，但销售强度不高，建议少量补货或结合人工判断。';
+        } else if (stockStatusResult.stockStatus === 'WARNING') {
+          purchaseSuggestionText = '观察补货';
+          purchaseSuggestionReason = '普通款库存进入预警区间，建议观察近期销量后再决定是否补货。';
+        } else if (stockStatusResult.stockStatus === 'SAFE') {
+          purchaseSuggestionText = '暂不补货';
+          purchaseSuggestionReason = '当前库存相对充足，暂不需要补货。';
+        } else if (stockStatusResult.stockStatus === 'OVERSTOCK') {
+          purchaseSuggestionText = '暂停补货';
+          purchaseSuggestionReason = '普通款当前库存偏多，建议暂停补货，避免库存积压。';
+        } else if (platformInTransit > 0) {
+          purchaseSuggestionText = '等待到货';
+          purchaseSuggestionReason = '普通款当前平台库存为0，但存在在途库存，建议等待到货后观察销售表现。';
+        } else {
+          purchaseSuggestionText = '待确认补货';
+          purchaseSuggestionReason = '普通款当前平台库存为0且无在途库存，建议结合销量和采购计划人工确认是否补货。';
+        }
+      } else if (isHotOrPotentialOutOfStock) {
+        const referenceDailySales = Math.max(compSales, sales_stats.d30 / 30);
+        if (platformInTransit <= 0) {
+          purchaseSuggestionText = '立即补货';
+          purchaseSuggestionReason = '当前平台库存为0，且无在途库存，热销或潜力产品建议立即补货。';
+        } else if (referenceDailySales <= 0) {
+          purchaseSuggestionText = '等待到货';
+          purchaseSuggestionReason = '当前平台库存为0，但存在在途库存，建议等待到货后观察销售表现。';
+        } else {
+          const inTransitDays = platformInTransit / referenceDailySales;
+          if (inTransitDays >= 30) {
+            purchaseSuggestionText = '等待到货';
+            purchaseSuggestionReason = `当前平台库存为0，但在途库存预计可覆盖约 ${inTransitDays.toFixed(1)} 天销量，建议关注到货进度，暂不重复采购。`;
+          } else {
+            purchaseSuggestionText = '仍需补货';
+            purchaseSuggestionReason = '当前平台库存为0，且在途库存预计覆盖不足30天，建议继续补货。';
+          }
+        }
+      } else if (isHotOrPotentialLowStockWarning) {
+        if (productClass === 'HOT' && stockStatusResult.stockStatus === 'LOW_STOCK') {
+          purchaseSuggestionText = '紧急补货';
+          purchaseSuggestionReason = '热销产品当前库存可售天数较低，建议尽快补货，避免断货。';
+        } else if (productClass === 'HOT' && stockStatusResult.stockStatus === 'WARNING') {
+          purchaseSuggestionText = '建议补货';
+          purchaseSuggestionReason = '热销产品库存已进入补货预警区间，建议提前安排补货。';
+        } else if (productClass === 'POTENTIAL' && stockStatusResult.stockStatus === 'LOW_STOCK') {
+          purchaseSuggestionText = '小批量补货';
+          purchaseSuggestionReason = '潜力产品库存偏低，可小批量补货，继续观察销售表现。';
+        } else {
+          purchaseSuggestionText = '观察备货';
+          purchaseSuggestionReason = '潜力产品库存进入预警区间，建议观察销量后决定是否补货。';
+        }
       }
       const productUrl = p.productUrl ?? (() => {
         const domain = (region && REGION_DOMAIN[region as keyof typeof REGION_DOMAIN]) ?? 'emag.ro';
@@ -799,6 +1079,8 @@ router.get('/', async (req: Request, res: Response) => {
           planningStock,
           suggestAmount,
           inventoryTag,
+          ...(purchaseSuggestionText ? { text: purchaseSuggestionText, label: purchaseSuggestionText } : {}),
+          ...(purchaseSuggestionReason ? { reason: purchaseSuggestionReason } : {}),
         },
         estimated_profit:     p.estimatedProfit ? Number(p.estimatedProfit) : null,
         estimated_profit_cny: p.estimatedProfitCny ? Number(p.estimatedProfitCny) : null,
@@ -817,6 +1099,18 @@ router.get('/', async (req: Request, res: Response) => {
         comprehensive_sales: compSales,   // 实时计算，与 sales_stats 强耦合，永不陈旧
         sales_stats: salesStatsObj,
         salesStats: salesStatsObj,
+        product_class: productClass,
+        productClass,
+        classification_reason: classificationReason,
+        classificationReason,
+        classification_metrics: classificationMetrics,
+        classificationMetrics,
+        stock_status: stockStatusResult.stockStatus,
+        stockStatus: stockStatusResult.stockStatus,
+        stock_days: stockStatusResult.stockDays,
+        stockDays: stockStatusResult.stockDays,
+        reference_daily_sales: stockStatusResult.referenceDailySales,
+        referenceDailySales: stockStatusResult.referenceDailySales,
         validation_status: validationStatusDisplay,
         doc_errors: p.docErrors ?? null,
         rejection_reason: p.rejectionReason ?? null,

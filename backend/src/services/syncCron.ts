@@ -19,8 +19,9 @@ import { shouldDelayNextSync, setDelayMultiplier, getDelayMultiplier } from './e
 import { syncPurchaseOrderFromAlibaba } from './alibabaService';
 import { syncExchangeRates } from './exchangeRateSync';
 import { recalcProfitForAllShops } from './profitCalculator';
+import { createInventorySnapshotsForAllShops } from './storeProductInventorySnapshot';
 
-export type SyncType = 'order_sentinel' | 'order_daily_catchup' | 'product_radar' | 'inventory_sync' | 'alibaba_purchase_sync';
+export type SyncType = 'order_sentinel' | 'order_daily_catchup' | 'product_radar' | 'inventory_sync' | 'alibaba_purchase_sync' | 'store_product_inventory_snapshot';
 
 async function logSync(
   syncType: SyncType,
@@ -48,6 +49,7 @@ let orderSentinelRunning = false;
 let orderDailyCatchupRunning = false;
 let productRadarRunning = false;
 let inventorySyncRunning = false;
+let inventorySnapshotRunning = false;
 
 // ═══════════════════════════════════════════════════════════════════
 // 【订单哨兵】每 10 分钟，同步最近 30 分钟内有变动的订单
@@ -225,6 +227,42 @@ function runInventorySync() {
 }
 
 // ═══════════════════════════════════════════════════════════════════
+// 【平台产品库存快照】每天记录一次 StoreProduct 当前平台库存与销量指标
+// 用于后续计算 90 天有货天数 / 有货日销；不改变现有分类逻辑
+// ═══════════════════════════════════════════════════════════════════
+function runStoreProductInventorySnapshot() {
+  if (inventorySnapshotRunning) {
+    console.log('[平台产品库存快照] 跳过（上次未完成）');
+    return;
+  }
+  inventorySnapshotRunning = true;
+  const start = Date.now();
+  (async () => {
+    try {
+      const results = await createInventorySnapshotsForAllShops({ dryRun: false });
+      const planned = results.reduce((sum, r) => sum + r.planned, 0);
+      const created = results.reduce((sum, r) => sum + r.created, 0);
+      const updated = results.reduce((sum, r) => sum + r.updated, 0);
+      const durationMs = Date.now() - start;
+      await logSync(
+        'store_product_inventory_snapshot',
+        planned,
+        durationMs,
+        'success',
+        JSON.stringify({ shops: results.length, created, updated }),
+      );
+      console.log(`[平台产品库存快照] 完成 shops=${results.length} planned=${planned} create=${created} update=${updated} 耗时=${durationMs}ms`);
+    } catch (e) {
+      const durationMs = Date.now() - start;
+      await logSync('store_product_inventory_snapshot', 0, durationMs, 'failed', e instanceof Error ? e.message : String(e));
+      console.error('[平台产品库存快照] 失败:', e instanceof Error ? e.message : e);
+    } finally {
+      inventorySnapshotRunning = false;
+    }
+  })();
+}
+
+// ═══════════════════════════════════════════════════════════════════
 // 【1688 采购同步】每 6 小时，自动同步活跃采购单状态与物流
 // 活跃状态：PLACED（已下单）/ IN_TRANSIT（运输中）
 // 排除 PENDING（未提交）/ RECEIVED（已入库）/ CANCELLED
@@ -313,6 +351,7 @@ export function startSyncCrons(): void {
   cron.schedule('0 */2 * * *', () => runProductRadar());            // 每 2 小时（产品锁）
   cron.schedule('5 * * * *',   () => runInventorySync());           // 每 1 小时（无锁）
   cron.schedule('0 */6 * * *', () => runAlibabaPurchaseSync());     // 每 6 小时（1688 采购同步）
+  cron.schedule('30 1 * * *',  () => runStoreProductInventorySnapshot()); // 每天 UTC 01:30（北京 09:30）
 
   // 汇率同步 + 利润引擎级联：每天 08:00（北京时间 = UTC+8 = UTC 00:00）
   cron.schedule('0 0 * * *', async () => {
@@ -335,5 +374,6 @@ export function startSyncCrons(): void {
   console.log('[Cron] 产品雷达: 每 2 小时（产品锁，与订单隔离）');
   console.log('[Cron] 库存同步: 每 1 小时');
   console.log('[Cron] 1688采购同步: 每 6 小时（PLACED/IN_TRANSIT 活跃单，串行防限流）');
+  console.log('[Cron] 平台产品库存快照: 每天 UTC 01:30（北京 09:30）');
   console.log('[Cron] 汇率+利润: 每天 UTC 00:00（北京 08:00，级联重算）');
 }

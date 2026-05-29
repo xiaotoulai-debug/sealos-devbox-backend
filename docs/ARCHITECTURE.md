@@ -324,12 +324,18 @@ suggestAmount = Math.max(
 );
 ```
 
-库存健康度标签 `inventoryTag` 采用四步漏斗：
+库存健康度标签 `inventoryTag` 采用四步漏斗，并对特定业务分类输出采购建议主文案：
 
-1. `syncedAt` 距当前时间 `<= 30` 天 → `NEW`（ERP 新同步入库保护期，优先级最高）。
-2. `comprehensiveSales === 0 && (platformStock + localStock) > 0` → `DEAD`。
-3. `comprehensiveSales > 0` 且 `(platformStock + localStock) / comprehensiveSales < 15` → `HOT`。
-4. 其他 → `NORMAL`。
+1. `productClass === TO_BE_ELIMINATED` → `TO_BE_ELIMINATED`，主文案 `暂停补货`，原因提示人工确认是否继续采购或下架。
+2. `productClass === NEW` → 按新品库存状态输出：平台无货且有在途为 `新品待到货`；平台有货为 `新品观察`；平台无货且无在途为 `待采购确认`。
+3. `productClass === DEAD` → 按滞销库存输出：平台库存 `>= 10` 为 `清仓处理`；平台库存 `< 10` 或无库存为 `停止补货`。
+4. `productClass === NORMAL` → 按库存状态输出温和建议：低库存 `少量补货`、预警 `观察补货`、库存充足 `暂不补货`、库存偏多 `暂停补货`、无货有在途 `等待到货`、无货无在途 `待确认补货`。
+5. `productClass in (HOT, POTENTIAL) && platformStock === 0` → 按平台缺货采购建议输出：无在途为 `立即补货`；有在途时根据 `inTransitStock / max(comprehensiveSales, sales30 / 30)` 是否覆盖 30 天，输出 `等待到货` 或 `仍需补货`。
+6. `productClass in (HOT, POTENTIAL) && platformStock > 0 && stockStatus in (LOW_STOCK, WARNING)` → 按低库存预警输出：热销低库存 `紧急补货`、热销预警 `建议补货`、潜力低库存 `小批量补货`、潜力预警 `观察备货`。
+7. `syncedAt` 距当前时间 `<= 30` 天 → `NEW`（ERP 新同步入库保护期）。
+8. `comprehensiveSales === 0 && (platformStock + localStock) > 0` → `DEAD`。
+9. `comprehensiveSales > 0` 且 `(platformStock + localStock) / comprehensiveSales < 15` → `HOT`。
+10. 其他 → `NORMAL`。
 
 DTO 字段：
 
@@ -343,6 +349,14 @@ purchaseSuggestion: {
   planningStock,
   suggestAmount,
   inventoryTag,
+  text?,   // TO_BE_ELIMINATED 时为“暂停补货”
+           // NEW 时为“新品待到货/新品观察/待采购确认”
+           // DEAD 时为“清仓处理/停止补货”
+           // NORMAL 时为“少量补货/观察补货/暂不补货/暂停补货/等待到货/待确认补货”
+           // HOT/POTENTIAL 平台缺货时为“立即补货/等待到货/仍需补货”
+           // HOT/POTENTIAL 平台低库存时为“紧急补货/建议补货/小批量补货/观察备货”
+  label?,  // 与 text 同步，兼容前端不同字段读取
+  reason?, // 特殊采购建议原因说明
 }
 ```
 
@@ -383,6 +397,82 @@ OR: [{ shopId: currentShopId }, { shopId: null }]
 2. **滞销警报**：过保护期后，`comprehensiveSales === 0` 且 `(platformStock + localStock) > 0`，标记 `DEAD`。
 3. **热销/断货预警**：有日销且 `(platformStock + localStock) / comprehensiveSales < 15`，标记 `HOT`。
 4. **正常周转**：其他情况标记 `NORMAL`。
+
+### 4.5.2 平台产品业务分类 productClass（2026-05-29，一阶段）
+
+`productClass` 是面向运营筛选的业务分类，和 `purchaseSuggestion.inventoryTag` 分离：前者用于平台产品分类筛选，后者用于库存健康/采购建议。第一阶段不使用毛利字段，也不伪造 90 天有货天数。
+
+**落库字段**：`store_products.product_class`、`classification_reason`、`classification_metrics`、`classified_at`。索引：`shop_id + product_class`，以及 `shop_id + product_class + comprehensive_sales DESC`。
+
+**合法值**：`HOT`（热销款）、`POTENTIAL`（潜力款）、`NORMAL`（普通款）、`DEAD`（滞销款）、`NEW`（新品）、`TO_BE_ELIMINATED`（待淘汰款）。断货不再作为 `productClass`，改由独立 `stockStatus` 表达。
+
+**严格优先级**：
+
+1. `NEW`：满足其一即归类新品：
+   - `daysSinceSynced <= 30 && sales30 === 0`，原因文案必须说明这是基于 ERP 首次同步时间的弱判断，不是 eMAG 真实上架时间。
+   - `sales7 === 0 && sales14 === 0 && sales30 === 0 && comprehensiveSales < 0.05 && stock === 0 && inTransitStock > 0`，表示平台暂无库存但存在 FBE 在途，尚未真正开始售卖，归为新品待到货。
+2. `HOT`：`comprehensiveSales >= 1 || sales30 >= 30 || sales7 >= 7`。
+3. `POTENTIAL`：`comprehensiveSales >= 0.2 || sales30 >= 5 || sales7 >= 2`。
+4. `DEAD`：`stock > 0 && daysSinceSynced > 30 && sales30 === 0 && comprehensiveSales < 0.05`，原因文案必须说明第一阶段没有 90 天有货天数，仅为弱滞销。
+5. `TO_BE_ELIMINATED`：`sales7 === 0 && sales14 === 0 && sales30 === 0 && comprehensiveSales < 0.05 && stock === 0 && inTransitStock === 0 && daysSinceSynced > 30`，表示无销量、无平台库存、无在途补货动作，建议人工确认是否继续采购或下架。
+6. `NORMAL`：兜底分类。
+
+**计算入口**：`src/services/productClassification.ts` 提供 `classifyStoreProduct()` 纯函数、`recalcProductClassForShop()` 和 `recalcProductClassForAllShops()`。脚本 `npm run ops:recalc-product-class` 默认 dry-run；追加 `-- --fix` 写库；支持 `-- --shopId=1 --fix` 单店重算。
+
+**API**：`GET /api/store-products?productClass=HOT|POTENTIAL|NORMAL|DEAD|NEW|TO_BE_ELIMINATED|all`。不传或 `all` 不过滤，非法值返回 400。筛选在 Prisma `where` 层执行，`count` 与 `findMany` 复用同一条件，保证分页 total 准确。DTO 新增 `product_class/productClass`、`classification_reason/classificationReason`、`classification_metrics/classificationMetrics`。
+
+**分类统计 API**：`GET /api/store-products/classification-summary?shopId=5` 返回固定字段 `{ total, HOT, POTENTIAL, NORMAL, DEAD, NEW, TO_BE_ELIMINATED }`，用于前端分类下拉框数量展示。统计基于 `store_products.product_class` 并按 `shopId`、`is_archived=false` 过滤；`null` 或未知分类归入 `NORMAL`，不纳入 `OUT_OF_STOCK_WATCH`。接口预留并支持 `mappingStatus/search`，采用与列表接口一致的 where 口径；底层使用 Prisma `groupBy`，不做分页后循环统计。
+
+**库存状态 stockStatus（DTO 计算字段，不落库）**：
+
+- `referenceDailySales = max(comprehensiveSales, sales30 / 30)`。
+- `referenceDailySales <= 0` 时 `stockDays = null`。
+- `stock === 0` → `OUT_OF_STOCK`。
+- `stock > 0 && stockDays <= 30` → `LOW_STOCK`。
+- `stockDays > 30 && stockDays <= 60` → `WARNING`。
+- `stockDays > 60 && stockDays <= 120` → `SAFE`。
+- `stockDays > 120` → `OVERSTOCK`。
+
+DTO 输出双命名：`stockStatus/stock_status`、`stockDays/stock_days`、`referenceDailySales/reference_daily_sales`。
+
+### 4.5.3 平台产品每日库存快照（2026-05-29，二阶段数据底座）
+
+为后续计算 `sales90`、`availableDays90` 与 `inStockDailySales90`，新增 `store_product_inventory_snapshots`。该表只记录事实快照，暂不替换现有 `productClass` 分类逻辑。
+
+**唯一性**：同一个 `store_product_id + snapshot_date` 只能有一条记录，重复执行采用 upsert 更新当日快照，避免重复插入。
+
+**字段口径**：
+
+- `shop_id`：平台店铺 ID。
+- `store_product_id`：`StoreProduct.id`。
+- `sku`：优先 `StoreProduct.sku`，为空时用 `vendorSku`。
+- `snapshot_date`：UTC 日期，按天去重。
+- `platform_stock`：`StoreProduct.stock`，eMAG 当前平台库存。
+- `in_transit_stock`：当前店铺 `FbeShipment.status=SHIPPED` 的在途数量，按本地 `Product.id` 聚合。
+- `sales_7 / sales_14 / sales_30`：复用 `salesStats.ts` 从 `platform_orders.products_json` 聚合出的销量。
+- `comprehensive_sales`：同综合日销公式 `(d7/7*0.3)+(d14/14*0.3)+(d30/30*0.4)`。
+
+**脚本**：
+
+```bash
+npm run ops:snapshot-store-products                 # dry-run，全店铺
+npm run ops:snapshot-store-products -- --shopId=1   # dry-run，单店
+npm run ops:snapshot-store-products -- --fix        # 写入/更新当天全店铺快照
+npm run ops:snapshot-store-products -- --shopId=1 --fix
+npm run ops:snapshot-store-products -- --date=2026-05-29 --fix
+```
+
+**定时任务**：`syncCron.ts` 每天 UTC 01:30（北京 09:30）执行一次 `createInventorySnapshotsForAllShops({ dryRun:false })`，写入当天全部活跃 eMAG 店铺的快照。
+
+**后续 90 天指标预留**：
+
+```sql
+availableDays90 = COUNT(*) WHERE snapshot_date >= today - 90 AND platform_stock > 0
+sales90 = 近90天订单销量聚合
+inStockDailySales90 = sales90 / NULLIF(availableDays90, 0)
+```
+
+其中 `availableDays90` 的有货判断条件固定为 `platform_stock > 0`。第一阶段/当前二阶段只建数据底座，不伪造历史 90 天有货日销。
 
 ### 4.6 多站点数据一致性保障
 
@@ -1200,11 +1290,12 @@ import { Prisma } from '@prisma/client';
 
 | 步骤 | 操作 | 说明 |
 |---|---|---|
-| ① 前置校验 | 订单存在 + `status === 'PLACED'` + 存在 `alibabaOrderStatus in ['cancelled','closed']` 的子单 | 防止误操作；保证一定经历过 1688 下单环节 |
+| ① 前置校验 | 订单存在 + `status === 'PLACED'`，或 `status === 'PENDING'` 且主单 `logisticsStatus` 已体现 cancel/closed；子单 `alibabaOrderStatus` 或主单物流状态任一路径存在取消语义 | 防止误操作，同时兼容 1688 已取消但本地主状态未推进的坏账单 |
 | ② 冻结主单 | `PurchaseOrder.status → CANCELLED` | **绝不清空** `alibabaOrderId`、`supplierName`、`logisticsCompany` 等任何 1688 字段 |
-| ③ 释放需求 | `Product.purchaseOrderId → null`，`Product.status → 'PURCHASING'`，`Product.externalOrderId → null` | 产品重回采购计划列表（`GET /api/products/purchasing`） |
+| ③ 释放需求 | 主路径解析 `PurchaseOrderItem.productIds`，再执行 `Product.purchaseOrderId → null`，`Product.status → 'PURCHASING'`，`Product.externalOrderId → null` | 产品重回采购计划列表（`GET /api/products/purchasing`）；不再依赖易断裂的 `order.products` FK |
 | ④ 保留规格 | `Product.externalSynced / externalSkuId / externalProductId` **原封不动** | 保留用户绑定 1688 规格的劳动成果，下次建单可直接复用 |
-| ⑤ 子单冻结 | `PurchaseOrderItem` 不做任何修改 | 子单作为历史凭据，alibabaOrderId 等信息一字不改 |
+| ⑤ 库存回滚 | 在同一个 Prisma `$transaction` 内复用 `tx`，按子单 `quantity` 汇总扣减 `products.in_transit_quantity` 与 `warehouse_stocks.in_transit_quantity` | SQL 使用 `GREATEST(0, in_transit_quantity - qty)`，从数据库层防止负库存 |
+| ⑥ 子单冻结 | `PurchaseOrderItem` 不做任何修改 | 子单作为历史凭据，alibabaOrderId 等信息一字不改 |
 
 ### 12.4 列表接口兼容
 
@@ -1344,6 +1435,7 @@ WHERE product_id = :productId
 - **唯一关联桥**：子表无 `productId` 外键，必须通过 `product_ids` 存 `"[123]"` 形式 JSON；列表/详情 Mapper 由此解析出顶层 `items[].productId` 供前端调用 `PUT /api/alibaba/bind`。
 - **建单**：`POST /api/purchases/create-local` 写入 `JSON.stringify([pid])`，并兼容请求体 `productId` / `product_id` / `product.id`（不使用行项目自身的 `id`）。
 - **回填**：`POST .../place-1688-order` 与 `POST .../bind-1688-order` 在落库 1688 单号时**同步**调用 `buildProductIdsJsonForItem`，保证子单与产品 ID 链不断裂。
-- **只读兜底**：`GET /api/purchases`（含按单 `purchaseOrderId` 补查、`offerId` 全局匹配）与 `GET /api/purchases/:id` 在 `product_ids` 为空时仍尽量解析出 `productId`（已释放 FK 的旧单依赖子单 `offerId` ↔ `Product.externalProductId`）。
+- **只读兜底**：`GET /api/purchases`（含按单 `purchaseOrderId` 补查、`offerId` 全局匹配）与 `GET /api/purchases/:id` 优先按 `product_ids` 直接补查 Product，即使 `Product.purchaseOrderId` 已释放为 null，也能返回完整 `items[].productId / externalSynced / externalSkuId`。
 - **数据补救脚本**：`backend/scripts/backfill-purchase-order-item-product-ids.ts`（`npx tsx scripts/backfill-purchase-order-item-product-ids.ts`）。
-- **绑定接口**：`PUT /api/alibaba/bind` 对非法/缺失 `productId` 返回 **400** 与明确文案，避免误传子单 id 时出现含混的 404。
+- **KFB03 专项坏账修复**：`npm run ops:fix-kfb03-stale` 默认 dry-run，只打印 `Product.inTransitQuantity` 与 `WarehouseStock.inTransitQuantity` 对比及计划结果；`npm run ops:fix-kfb03-stale:fix` 才写库。仅当 `purchaseUrl` 解析出的 offerId 与 `Product.externalProductId` 完全一致，且 `externalSkuId` 是 32 位 MD5 specId 时，才允许自动恢复 `externalSynced=true`。
+- **绑定接口**：`PUT /api/alibaba/bind` 支持 `productId` 主路径，也支持 `purchaseOrderItemId` 兜底从 `PurchaseOrderItem.productIds` 精准反查产品；绑定写库保持单次 `Product.update`，响应 `data.resolvedFrom` 标识来源。

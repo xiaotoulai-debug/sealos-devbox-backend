@@ -807,18 +807,66 @@ router.post('/create-order', async (req: Request, res: Response) => {
 // ── PUT /api/alibaba/bind ────────────────────────────────────
 // 将系统 SKU 与 1688 规格绑定。★ specId（32位 MD5）必传，否则下单会失败！
 const SPEC_ID_REGEX_BIND = /^[a-fA-F0-9]{32}$/;
+function parseBindProductIds(raw: string | null | undefined): number[] {
+  try {
+    const parsed: unknown = JSON.parse(raw ?? '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((id) => Number(id))
+      .filter((id) => Number.isInteger(id) && id > 0);
+  } catch {
+    return [];
+  }
+}
+
 router.put('/bind', async (req: Request, res: Response) => {
   try {
-    const { productId, offerId, specId, skuId } = req.body ?? {};
+    const { productId, purchaseOrderItemId, offerId, specId, skuId } = req.body ?? {};
 
-    console.log('[PUT /api/alibaba/bind] 收到 payload:', JSON.stringify({ productId, offerId, specId: specId ? `${String(specId).slice(0, 8)}...` : undefined, skuId }));
+    console.log('[PUT /api/alibaba/bind] 收到 payload:', JSON.stringify({
+      productId,
+      purchaseOrderItemId,
+      offerId,
+      specId: specId ? `${String(specId).slice(0, 8)}...` : undefined,
+      skuId,
+    }));
 
     const pidNum = Number(productId);
-    if (!Number.isFinite(pidNum) || pidNum <= 0) {
+    const poiIdNum = Number(purchaseOrderItemId);
+    let finalProductId = Number.isFinite(pidNum) && pidNum > 0 ? pidNum : null;
+    let resolvedFrom: 'productId' | 'purchaseOrderItemId' = finalProductId ? 'productId' : 'purchaseOrderItemId';
+
+    if (!finalProductId && Number.isFinite(poiIdNum) && poiIdNum > 0) {
+      const item = await prisma.purchaseOrderItem.findUnique({
+        where: { id: poiIdNum },
+        select: { id: true, offerId: true, productIds: true },
+      });
+      if (!item) {
+        res.status(404).json({ code: 404, data: null, message: `采购子单不存在（purchaseOrderItemId=${poiIdNum}）` });
+        return;
+      }
+
+      const candidateIds = parseBindProductIds(item.productIds);
+      if (candidateIds.length === 1) {
+        finalProductId = candidateIds[0];
+      } else if (candidateIds.length > 1) {
+        const matched = await prisma.product.findFirst({
+          where: {
+            id: { in: candidateIds },
+            externalProductId: String(offerId ?? item.offerId ?? '').trim(),
+            isDeleted: false,
+          },
+          select: { id: true },
+        });
+        finalProductId = matched?.id ?? null;
+      }
+    }
+
+    if (!finalProductId) {
       res.status(400).json({
         code: 400, data: null,
         message:
-          '缺少有效的 productId（须为正整数）。请从采购单列表/详情 items[].productId 读取，勿使用子单行 id（PurchaseOrderItem.id）。',
+          '缺少有效的 productId 或 purchaseOrderItemId。请从采购单列表/详情 items[].productId 或 items[].id 读取，后端将通过 productIds 历史凭据兜底解析。',
       });
       return;
     }
@@ -844,9 +892,9 @@ router.put('/bind', async (req: Request, res: Response) => {
       return;
     }
 
-    const product = await prisma.product.findUnique({ where: { id: pidNum } });
+    const product = await prisma.product.findUnique({ where: { id: finalProductId } });
     if (!product) {
-      res.status(404).json({ code: 404, data: null, message: `产品不存在（productId=${pidNum}）` });
+      res.status(404).json({ code: 404, data: null, message: `产品不存在（productId=${finalProductId}）` });
       return;
     }
 
@@ -862,8 +910,15 @@ router.put('/bind', async (req: Request, res: Response) => {
       },
     });
 
-    console.log(`[PUT /api/alibaba/bind] 绑定成功 productId=${productId} externalSkuId=${finalSpecId.slice(0, 8)}...`);
-    res.json({ code: 200, data: null, message: '1688 规格绑定成功' });
+    console.log(`[PUT /api/alibaba/bind] 绑定成功 productId=${product.id} resolvedFrom=${resolvedFrom} externalSkuId=${finalSpecId.slice(0, 8)}...`);
+    res.json({
+      code: 200,
+      data: {
+        productId: product.id,
+        resolvedFrom,
+      },
+      message: '1688 规格绑定成功',
+    });
   } catch (err) {
     console.error('[PUT /api/alibaba/bind]', err);
     res.status(500).json({ code: 500, data: null, message: '绑定失败' });

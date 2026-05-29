@@ -293,9 +293,14 @@ model StoreProduct {
   profitMarginPct      Float?     @map("profit_margin_pct")        // 毛利率 % = profit / salePrice × 100
   profitCalculatedAt   DateTime?  @map("profit_calculated_at")     // 上次利润计算时间
   profitBreakdown      Json?      @map("profit_breakdown")          // 利润明细拆解 JSON（各项扣费 + 估算标识）
+  productClass         String?    @map("product_class")             // 平台产品业务分类：HOT/POTENTIAL/NORMAL/DEAD/NEW/TO_BE_ELIMINATED
+  classificationReason String?    @map("classification_reason")     // 分类原因说明，面向运营展示
+  classificationMetrics Json?     @map("classification_metrics")    // 分类计算指标快照（不伪造 90 天有货数据）
+  classifiedAt         DateTime?  @map("classified_at")             // 上次分类计算时间
   isArchived      Boolean  @default(false) @map("is_archived") // eMAG 变更 PNK/SKU 后保留审计用的归档标记；列表默认过滤
   syncedAt         DateTime @default(now()) @map("synced_at")
   shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  inventorySnapshots StoreProductInventorySnapshot[]
 
   @@unique([shopId, pnk])
   @@unique([shopId, sku])
@@ -308,7 +313,34 @@ model StoreProduct {
   @@index([vendorSku])
   @@index([isArchived])
   @@index([shopId, comprehensiveSales(sort: Desc)])
+  @@index([shopId, productClass])
+  @@index([shopId, productClass, comprehensiveSales(sort: Desc)])
   @@map("store_products")
+}
+
+/// 平台产品每日库存快照：用于第二阶段计算近 90 天有货天数与有货日销
+model StoreProductInventorySnapshot {
+  id                 Int      @id @default(autoincrement())
+  shopId             Int      @map("shop_id")
+  storeProductId     Int      @map("store_product_id")
+  sku                String?
+  snapshotDate       DateTime @map("snapshot_date") @db.Date
+  platformStock      Int      @default(0) @map("platform_stock")
+  inTransitStock     Int      @default(0) @map("in_transit_stock")
+  sales7             Int      @default(0) @map("sales_7")
+  sales14            Int      @default(0) @map("sales_14")
+  sales30            Int      @default(0) @map("sales_30")
+  comprehensiveSales Float    @default(0) @map("comprehensive_sales")
+  createdAt          DateTime @default(now()) @map("created_at")
+  updatedAt          DateTime @updatedAt @map("updated_at")
+
+  storeProduct StoreProduct @relation(fields: [storeProductId], references: [id], onDelete: Cascade)
+
+  @@unique([storeProductId, snapshotDate])
+  @@index([shopId, snapshotDate])
+  @@index([shopId, sku, snapshotDate])
+  @@index([storeProductId])
+  @@map("store_product_inventory_snapshots")
 }
 
 /// 汇率缓存表（每日定时拉取，source→target 货币对，upsert 模式保持唯一）
