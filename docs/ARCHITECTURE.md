@@ -423,6 +423,8 @@ OR: [{ shopId: currentShopId }, { shopId: null }]
 
 **分类统计 API**：`GET /api/store-products/classification-summary?shopId=5` 返回固定字段 `{ total, HOT, POTENTIAL, NORMAL, DEAD, NEW, TO_BE_ELIMINATED }`，用于前端分类下拉框数量展示。统计基于 `store_products.product_class` 并按 `shopId`、`is_archived=false` 过滤；`null` 或未知分类归入 `NORMAL`，不纳入 `OUT_OF_STOCK_WATCH`。接口预留并支持 `mappingStatus/search`，采用与列表接口一致的 where 口径；底层使用 Prisma `groupBy`，不做分页后循环统计。
 
+**店铺结构概览 API**：`GET /api/store-products/store-overview?shopId=5` 返回 `{ productStructure, stockRisk, purchaseActions, generatedAt }`，用于平台产品页第一阶段概览卡片。`productStructure` 复用分类统计口径，按 `shopId` 与 `is_archived=false` 过滤，`null` 或未知 `productClass` 归入 `NORMAL`；`stockRisk` 复用 `calculateStockStatus()`，基于实时 `salesStats` 计算 `comprehensiveSales` 与 `referenceDailySales` 后归入 `OUT_OF_STOCK/LOW_STOCK/WARNING/SAFE/OVERSTOCK`；`purchaseActions` 复用后端采购建议 helper 生成单品 `purchaseSuggestion`，再映射为 `REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/WAIT_FOR_ARRIVAL/CLEARANCE/SAFE/UNKNOWN`。第一版不新增数据库字段、不做 `operationAdvice`，全店计算使用批量查询本地库存、FBE 在途、采购在途和计划中数量，避免逐品 N+1；后续如访问频率升高，可在 service 入口按 `shopId` 增加 1-5 分钟 TTL 缓存。
+
 **库存状态 stockStatus（DTO 计算字段，不落库）**：
 
 - `referenceDailySales = max(comprehensiveSales, sales30 / 30)`。
