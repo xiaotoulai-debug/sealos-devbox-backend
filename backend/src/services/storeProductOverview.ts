@@ -429,7 +429,7 @@ export async function getMatchedStoreProductIdsByOverviewFilters(
   const matchedIds: number[] = [];
 
   for (const product of products) {
-    const sales = getSalesForProduct(salesStats.map, product.sku, product.vendorSku);
+    const sales = getSalesForProduct(salesStats.map, product.sku, product.vendorSku, product.pnk);
     const comprehensiveSales = calculateComprehensiveSales(sales.d7, sales.d14, sales.d30);
     const stockStatusResult = calculateStockStatus(product.stock, comprehensiveSales, sales.d30);
     if (filters.stockStatus && stockStatusResult.stockStatus !== filters.stockStatus) {
@@ -452,6 +452,9 @@ export async function getMatchedStoreProductIdsByOverviewFilters(
         sales7: sales.d7,
         sales14: sales.d14,
         sales30: sales.d30,
+        sales90: sales.d90,
+        sales180: sales.d180,
+        lastOrderAt: sales.lastOrderAt,
         comprehensiveSales,
       });
       const productClass = storedProductClass ?? fallbackClassification.productClass;
@@ -511,7 +514,7 @@ export async function getStoreProductOverview(shopId: number): Promise<StoreProd
   const dayMs = 24 * 60 * 60 * 1000;
 
   for (const product of products) {
-    const sales = getSalesForProduct(salesStats.map, product.sku, product.vendorSku);
+    const sales = getSalesForProduct(salesStats.map, product.sku, product.vendorSku, product.pnk);
     const comprehensiveSales = calculateComprehensiveSales(sales.d7, sales.d14, sales.d30);
     const stockStatusResult = calculateStockStatus(product.stock, comprehensiveSales, sales.d30);
     stockRisk[stockStatusResult.stockStatus]++;

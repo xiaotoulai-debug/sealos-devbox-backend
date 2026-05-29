@@ -569,7 +569,7 @@ router.get('/', async (req: Request, res: Response) => {
       res.status(400).json({
         code: 400,
         data: null,
-        message: 'productClass 无效，合法值：HOT/POTENTIAL/NORMAL/DEAD/NEW/TO_BE_ELIMINATED/all',
+        message: 'productClass 无效，合法值：HOT/POTENTIAL/NORMAL/DEAD/OUT_OF_STOCK_WATCH/NEW/TO_BE_ELIMINATED/all',
       });
       return;
     }
@@ -962,13 +962,20 @@ router.get('/', async (req: Request, res: Response) => {
 
       const currency = p.currency ?? defaultCurrency;
 
-      const sales_stats = getSalesForProduct(salesMap, p.sku, p.vendorSku);
+      const sales_stats = getSalesForProduct(salesMap, p.sku, p.vendorSku, p.pnk);
       if (sales_stats.d30 === 0 && skusWithSales.length > 0 && zeroSalesDiagnosticCount < 3) {
         logZeroSalesDiagnostic(p.sku, p.vendorSku, salesMap, skusWithSales);
         zeroSalesDiagnosticCount++;
       }
 
-      const salesStatsObj = { d7: sales_stats.d7, d14: sales_stats.d14, d30: sales_stats.d30 };
+      const salesStatsObj = {
+        d7: sales_stats.d7,
+        d14: sales_stats.d14,
+        d30: sales_stats.d30,
+        d90: sales_stats.d90,
+        d180: sales_stats.d180,
+        lastOrderAt: sales_stats.lastOrderAt,
+      };
 
       // ★ 强耦合计算：在同一作用域内用实时销量原子计算 comprehensive_sales
       // 公式: (d7/7*0.3) + (d14/14*0.3) + (d30/30*0.4)，与 backfillComprehensiveSales 完全一致
@@ -987,6 +994,9 @@ router.get('/', async (req: Request, res: Response) => {
         sales7: sales_stats.d7,
         sales14: sales_stats.d14,
         sales30: sales_stats.d30,
+        sales90: sales_stats.d90,
+        sales180: sales_stats.d180,
+        lastOrderAt: sales_stats.lastOrderAt,
         comprehensiveSales: compSales,
       });
       const storedProductClass = p.productClass && isProductClass(p.productClass) ? p.productClass : null;

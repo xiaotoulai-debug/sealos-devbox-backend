@@ -7,6 +7,7 @@ export const PRODUCT_CLASSES = [
   'POTENTIAL',
   'NORMAL',
   'DEAD',
+  'OUT_OF_STOCK_WATCH',
   'TO_BE_ELIMINATED',
   'NEW',
 ] as const;
@@ -41,6 +42,9 @@ export type ClassifyStoreProductInput = {
   sales7: number;
   sales14: number;
   sales30: number;
+  sales90?: number;
+  sales180?: number;
+  lastOrderAt?: Date | null;
   comprehensiveSales: number;
 };
 
@@ -50,13 +54,17 @@ export type ClassificationMetrics = {
   sales7: number;
   sales14: number;
   sales30: number;
+  sales90: number;
+  sales180: number;
+  lastOrderAt: string | null;
+  daysSinceLastOrder: number | null;
   sales7Daily: number;
   sales30Daily: number;
   comprehensiveSales: number;
   daysSinceSynced: number;
-  sales90: null;
   availableDays90: null;
   inStockDailySales90: null;
+  outOfStockHistoryProtected: boolean;
 };
 
 export type StockStatusResult = {
@@ -137,10 +145,24 @@ export function classifyStoreProduct(input: ClassifyStoreProductInput, now = new
   const sales7 = Number(input.sales7 ?? 0);
   const sales14 = Number(input.sales14 ?? 0);
   const sales30 = Number(input.sales30 ?? 0);
+  const sales90 = Number(input.sales90 ?? 0);
+  const sales180 = Number(input.sales180 ?? 0);
   const comprehensiveSales = Number(input.comprehensiveSales ?? 0);
   const daysSinceSynced = Math.max(0, Math.floor((now.getTime() - input.syncedAt.getTime()) / DAY_MS));
+  const lastOrderAt = input.lastOrderAt instanceof Date && !Number.isNaN(input.lastOrderAt.getTime())
+    ? input.lastOrderAt
+    : null;
+  const daysSinceLastOrder = lastOrderAt
+    ? Math.max(0, Math.floor((now.getTime() - lastOrderAt.getTime()) / DAY_MS))
+    : null;
   const sales7Daily = sales7 / 7;
   const sales30Daily = sales30 / 30;
+  const isOutOfStockHistoryProtected =
+    stock === 0 &&
+    (
+      sales90 > 0 ||
+      (sales180 >= 3 && daysSinceLastOrder !== null && daysSinceLastOrder <= 120)
+    );
 
   const metrics: ClassificationMetrics = {
     stock,
@@ -148,13 +170,17 @@ export function classifyStoreProduct(input: ClassifyStoreProductInput, now = new
     sales7,
     sales14,
     sales30,
+    sales90,
+    sales180,
+    lastOrderAt: lastOrderAt ? lastOrderAt.toISOString() : null,
+    daysSinceLastOrder,
     sales7Daily: parseFloat(sales7Daily.toFixed(4)),
     sales30Daily: parseFloat(sales30Daily.toFixed(4)),
     comprehensiveSales,
     daysSinceSynced,
-    sales90: null,
     availableDays90: null,
     inStockDailySales90: null,
+    outOfStockHistoryProtected: isOutOfStockHistoryProtected,
   };
 
   const isSyncedNewWithoutSales = daysSinceSynced <= PRODUCT_CLASS_RULES.newDays && sales30 === 0;
@@ -172,6 +198,16 @@ export function classifyStoreProduct(input: ClassifyStoreProductInput, now = new
       reason: isIncomingNewWithoutSales
         ? '近7/14/30天暂无销量、平台库存为0且存在FBE在途库存，说明产品尚未真正开始售卖，归为新品待到货。'
         : '基于 StoreProduct.syncedAt 判断为 ERP 新同步产品，且近30天暂无销量；该时间不是 eMAG 真实上架时间。',
+      metrics,
+    };
+  }
+
+  if (isOutOfStockHistoryProtected) {
+    return {
+      productClass: 'OUT_OF_STOCK_WATCH',
+      reason: sales90 > 0
+        ? '当前平台库存为0，但近90天有销量，判断为断货观察款，避免误判为滞销或待淘汰。'
+        : '当前平台库存为0，近180天历史销量达到保护阈值且最后出单距今不超过120天，判断为断货观察款。',
       metrics,
     };
   }
@@ -212,6 +248,7 @@ export function classifyStoreProduct(input: ClassifyStoreProductInput, now = new
     sales7 === 0 &&
     sales14 === 0 &&
     sales30 === 0 &&
+    sales180 === 0 &&
     comprehensiveSales < PRODUCT_CLASS_RULES.deadComprehensiveSales &&
     stock === 0 &&
     inTransitStock === 0 &&
@@ -338,7 +375,7 @@ async function recalcForProducts(shopId: number, dryRun: boolean): Promise<Produ
   }> = [];
 
   for (const p of products) {
-    const sales = getSalesForProduct(salesMap, p.sku, p.vendorSku);
+    const sales = getSalesForProduct(salesMap, p.sku, p.vendorSku, p.pnk);
     const comprehensiveSales = calculateComprehensiveSales(sales.d7, sales.d14, sales.d30);
     const localProductId = productIdByPnk.get(p.pnk);
     const inTransitStock = localProductId ? inTransitByProductId.get(localProductId) ?? 0 : 0;
@@ -349,6 +386,9 @@ async function recalcForProducts(shopId: number, dryRun: boolean): Promise<Produ
       sales7: sales.d7,
       sales14: sales.d14,
       sales30: sales.d30,
+      sales90: sales.d90,
+      sales180: sales.d180,
+      lastOrderAt: sales.lastOrderAt,
       comprehensiveSales,
     }, now);
 

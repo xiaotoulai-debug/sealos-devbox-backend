@@ -12,6 +12,9 @@ export interface SalesStats {
   d7: number;
   d14: number;
   d30: number;
+  d90: number;
+  d180: number;
+  lastOrderAt: Date | null;
 }
 
 const CACHE_TTL_MS = 2 * 60 * 1000; // 2 分钟
@@ -23,6 +26,31 @@ function normalizeSku(s: string | null | undefined): string {
     .replace(/\n/g, '')
     .trim()
     .toLowerCase();
+}
+
+function normalizePnk(s: string | null | undefined): string {
+  return normalizeSku(s);
+}
+
+function pnkKey(pnk: string): string {
+  return `pnk:${pnk}`;
+}
+
+function emptySalesStats(): SalesStats {
+  return { d7: 0, d14: 0, d30: 0, d90: 0, d180: 0, lastOrderAt: null };
+}
+
+function mergeStats(target: SalesStats, source: SalesStats): SalesStats {
+  return {
+    d7: target.d7 + source.d7,
+    d14: target.d14 + source.d14,
+    d30: target.d30 + source.d30,
+    d90: target.d90 + source.d90,
+    d180: target.d180 + source.d180,
+    lastOrderAt: [target.lastOrderAt, source.lastOrderAt]
+      .filter((d): d is Date => d instanceof Date)
+      .sort((a, b) => b.getTime() - a.getTime())[0] ?? null,
+  };
 }
 
 export interface SalesStatsResult {
@@ -66,44 +94,66 @@ async function aggregateSalesForShop(shopId: number): Promise<{ map: Map<string,
   d14.setDate(d14.getDate() - 14);
   const d30 = new Date(now);
   d30.setDate(d30.getDate() - 30);
+  const d90 = new Date(now);
+  d90.setDate(d90.getDate() - 90);
+  const d180 = new Date(now);
+  d180.setDate(d180.getDate() - 180);
 
-  const baseWhere = `shop_id = ${shopId} AND (status = 4 OR status IN (1,2,3,4))`;
+  const baseWhere = `shop_id = ${shopId} AND (status = 4 OR status IN (1,2,3,4)) AND order_time >= '${d180.toISOString().slice(0, 10)}'`;
   const skuExpr = `LOWER(TRIM(REPLACE(REPLACE(COALESCE(elem->>'sku', elem->>'ext_part_number', ''), E'\\\\r', ''), E'\\\\n', '')))`;
+  const pnkExpr = `LOWER(TRIM(REPLACE(REPLACE(COALESCE(elem->>'pnk', ''), E'\\\\r', ''), E'\\\\n', '')))`;
   const qtyExpr = `COALESCE((elem->>'quantity')::int, 0)`;
 
-  const [d7Rows, d14Rows, d30Rows] = await Promise.all([
-    prisma.$queryRawUnsafe<Array<{ sku: string; total: string | number }>>(
-      `SELECT ${skuExpr} as sku, SUM(${qtyExpr}) as total FROM platform_orders, jsonb_array_elements(products_json::jsonb) as elem WHERE ${baseWhere} AND order_time >= '${d7.toISOString().slice(0, 10)}' GROUP BY 1`
-    ),
-    prisma.$queryRawUnsafe<Array<{ sku: string; total: string | number }>>(
-      `SELECT ${skuExpr} as sku, SUM(${qtyExpr}) as total FROM platform_orders, jsonb_array_elements(products_json::jsonb) as elem WHERE ${baseWhere} AND order_time >= '${d14.toISOString().slice(0, 10)}' GROUP BY 1`
-    ),
-    prisma.$queryRawUnsafe<Array<{ sku: string; total: string | number }>>(
-      `SELECT ${skuExpr} as sku, SUM(${qtyExpr}) as total FROM platform_orders, jsonb_array_elements(products_json::jsonb) as elem WHERE ${baseWhere} AND order_time >= '${d30.toISOString().slice(0, 10)}' GROUP BY 1`
-    ),
-  ]);
+  const rows = await prisma.$queryRawUnsafe<Array<{
+    sku: string | null;
+    pnk: string | null;
+    d7: string | number;
+    d14: string | number;
+    d30: string | number;
+    d90: string | number;
+    d180: string | number;
+    last_order_at: Date | string | null;
+  }>>(
+    `SELECT ${skuExpr} as sku,
+            ${pnkExpr} as pnk,
+            SUM(CASE WHEN order_time >= '${d7.toISOString().slice(0, 10)}' THEN ${qtyExpr} ELSE 0 END) as d7,
+            SUM(CASE WHEN order_time >= '${d14.toISOString().slice(0, 10)}' THEN ${qtyExpr} ELSE 0 END) as d14,
+            SUM(CASE WHEN order_time >= '${d30.toISOString().slice(0, 10)}' THEN ${qtyExpr} ELSE 0 END) as d30,
+            SUM(CASE WHEN order_time >= '${d90.toISOString().slice(0, 10)}' THEN ${qtyExpr} ELSE 0 END) as d90,
+            SUM(${qtyExpr}) as d180,
+            MAX(order_time) as last_order_at
+       FROM platform_orders, jsonb_array_elements(products_json::jsonb) as elem
+      WHERE ${baseWhere}
+      GROUP BY 1, 2`
+  );
 
-  const skuStats = new Map<string, { d7: number; d14: number; d30: number }>();
+  const skuStats = new Map<string, SalesStats>();
 
-  const merge = (rows: Array<{ sku: string; total: string | number }>, key: 'd7' | 'd14' | 'd30') => {
-    for (const row of rows) {
-      const sku = normalizeSku(row.sku);
-      if (!sku) continue;
-      const qty = Number(row.total) || 0;
-      const s = skuStats.get(sku) ?? { d7: 0, d14: 0, d30: 0 };
-      s[key] = qty;
-      skuStats.set(sku, s);
-    }
+  const addStats = (key: string, stats: SalesStats) => {
+    const existing = skuStats.get(key) ?? emptySalesStats();
+    skuStats.set(key, mergeStats(existing, stats));
   };
-  merge(d7Rows, 'd7');
-  merge(d14Rows, 'd14');
-  merge(d30Rows, 'd30');
+
+  for (const row of rows) {
+    const stats: SalesStats = {
+      d7: Number(row.d7) || 0,
+      d14: Number(row.d14) || 0,
+      d30: Number(row.d30) || 0,
+      d90: Number(row.d90) || 0,
+      d180: Number(row.d180) || 0,
+      lastOrderAt: row.last_order_at ? new Date(row.last_order_at) : null,
+    };
+    const sku = normalizeSku(row.sku);
+    if (sku) addStats(sku, stats);
+    const pnk = normalizePnk(row.pnk);
+    if (pnk) addStats(pnkKey(pnk), stats);
+  }
 
   // 通用诊断：打印 top3 有销量 SKU（全站通用，无硬编码）
   const skusWithSales = [...skuStats.keys()];
   const topSample = skusWithSales.slice(0, 3);
   if (topSample.length > 0) {
-    console.log(`[Sales shopId=${shopId}] 30天 Top3 SKU: ${topSample.map(k => `${k}(d30=${skuStats.get(k)?.d30 ?? 0})`).join(', ')}`);
+    console.log(`[Sales shopId=${shopId}] 30天 Top3 SKU: ${topSample.map(k => `${k}(d30=${skuStats.get(k)?.d30 ?? 0},d180=${skuStats.get(k)?.d180 ?? 0})`).join(', ')}`);
   } else {
     console.log(`[Sales shopId=${shopId}] 30天内无有效订单销量`);
   }
@@ -117,23 +167,29 @@ async function aggregateSalesForShop(shopId: number): Promise<{ map: Map<string,
 export function getSalesForProduct(
   salesMap: Map<string, SalesStats>,
   sku: string | null,
-  vendorSku: string | null
+  vendorSku: string | null,
+  pnk?: string | null,
 ): SalesStats {
   const keys = new Set(
     [(sku ?? '').trim(), (vendorSku ?? '').trim()]
       .filter(Boolean)
       .map((k) => k.toLowerCase())
   );
-  let d7 = 0, d14 = 0, d30 = 0;
+  let stats = emptySalesStats();
   for (const k of keys) {
     const s = salesMap.get(k);
     if (s) {
-      d7 += s.d7;
-      d14 += s.d14;
-      d30 += s.d30;
+      stats = mergeStats(stats, s);
     }
   }
-  return { d7, d14, d30 };
+  if (stats.d180 > 0 || stats.lastOrderAt) return stats;
+
+  const normalizedPnk = normalizePnk(pnk);
+  if (normalizedPnk) {
+    const pnkStats = salesMap.get(pnkKey(normalizedPnk));
+    if (pnkStats) return pnkStats;
+  }
+  return stats;
 }
 
 /**

@@ -404,24 +404,25 @@ OR: [{ shopId: currentShopId }, { shopId: null }]
 
 **落库字段**：`store_products.product_class`、`classification_reason`、`classification_metrics`、`classified_at`。索引：`shop_id + product_class`，以及 `shop_id + product_class + comprehensive_sales DESC`。
 
-**合法值**：`HOT`（热销款）、`POTENTIAL`（潜力款）、`NORMAL`（普通款）、`DEAD`（滞销款）、`NEW`（新品）、`TO_BE_ELIMINATED`（待淘汰款）。断货不再作为 `productClass`，改由独立 `stockStatus` 表达。
+**合法值**：`HOT`（热销款）、`POTENTIAL`（潜力款）、`NORMAL`（普通款）、`DEAD`（滞销款）、`OUT_OF_STOCK_WATCH`（断货观察款）、`NEW`（新品）、`TO_BE_ELIMINATED`（待淘汰款）。`OUT_OF_STOCK_WATCH` 用于保护当前平台缺货但历史有销量的产品，避免误判为滞销或待淘汰；实时库存缺货状态仍由独立 `stockStatus` 表达。
 
 **严格优先级**：
 
 1. `NEW`：满足其一即归类新品：
    - `daysSinceSynced <= 30 && sales30 === 0`，原因文案必须说明这是基于 ERP 首次同步时间的弱判断，不是 eMAG 真实上架时间。
    - `sales7 === 0 && sales14 === 0 && sales30 === 0 && comprehensiveSales < 0.05 && stock === 0 && inTransitStock > 0`，表示平台暂无库存但存在 FBE 在途，尚未真正开始售卖，归为新品待到货。
-2. `HOT`：`comprehensiveSales >= 1 || sales30 >= 30 || sales7 >= 7`。
-3. `POTENTIAL`：`comprehensiveSales >= 0.2 || sales30 >= 5 || sales7 >= 2`。
-4. `DEAD`：`stock > 0 && daysSinceSynced > 30 && sales30 === 0 && comprehensiveSales < 0.05`，原因文案必须说明第一阶段没有 90 天有货天数，仅为弱滞销。
-5. `TO_BE_ELIMINATED`：`sales7 === 0 && sales14 === 0 && sales30 === 0 && comprehensiveSales < 0.05 && stock === 0 && inTransitStock === 0 && daysSinceSynced > 30`，表示无销量、无平台库存、无在途补货动作，建议人工确认是否继续采购或下架。
-6. `NORMAL`：兜底分类。
+2. `OUT_OF_STOCK_WATCH`：`stock === 0 && (sales90 > 0 || (sales180 >= 3 && daysSinceLastOrder <= 120))`，表示当前平台缺货但历史有销量，先进入断货观察保护，暂不误判为滞销或待淘汰。
+3. `HOT`：`comprehensiveSales >= 1 || sales30 >= 30 || sales7 >= 7`。
+4. `POTENTIAL`：`comprehensiveSales >= 0.2 || sales30 >= 5 || sales7 >= 2`。
+5. `DEAD`：`stock > 0 && daysSinceSynced > 30 && sales30 === 0 && comprehensiveSales < 0.05`，原因文案必须说明第一阶段没有 90 天有货天数，仅为弱滞销。
+6. `TO_BE_ELIMINATED`：`sales7 === 0 && sales14 === 0 && sales30 === 0 && sales180 === 0 && comprehensiveSales < 0.05 && stock === 0 && inTransitStock === 0 && daysSinceSynced > 30`，表示无近期/历史销量、无平台库存、无在途补货动作，建议人工确认是否继续采购或下架。
+7. `NORMAL`：兜底分类。
 
 **计算入口**：`src/services/productClassification.ts` 提供 `classifyStoreProduct()` 纯函数、`recalcProductClassForShop()` 和 `recalcProductClassForAllShops()`。脚本 `npm run ops:recalc-product-class` 默认 dry-run；追加 `-- --fix` 写库；支持 `-- --shopId=1 --fix` 单店重算。
 
-**API**：`GET /api/store-products?productClass=HOT|POTENTIAL|NORMAL|DEAD|NEW|TO_BE_ELIMINATED|all`。不传或 `all` 不过滤，非法值返回 400。筛选在 Prisma `where` 层执行，`count` 与 `findMany` 复用同一条件，保证分页 total 准确。DTO 新增 `product_class/productClass`、`classification_reason/classificationReason`、`classification_metrics/classificationMetrics`。列表接口同时支持计算型筛选 `stockStatus=OUT_OF_STOCK|LOW_STOCK|WARNING|SAFE|OVERSTOCK` 与 `purchaseAction=REPLENISH_NOW|URGENT_REPLENISH|STILL_NEED_REPLENISH|WAIT_FOR_ARRIVAL|CLEARANCE|SAFE|UNKNOWN`；后端先按全店批量计算匹配的 `StoreProduct.id`，再写入 Prisma `where.id in (...)`，严禁分页后过滤，确保 `total` 与分页准确，并可与 `productClass/mappingStatus/search` 按 AND 组合。
+**API**：`GET /api/store-products?productClass=HOT|POTENTIAL|NORMAL|DEAD|OUT_OF_STOCK_WATCH|NEW|TO_BE_ELIMINATED|all`。不传或 `all` 不过滤，非法值返回 400。筛选在 Prisma `where` 层执行，`count` 与 `findMany` 复用同一条件，保证分页 total 准确。DTO 新增 `product_class/productClass`、`classification_reason/classificationReason`、`classification_metrics/classificationMetrics`。列表接口同时支持计算型筛选 `stockStatus=OUT_OF_STOCK|LOW_STOCK|WARNING|SAFE|OVERSTOCK` 与 `purchaseAction=REPLENISH_NOW|URGENT_REPLENISH|STILL_NEED_REPLENISH|WAIT_FOR_ARRIVAL|CLEARANCE|SAFE|UNKNOWN`；后端先按全店批量计算匹配的 `StoreProduct.id`，再写入 Prisma `where.id in (...)`，严禁分页后过滤，确保 `total` 与分页准确，并可与 `productClass/mappingStatus/search` 按 AND 组合。
 
-**分类统计 API**：`GET /api/store-products/classification-summary?shopId=5` 返回固定字段 `{ total, HOT, POTENTIAL, NORMAL, DEAD, NEW, TO_BE_ELIMINATED }`，用于前端分类下拉框数量展示。统计基于 `store_products.product_class` 并按 `shopId`、`is_archived=false` 过滤；`null` 或未知分类归入 `NORMAL`，不纳入 `OUT_OF_STOCK_WATCH`。接口预留并支持 `mappingStatus/search`，采用与列表接口一致的 where 口径；底层使用 Prisma `groupBy`，不做分页后循环统计。
+**分类统计 API**：`GET /api/store-products/classification-summary?shopId=5` 返回固定字段 `{ total, HOT, POTENTIAL, NORMAL, DEAD, OUT_OF_STOCK_WATCH, NEW, TO_BE_ELIMINATED }`，用于前端分类下拉框数量展示。统计基于 `store_products.product_class` 并按 `shopId`、`is_archived=false` 过滤；`null` 或未知分类归入 `NORMAL`。接口预留并支持 `mappingStatus/search`，采用与列表接口一致的 where 口径；底层使用 Prisma `groupBy`，不做分页后循环统计。
 
 **店铺结构概览 API**：`GET /api/store-products/store-overview?shopId=5` 返回 `{ productStructure, stockRisk, purchaseActions, generatedAt }`，用于平台产品页第一阶段概览卡片。`productStructure` 复用分类统计口径，按 `shopId` 与 `is_archived=false` 过滤，`null` 或未知 `productClass` 归入 `NORMAL`；`stockRisk` 复用 `calculateStockStatus()`，基于实时 `salesStats` 计算 `comprehensiveSales` 与 `referenceDailySales` 后归入 `OUT_OF_STOCK/LOW_STOCK/WARNING/SAFE/OVERSTOCK`；`purchaseActions` 复用后端采购建议 helper 生成单品 `purchaseSuggestion`，再映射为 `REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/WAIT_FOR_ARRIVAL/CLEARANCE/SAFE/UNKNOWN`。第一版不新增数据库字段、不做 `operationAdvice`，全店计算使用批量查询本地库存、FBE 在途、采购在途和计划中数量，避免逐品 N+1；后续如访问频率升高，可在 service 入口按 `shopId` 增加 1-5 分钟 TTL 缓存。
 
@@ -441,7 +442,7 @@ DTO 输出双命名：`stockStatus/stock_status`、`stockDays/stock_days`、`ref
 
 ### 4.5.3 平台产品每日库存快照（2026-05-29，二阶段数据底座）
 
-为后续计算 `sales90`、`availableDays90` 与 `inStockDailySales90`，新增 `store_product_inventory_snapshots`。该表只记录事实快照，暂不替换现有 `productClass` 分类逻辑。
+为后续计算 `availableDays90` 与 `inStockDailySales90`，新增 `store_product_inventory_snapshots`。该表只记录事实快照，暂不替换现有 `productClass` 分类逻辑；`sales90/sales180/lastOrderAt` 第一阶段从订单历史聚合获得，不依赖库存快照。有货日销将在库存快照积累 30～90 天后实现，严禁用当前不足天数的快照伪造 90 天指标。
 
 **唯一性**：同一个 `store_product_id + snapshot_date` 只能有一条记录，重复执行采用 upsert 更新当日快照，避免重复插入。
 
