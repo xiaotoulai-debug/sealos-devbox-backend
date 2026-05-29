@@ -16,7 +16,17 @@ import { tryAcquireLock, releaseLock } from '../lib/syncStatus';
 import { backfillProductUrls, backfillProductImages, syncStoreProducts, backfillComprehensiveSales } from '../services/storeProductSync';
 import { recalcProfitForShop, recalcProfitForAllShops } from '../services/profitCalculator';
 import { syncExchangeRates } from '../services/exchangeRateSync';
-import { buildPurchaseSuggestion, getStoreProductOverview } from '../services/storeProductOverview';
+import { buildOperationAdvice } from '../services/operationAdvice';
+import {
+  buildPurchaseSuggestion,
+  getMatchedStoreProductIdsByOverviewFilters,
+  getStoreProductOverview,
+  isPurchaseActionFilter,
+  isStockStatusFilter,
+  type PurchaseActionKey,
+  PURCHASE_ACTION_FILTERS,
+  STOCK_STATUS_FILTERS,
+} from '../services/storeProductOverview';
 import {
   calculateStockStatus,
   classifyStoreProduct,
@@ -25,6 +35,7 @@ import {
   PRODUCT_CLASSES,
   recalcProductClassForAllShops,
   recalcProductClassForShop,
+  type StockStatus,
 } from '../services/productClassification';
 
 const router = Router();
@@ -562,6 +573,36 @@ router.get('/', async (req: Request, res: Response) => {
       });
       return;
     }
+    const rawStockStatus = req.query.stockStatus ?? req.query.stock_status;
+    const normalizedStockStatus = rawStockStatus == null
+      ? undefined
+      : String(Array.isArray(rawStockStatus) ? rawStockStatus[0] : rawStockStatus).trim().toUpperCase();
+    if (normalizedStockStatus && !isStockStatusFilter(normalizedStockStatus)) {
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: `stockStatus 无效，合法值：${STOCK_STATUS_FILTERS.join('/')}`,
+      });
+      return;
+    }
+    const stockStatusFilter: StockStatus | undefined = normalizedStockStatus && isStockStatusFilter(normalizedStockStatus)
+      ? normalizedStockStatus
+      : undefined;
+    const rawPurchaseAction = req.query.purchaseAction ?? req.query.purchase_action;
+    const normalizedPurchaseAction = rawPurchaseAction == null
+      ? undefined
+      : String(Array.isArray(rawPurchaseAction) ? rawPurchaseAction[0] : rawPurchaseAction).trim().toUpperCase();
+    if (normalizedPurchaseAction && !isPurchaseActionFilter(normalizedPurchaseAction)) {
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: `purchaseAction 无效，合法值：${PURCHASE_ACTION_FILTERS.join('/')}`,
+      });
+      return;
+    }
+    const purchaseActionFilter: PurchaseActionKey | undefined = normalizedPurchaseAction && isPurchaseActionFilter(normalizedPurchaseAction)
+      ? normalizedPurchaseAction
+      : undefined;
 
     // Prisma 无法在一条 where 里同时表达「IS NULL OR = ''」，使用 OR 组合处理空字符串边界
     const where: Prisma.StoreProductWhereInput = { shopId, isArchived: false };
@@ -627,6 +668,14 @@ router.get('/', async (req: Request, res: Response) => {
           where.OR = searchOr as Prisma.StoreProductWhereInput['OR'];
         }
       }
+    }
+
+    if (stockStatusFilter || purchaseActionFilter) {
+      const matchedIds = await getMatchedStoreProductIdsByOverviewFilters(shopId, {
+        ...(stockStatusFilter ? { stockStatus: stockStatusFilter } : {}),
+        ...(purchaseActionFilter ? { purchaseAction: purchaseActionFilter } : {}),
+      });
+      where.id = { in: matchedIds };
     }
 
     // 分页必须分离查数据与查总数；mappedInventorySku 已改为纯字符串，不再 include Inventory
@@ -965,6 +1014,27 @@ router.get('/', async (req: Request, res: Response) => {
         sales30: sales_stats.d30,
         daysSinceSynced,
       });
+      const estimatedProfit = p.estimatedProfit != null ? Number(p.estimatedProfit) : null;
+      const profitMarginPct = p.profitMarginPct ?? null;
+      const operationAdvice = buildOperationAdvice({
+        productClass,
+        stockStatus: stockStatusResult.stockStatus,
+        stock: platformStock,
+        stockDays: stockStatusResult.stockDays,
+        platformInTransit,
+        localStock,
+        purchasingInTransit,
+        planningStock,
+        sales7: sales_stats.d7,
+        sales14: sales_stats.d14,
+        sales30: sales_stats.d30,
+        comprehensiveSales: compSales,
+        suggestAmount: purchaseSuggestion.suggestAmount,
+        estimatedProfit,
+        profitMarginPct,
+        price: Number.isFinite(salePriceNum) ? salePriceNum : null,
+        daysSinceSynced,
+      });
       const productUrl = p.productUrl ?? (() => {
         const domain = (region && REGION_DOMAIN[region as keyof typeof REGION_DOMAIN]) ?? 'emag.ro';
         const name = (p.name ?? '').trim();
@@ -1000,15 +1070,17 @@ router.get('/', async (req: Request, res: Response) => {
           ...purchaseSuggestion,
           platformInTransit: fbeInTransitQuantity,
         },
-        estimated_profit:     p.estimatedProfit ? Number(p.estimatedProfit) : null,
+        operation_advice: operationAdvice,
+        operationAdvice,
+        estimated_profit:     estimatedProfit,
         estimated_profit_cny: p.estimatedProfitCny ? Number(p.estimatedProfitCny) : null,
-        profit_margin_pct:    p.profitMarginPct ?? null,
+        profit_margin_pct:    profitMarginPct,
         commission_rate:      p.commissionRate ?? null,
         profit_calculated_at: p.profitCalculatedAt ?? null,
         // ── camelCase 别名（与架构方案文档 & 前端接口契约严格对齐，向前兼容）──
-        estimatedProfitLocal: p.estimatedProfit ? Number(p.estimatedProfit) : null,
+        estimatedProfitLocal: estimatedProfit,
         estimatedProfitCny:   p.estimatedProfitCny ? Number(p.estimatedProfitCny) : null,
-        profitMarginPct:      p.profitMarginPct ?? null,
+        profitMarginPct,
         commissionRate:       p.commissionRate ?? null,
         profitCalculatedAt:   p.profitCalculatedAt ?? null,
         // ── 利润明细拆解（前端可直接渲染，无需重算）──

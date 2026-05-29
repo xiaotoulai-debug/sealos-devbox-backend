@@ -2,6 +2,7 @@ import { prisma } from '../lib/prisma';
 import {
   calculateComprehensiveSales,
   calculateStockStatus,
+  classifyStoreProduct,
   isProductClass,
   PRODUCT_CLASSES,
   STOCK_STATUSES,
@@ -55,7 +56,8 @@ export type StoreProductOverview = {
 
 const PRODUCT_STRUCTURE_KEYS = PRODUCT_CLASSES;
 const STOCK_RISK_KEYS = STOCK_STATUSES;
-const PURCHASE_ACTION_KEYS: PurchaseActionKey[] = [
+export const STOCK_STATUS_FILTERS = STOCK_STATUSES;
+export const PURCHASE_ACTION_FILTERS = [
   'REPLENISH_NOW',
   'URGENT_REPLENISH',
   'STILL_NEED_REPLENISH',
@@ -63,7 +65,9 @@ const PURCHASE_ACTION_KEYS: PurchaseActionKey[] = [
   'CLEARANCE',
   'SAFE',
   'UNKNOWN',
-];
+] as const;
+
+const PURCHASE_ACTION_KEYS: readonly PurchaseActionKey[] = PURCHASE_ACTION_FILTERS;
 
 function normalizeSkuKey(value: string | null | undefined): string {
   return String(value ?? '').trim().toLowerCase();
@@ -78,6 +82,14 @@ function emptyRecord<T extends readonly string[]>(keys: T): Record<T[number], nu
 
 function normalizeProductClass(value: string | null): ProductClass {
   return value && isProductClass(value) ? value : 'NORMAL';
+}
+
+export function isStockStatusFilter(value: string): value is StockStatus {
+  return (STOCK_STATUS_FILTERS as readonly string[]).includes(value);
+}
+
+export function isPurchaseActionFilter(value: string): value is PurchaseActionKey {
+  return (PURCHASE_ACTION_FILTERS as readonly string[]).includes(value);
 }
 
 export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): PurchaseSuggestion {
@@ -220,7 +232,7 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
   };
 }
 
-function mapPurchaseAction(suggestion: PurchaseSuggestion): PurchaseActionKey {
+export function mapPurchaseAction(suggestion: PurchaseSuggestion): PurchaseActionKey {
   const text = suggestion.text ?? suggestion.label ?? '';
   if (text.includes('立即补货')) return 'REPLENISH_NOW';
   if (text.includes('紧急补货')) return 'URGENT_REPLENISH';
@@ -382,6 +394,89 @@ export async function getProductStructureSummary(shopId: number): Promise<StoreP
   }
   const total = PRODUCT_STRUCTURE_KEYS.reduce((sum, key) => sum + counts[key], 0);
   return { total, ...counts };
+}
+
+export async function getMatchedStoreProductIdsByOverviewFilters(
+  shopId: number,
+  filters: { stockStatus?: StockStatus; purchaseAction?: PurchaseActionKey },
+): Promise<number[]> {
+  if (!filters.stockStatus && !filters.purchaseAction) {
+    return [];
+  }
+
+  // 第一版暂不做缓存；后续可在这里按 shopId + filters 增加 1-5 分钟 TTL 缓存。
+  const [salesStats, products] = await Promise.all([
+    getSalesStatsByShop(shopId),
+    prisma.storeProduct.findMany({
+      where: { shopId, isArchived: false },
+      select: {
+        id: true,
+        pnk: true,
+        sku: true,
+        vendorSku: true,
+        mappedInventorySku: true,
+        stock: true,
+        productClass: true,
+        syncedAt: true,
+      },
+      orderBy: { id: 'asc' },
+    }),
+  ]);
+
+  const assets = filters.purchaseAction ? await buildLocalProductAssets(shopId, products) : null;
+  const nowMs = Date.now();
+  const dayMs = 24 * 60 * 60 * 1000;
+  const matchedIds: number[] = [];
+
+  for (const product of products) {
+    const sales = getSalesForProduct(salesStats.map, product.sku, product.vendorSku);
+    const comprehensiveSales = calculateComprehensiveSales(sales.d7, sales.d14, sales.d30);
+    const stockStatusResult = calculateStockStatus(product.stock, comprehensiveSales, sales.d30);
+    if (filters.stockStatus && stockStatusResult.stockStatus !== filters.stockStatus) {
+      continue;
+    }
+
+    if (filters.purchaseAction) {
+      if (!assets) continue;
+      const localProductId = assets.storeProductToProductId.get(product.id);
+      const skuKey = assets.skuKeyByStoreProductId.get(product.id) ?? '';
+      const platformInTransit = localProductId ? assets.platformInTransitByProductId.get(localProductId) ?? 0 : 0;
+      const localStock = localProductId ? assets.localStockByProductId.get(localProductId) ?? 0 : 0;
+      const purchasingInTransit = localProductId ? assets.purchasingInTransitByProductId.get(localProductId) ?? 0 : 0;
+      const planningStock = skuKey ? assets.planningStockBySku.get(skuKey) ?? 0 : 0;
+      const storedProductClass = product.productClass && isProductClass(product.productClass) ? product.productClass : null;
+      const fallbackClassification = classifyStoreProduct({
+        stock: product.stock,
+        inTransitStock: platformInTransit,
+        syncedAt: product.syncedAt,
+        sales7: sales.d7,
+        sales14: sales.d14,
+        sales30: sales.d30,
+        comprehensiveSales,
+      });
+      const productClass = storedProductClass ?? fallbackClassification.productClass;
+      const daysSinceSynced = Math.max(0, Math.floor((nowMs - product.syncedAt.getTime()) / dayMs));
+      const suggestion = buildPurchaseSuggestion({
+        productClass,
+        stockStatus: stockStatusResult.stockStatus,
+        platformStock: product.stock,
+        platformInTransit,
+        localStock,
+        purchasingInTransit,
+        planningStock,
+        comprehensiveSales,
+        sales30: sales.d30,
+        daysSinceSynced,
+      });
+      if (mapPurchaseAction(suggestion) !== filters.purchaseAction) {
+        continue;
+      }
+    }
+
+    matchedIds.push(product.id);
+  }
+
+  return matchedIds;
 }
 
 export async function getStoreProductOverview(shopId: number): Promise<StoreProductOverview> {
