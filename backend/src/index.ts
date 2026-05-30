@@ -18,6 +18,7 @@ import alibabaRouter from './routes/alibaba';
 import shopRouter    from './routes/shop';
 import emagRouter    from './routes/emag';
 import dashboardRouter from './routes/dashboard';
+import analyticsRouter from './routes/analytics';
 import storeProductsRouter from './routes/storeProducts';
 import permissionRouter from './routes/permission';
 import translateRouter from './routes/translate';
@@ -64,6 +65,7 @@ app.use('/api/shops',   shopRouter);    // 多平台店铺授权管理
 app.use('/api/shop',    shopRouter);    // 别名，兼容前端 /api/shop/:id
 app.use('/api/emag',    emagRouter);    // eMAG 核心业务 API
 app.use('/api/dashboard', dashboardRouter); // 实时业绩看板
+app.use('/api/analytics', analyticsRouter); // 订单日报 / 运营看板聚合接口
 app.use('/api/store-products', storeProductsRouter); // 店铺在售产品（仅 StoreProduct，不混公海）
 app.use('/api/translate', translateRouter);          // 翻译代理（MyMemory API 转发）
 app.use('/api/fbe-shipments', fbeShipmentRouter);   // FBE 发货单管理（在途库存闭环）

@@ -3,6 +3,9 @@ import type { ProductClass, StockStatus } from './productClassification';
 export type OperationPriority = 'P0' | 'P1' | 'P2' | 'P3';
 
 export type OperationAction =
+  | 'REPLENISH_NOW'
+  | 'URGENT_REPLENISH'
+  | 'STILL_NEED_REPLENISH'
   | 'RAISE_PRICE'
   | 'LOWER_PRICE'
   | 'JOIN_CAMPAIGN'
@@ -33,7 +36,14 @@ export type BuildOperationAdviceInput = {
   sales7: number;
   sales14: number;
   sales30: number;
+  sales90: number;
+  sales180: number;
+  lastOrderAt: Date | null;
+  daysSinceLastOrder: number | null;
   comprehensiveSales: number;
+  replenishReferenceDailySales: number;
+  targetStock: number;
+  coverageStock: number;
   suggestAmount: number;
   estimatedProfit: number | null;
   profitMarginPct: number | null;
@@ -65,7 +75,14 @@ function buildMetrics(input: BuildOperationAdviceInput): Record<string, unknown>
     sales7: input.sales7,
     sales14: input.sales14,
     sales30: input.sales30,
+    sales90: input.sales90,
+    sales180: input.sales180,
+    lastOrderAt: input.lastOrderAt ? input.lastOrderAt.toISOString() : null,
+    daysSinceLastOrder: input.daysSinceLastOrder,
     comprehensiveSales: input.comprehensiveSales,
+    replenishReferenceDailySales: input.replenishReferenceDailySales,
+    targetStock: input.targetStock,
+    coverageStock: input.coverageStock,
     suggestAmount: input.suggestAmount,
     estimatedProfit: input.estimatedProfit,
     profitMarginPct: input.profitMarginPct,
@@ -97,13 +114,21 @@ export function buildOperationAdvice(input: BuildOperationAdviceInput): Operatio
     stockStatus,
     stock,
     platformInTransit,
+    localStock,
+    purchasingInTransit,
+    planningStock,
     sales30,
+    replenishReferenceDailySales,
+    targetStock,
+    coverageStock,
     comprehensiveSales,
     suggestAmount,
     estimatedProfit,
     profitMarginPct,
     daysSinceSynced,
   } = input;
+
+  const hasReplenishDemand = stock === 0 && replenishReferenceDailySales > 0;
 
   if (
     estimatedProfit != null &&
@@ -117,6 +142,50 @@ export function buildOperationAdvice(input: BuildOperationAdviceInput): Operatio
       title: '负毛利动销，优先调价',
       reason: '该产品近期有销量但预估毛利为负，建议立即复核成本和售价，优先调高价格或暂停低价活动。',
       tags: ['负毛利', '有销量', '优先处理'],
+      metrics,
+    };
+  }
+
+  if (hasReplenishDemand && coverageStock <= 0 && replenishReferenceDailySales >= 1) {
+    return {
+      priority: 'P0',
+      action: 'REPLENISH_NOW',
+      title: '立即补货',
+      reason: '该产品当前平台库存为 0，且历史/近期销量较好，当前无足够在途或计划库存，建议立即补货。',
+      tags: ['缺货', '有销量', '优先补货'],
+      metrics,
+    };
+  }
+
+  if (hasReplenishDemand && coverageStock <= 0) {
+    return {
+      priority: 'P1',
+      action: 'URGENT_REPLENISH',
+      title: '紧急补货',
+      reason: '该产品当前平台库存为 0，但历史/近期仍有销量，建议优先安排补货，避免继续丢单。',
+      tags: ['断货观察', '有销量', '紧急补货'],
+      metrics,
+    };
+  }
+
+  if (hasReplenishDemand && coverageStock > 0 && coverageStock < targetStock) {
+    return {
+      priority: 'P1',
+      action: 'STILL_NEED_REPLENISH',
+      title: '仍需补货',
+      reason: '该产品虽然已有部分在途或计划库存，但按历史销量测算仍不足，建议继续补货。',
+      tags: ['在途不足', '有销量', '继续补货'],
+      metrics,
+    };
+  }
+
+  if (hasReplenishDemand && coverageStock >= targetStock) {
+    return {
+      priority: 'P2',
+      action: 'WAIT_FOR_ARRIVAL',
+      title: '等待到货',
+      reason: '当前平台无库存，但已有库存保障覆盖目标库存，建议等待到货并观察销售恢复情况。',
+      tags: ['缺货', '已有在途', '等待到货'],
       metrics,
     };
   }
@@ -147,7 +216,7 @@ export function buildOperationAdvice(input: BuildOperationAdviceInput): Operatio
     };
   }
 
-  if (stock === 0 && platformInTransit > 0) {
+  if (stock === 0 && (platformInTransit + purchasingInTransit + planningStock + localStock) > 0) {
     return {
       priority: 'P2',
       action: 'WAIT_FOR_ARRIVAL',

@@ -28,7 +28,9 @@ export type PurchaseSuggestion = {
   purchasingInTransit: number;
   planningStock: number;
   suggestAmount: number;
-  inventoryTag: 'NEW' | 'DEAD' | 'HOT' | 'POTENTIAL' | 'NORMAL' | 'TO_BE_ELIMINATED';
+  coverageStock: number;
+  replenishReferenceDailySales: number;
+  inventoryTag: 'NEW' | 'DEAD' | 'HOT' | 'POTENTIAL' | 'NORMAL' | 'OUT_OF_STOCK_WATCH' | 'TO_BE_ELIMINATED';
   text?: string;
   label?: string;
   reason?: string;
@@ -44,6 +46,9 @@ type BuildPurchaseSuggestionInput = {
   planningStock: number;
   comprehensiveSales: number;
   sales30: number;
+  sales90?: number;
+  sales180?: number;
+  lastOrderAt?: Date | null;
   daysSinceSynced: number;
 };
 
@@ -92,6 +97,21 @@ export function isPurchaseActionFilter(value: string): value is PurchaseActionKe
   return (PURCHASE_ACTION_FILTERS as readonly string[]).includes(value);
 }
 
+export function calculateReplenishReferenceDailySales(
+  comprehensiveSales: number | null | undefined,
+  sales30: number | null | undefined,
+  sales90?: number | null,
+  sales180?: number | null,
+): number {
+  const referenceDailySales = Math.max(
+    Number(comprehensiveSales ?? 0),
+    Number(sales30 ?? 0) / 30,
+    Number(sales90 ?? 0) / 90,
+    Number(sales180 ?? 0) / 180,
+  );
+  return parseFloat(referenceDailySales.toFixed(4));
+}
+
 export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): PurchaseSuggestion {
   const {
     productClass,
@@ -103,19 +123,27 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
     planningStock,
     comprehensiveSales,
     sales30,
+    sales90,
+    sales180,
     daysSinceSynced,
   } = input;
 
-  const targetStock = Math.floor(comprehensiveSales * 60);
-  const suggestAmount = Math.max(
-    0,
-    targetStock - platformStock - platformInTransit - localStock - purchasingInTransit - planningStock,
+  const replenishReferenceDailySales = calculateReplenishReferenceDailySales(
+    comprehensiveSales,
+    sales30,
+    sales90,
+    sales180,
   );
+  const targetStock = replenishReferenceDailySales > 0 ? Math.ceil(replenishReferenceDailySales * 60) : 0;
+  const coverageStock = platformStock + platformInTransit + localStock + purchasingInTransit + planningStock;
+  const suggestAmount = Math.max(0, targetStock - coverageStock);
 
   const isToBeEliminated = productClass === 'TO_BE_ELIMINATED';
   const isNewProduct = productClass === 'NEW';
   const isDeadProduct = productClass === 'DEAD';
   const isNormalProduct = productClass === 'NORMAL';
+  const isOutOfStockWatch = productClass === 'OUT_OF_STOCK_WATCH';
+  const isOutOfStockWithSales = platformStock === 0 && replenishReferenceDailySales > 0;
   const isHotOrPotentialOutOfStock = (productClass === 'HOT' || productClass === 'POTENTIAL') && platformStock === 0;
   const isHotOrPotentialLowStockWarning =
     (productClass === 'HOT' || productClass === 'POTENTIAL') &&
@@ -127,11 +155,12 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
   else if (isNewProduct) inventoryTag = 'NEW';
   else if (isDeadProduct) inventoryTag = 'DEAD';
   else if (isNormalProduct) inventoryTag = 'NORMAL';
+  else if (isOutOfStockWatch) inventoryTag = 'OUT_OF_STOCK_WATCH';
   else if (isHotOrPotentialOutOfStock || isHotOrPotentialLowStockWarning) inventoryTag = productClass;
   else if (daysSinceSynced <= 30) inventoryTag = 'NEW';
-  else if (comprehensiveSales === 0 && platformStock + localStock > 0) inventoryTag = 'DEAD';
-  else if (comprehensiveSales > 0) {
-    const turnoverDays = (platformStock + localStock) / comprehensiveSales;
+  else if (replenishReferenceDailySales === 0 && platformStock + localStock > 0) inventoryTag = 'DEAD';
+  else if (replenishReferenceDailySales > 0) {
+    const turnoverDays = (platformStock + localStock) / replenishReferenceDailySales;
     inventoryTag = turnoverDays < 15 ? 'HOT' : 'NORMAL';
   } else {
     inventoryTag = 'NORMAL';
@@ -139,7 +168,27 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
 
   let text: string | undefined;
   let reason: string | undefined;
-  if (isToBeEliminated) {
+  if (isOutOfStockWithSales) {
+    const pendingStock = platformInTransit + purchasingInTransit + planningStock;
+    if (suggestAmount > 0 && coverageStock <= 0) {
+      text = replenishReferenceDailySales >= 1 ? '立即补货' : '紧急补货';
+      reason = replenishReferenceDailySales >= 1
+        ? '当前平台库存为0，且历史/近期销量较好，当前无足够在途或计划库存，建议立即补货。'
+        : '当前平台库存为0，但历史/近期仍有销量，建议优先安排补货，避免继续丢单。';
+    } else if (suggestAmount > 0) {
+      text = '仍需补货';
+      reason = '当前平台库存为0，虽然已有部分库存保障，但按历史/近期销量测算仍不足，建议继续补货。';
+    } else if (pendingStock > 0) {
+      text = '等待到货';
+      reason = '当前平台库存为0，但已有在途、采购中或计划库存覆盖目标库存，建议等待到货并观察销售恢复情况。';
+    } else if (localStock > 0) {
+      text = '仍需补货';
+      reason = '当前平台库存为0，本地库存可覆盖目标库存，建议尽快安排补货或发往平台仓，避免继续丢单。';
+    } else {
+      text = '仍需补货';
+      reason = '当前平台库存为0且历史/近期有销量，建议复核库存保障并安排补货。';
+    }
+  } else if (isToBeEliminated) {
     text = '暂停补货';
     reason = '近30天无销量，且当前无平台库存、无在途库存，建议人工确认是否继续采购或下架。';
   } else if (isNewProduct) {
@@ -185,15 +234,14 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
       reason = '普通款当前平台库存为0且无在途库存，建议结合销量和采购计划人工确认是否补货。';
     }
   } else if (isHotOrPotentialOutOfStock) {
-    const referenceDailySales = Math.max(comprehensiveSales, sales30 / 30);
     if (platformInTransit <= 0) {
       text = '立即补货';
       reason = '当前平台库存为0，且无在途库存，热销或潜力产品建议立即补货。';
-    } else if (referenceDailySales <= 0) {
+    } else if (replenishReferenceDailySales <= 0) {
       text = '等待到货';
       reason = '当前平台库存为0，但存在在途库存，建议等待到货后观察销售表现。';
     } else {
-      const inTransitDays = platformInTransit / referenceDailySales;
+      const inTransitDays = platformInTransit / replenishReferenceDailySales;
       if (inTransitDays >= 30) {
         text = '等待到货';
         reason = `当前平台库存为0，但在途库存预计可覆盖约 ${inTransitDays.toFixed(1)} 天销量，建议关注到货进度，暂不重复采购。`;
@@ -226,6 +274,8 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
     purchasingInTransit,
     planningStock,
     suggestAmount,
+    coverageStock,
+    replenishReferenceDailySales,
     inventoryTag,
     ...(text ? { text, label: text } : {}),
     ...(reason ? { reason } : {}),
@@ -469,6 +519,9 @@ export async function getMatchedStoreProductIdsByOverviewFilters(
         planningStock,
         comprehensiveSales,
         sales30: sales.d30,
+        sales90: sales.d90,
+        sales180: sales.d180,
+        lastOrderAt: sales.lastOrderAt,
         daysSinceSynced,
       });
       if (mapPurchaseAction(suggestion) !== filters.purchaseAction) {
@@ -538,6 +591,9 @@ export async function getStoreProductOverview(shopId: number): Promise<StoreProd
       planningStock,
       comprehensiveSales,
       sales30: sales.d30,
+      sales90: sales.d90,
+      sales180: sales.d180,
+      lastOrderAt: sales.lastOrderAt,
       daysSinceSynced,
     });
     purchaseActions[mapPurchaseAction(suggestion)]++;

@@ -1012,6 +1012,9 @@ router.get('/', async (req: Request, res: Response) => {
         : 0;
       const planningStock = planningStockMap.get(normalizeSkuKey(skuKey)) ?? 0;
       const daysSinceSynced = Math.floor((nowMs - p.syncedAt.getTime()) / DAY_MS);
+      const daysSinceLastOrder = sales_stats.lastOrderAt
+        ? Math.max(0, Math.floor((nowMs - sales_stats.lastOrderAt.getTime()) / DAY_MS))
+        : null;
       const purchaseSuggestion = buildPurchaseSuggestion({
         productClass,
         stockStatus: stockStatusResult.stockStatus,
@@ -1022,6 +1025,9 @@ router.get('/', async (req: Request, res: Response) => {
         planningStock,
         comprehensiveSales: compSales,
         sales30: sales_stats.d30,
+        sales90: sales_stats.d90,
+        sales180: sales_stats.d180,
+        lastOrderAt: sales_stats.lastOrderAt,
         daysSinceSynced,
       });
       const estimatedProfit = p.estimatedProfit != null ? Number(p.estimatedProfit) : null;
@@ -1038,7 +1044,14 @@ router.get('/', async (req: Request, res: Response) => {
         sales7: sales_stats.d7,
         sales14: sales_stats.d14,
         sales30: sales_stats.d30,
+        sales90: sales_stats.d90,
+        sales180: sales_stats.d180,
+        lastOrderAt: sales_stats.lastOrderAt,
+        daysSinceLastOrder,
         comprehensiveSales: compSales,
+        replenishReferenceDailySales: purchaseSuggestion.replenishReferenceDailySales,
+        targetStock: purchaseSuggestion.targetStock,
+        coverageStock: purchaseSuggestion.coverageStock,
         suggestAmount: purchaseSuggestion.suggestAmount,
         estimatedProfit,
         profitMarginPct,

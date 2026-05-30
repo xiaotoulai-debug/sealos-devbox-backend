@@ -74,6 +74,7 @@ backend/
 │   │   │                      #   POST /api/store-products/sync     — 手动全量同步
 │   │   │                      #   POST /api/store-products/map      — 绑定库存 SKU（★ SKU 字符串优先匹配，inventorySkuId 兜底；pnk+shopId 或 storeProductId 定位平台产品）
 │   │   ├── dashboard.ts       # 业绩看板（stats、shops 下拉）
+│   │   ├── analytics.ts       # 运营分析接口（订单日报）
 │   │   ├── translate.ts       # 翻译代理（MyMemory API 转发，ro→zh 等）
 │   │   ├── fbeShipment.ts     # FBE 发货单管理（在途库存闭环；GET /counts 须在 /:id 前；PUT /:id 严格校验 items）
 │   │   ├── inventory.ts       # 进销存核心（POST batch-adjust / PUT purchase-orders receive / GET logs）
@@ -93,6 +94,7 @@ backend/
 │   │   ├── syncCron.ts               # 订单哨兵(10min)、产品雷达(2h)、库存同步(1h)
 │   │   ├── salesStats.ts             # 全站销量聚合（无 shopId/region 硬编码）
 │   │   ├── dashboardStats.ts         # 看板数据（getStatsFromLocalDB / getStatsByDateRange）
+│   │   ├── orderDailyAnalytics.ts    # 订单日报：按站点当地自然日聚合 platform_orders
 │   │   ├── emagOrder.ts              # eMAG 订单相关操作
 │   │   ├── emagLogistics.ts          # eMAG 物流查询
 │   │   ├── emagRateLimit.ts          # 限流与延迟（3 req/s）
@@ -426,7 +428,9 @@ OR: [{ shopId: currentShopId }, { shopId: null }]
 
 **店铺结构概览 API**：`GET /api/store-products/store-overview?shopId=5` 返回 `{ productStructure, stockRisk, purchaseActions, generatedAt }`，用于平台产品页第一阶段概览卡片。`productStructure` 复用分类统计口径，按 `shopId` 与 `is_archived=false` 过滤，`null` 或未知 `productClass` 归入 `NORMAL`；`stockRisk` 复用 `calculateStockStatus()`，基于实时 `salesStats` 计算 `comprehensiveSales` 与 `referenceDailySales` 后归入 `OUT_OF_STOCK/LOW_STOCK/WARNING/SAFE/OVERSTOCK`；`purchaseActions` 复用后端采购建议 helper 生成单品 `purchaseSuggestion`，再映射为 `REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/WAIT_FOR_ARRIVAL/CLEARANCE/SAFE/UNKNOWN`。第一版不新增数据库字段、不做 `operationAdvice`，全店计算使用批量查询本地库存、FBE 在途、采购在途和计划中数量，避免逐品 N+1；后续如访问频率升高，可在 service 入口按 `shopId` 增加 1-5 分钟 TTL 缓存。
 
-**运营动作建议 operationAdvice（实时 DTO，不落库）**：`GET /api/store-products` 每行返回双命名 `operationAdvice/operation_advice`，用于回答“运营接下来做什么”，与 `purchaseSuggestion` 的供应链采购动作分离。第一阶段由 `src/services/operationAdvice.ts` 的规则引擎实时生成，不新增数据库字段、不做筛选/统计、不接 AI。动作集合：`RAISE_PRICE/LOWER_PRICE/JOIN_CAMPAIGN/ADVERTISE/CLEARANCE/PAUSE_PURCHASE/WAIT_FOR_ARRIVAL/OBSERVE`；优先级：`P0/P1/P2/P3`。规则按顺序短路：负毛利动销异常、清仓处理、暂停采购、等待到货、建议涨价、建议降价、加广告、参加活动、观察即可。阈值集中配置为 `lowProfitMarginPct=15`、`goodProfitMarginPct=25`、`lowStockDays=30`、`warningStockDays=60`、`overstockDays=120`、`clearanceStockThreshold=10`；`profitMarginPct` 单位是百分数（`15` 表示 15%）。因当前缺少竞品价格、价格历史、广告 ROI、曝光点击转化数据，涨价/降价/广告/活动文案必须表达为“可考虑/测试”，不能作为强结论。
+**运营动作建议 operationAdvice（实时 DTO，不落库）**：`GET /api/store-products` 每行返回双命名 `operationAdvice/operation_advice`，用于回答“运营接下来做什么”，与 `purchaseSuggestion` 的供应链采购动作分离。第一阶段由 `src/services/operationAdvice.ts` 的规则引擎实时生成，不新增数据库字段、不做筛选/统计、不接 AI。动作集合：`REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/RAISE_PRICE/LOWER_PRICE/JOIN_CAMPAIGN/ADVERTISE/CLEARANCE/PAUSE_PURCHASE/WAIT_FOR_ARRIVAL/OBSERVE`；优先级：`P0/P1/P2/P3`。断货补货规则优先于普通调价、广告、活动和观察兜底：`stock=0 && replenishReferenceDailySales>0 && coverageStock<=0` 返回立即/紧急补货，`coverageStock<targetStock` 返回仍需补货，`coverageStock>=targetStock` 返回等待到货；`OUT_OF_STOCK_WATCH` 且有补货参考日销时不得误判为 `OBSERVE`。其他规则按顺序短路：负毛利动销异常、清仓处理、暂停采购、等待到货、建议涨价、建议降价、加广告、参加活动、观察即可。阈值集中配置为 `lowProfitMarginPct=15`、`goodProfitMarginPct=25`、`lowStockDays=30`、`warningStockDays=60`、`overstockDays=120`、`clearanceStockThreshold=10`；`profitMarginPct` 单位是百分数（`15` 表示 15%）。因当前缺少竞品价格、价格历史、广告 ROI、曝光点击转化数据，涨价/降价/广告/活动文案必须表达为“可考虑/测试”，不能作为强结论。
+
+**补货参考日销**：`purchaseSuggestion` 与 `operationAdvice` 统一使用 `replenishReferenceDailySales = max(comprehensiveSales, sales30/30, sales90/90, sales180/180)`。该指标只用于采购建议和运营建议，不改变 `productClass` 分类；`targetStock = ceil(replenishReferenceDailySales * 60)`，`coverageStock = platformStock + platformInTransit + localStock + purchasingInTransit + planningStock`，`suggestAmount = max(0, targetStock - coverageStock)`。当平台库存为 0 且历史/近期有销量时，即使近 7/14/30 综合日销因断货归零，也能基于 90/180 天历史销量给出补货、仍需补货或等待到货建议。
 
 **库存状态 stockStatus（DTO 计算字段，不落库）**：
 
@@ -521,6 +525,44 @@ graph TD
 **运维补单工具**：
 - `scripts/backfill-platform-orders.ts`：7 天串行补单脚本，`createdAfter` 过滤，幂等 upsert
 - `scripts/diagnose-orders-dryrun.ts`：只读诊断脚本，按日期统计 API 返回量 vs DB 入库量
+
+### 4.8 订单日报 / 运营看板（Phase 1）
+
+**入口**：`GET /api/analytics/orders/daily?month=YYYY-MM&shopId=5&site=RO&statusMode=valid&currencyMode=original`，由 `routes/analytics.ts` 挂载到 `/api/analytics`，实现位于 `services/orderDailyAnalytics.ts`。
+
+**数据源**：只读取本地 `platform_orders`，不实时请求 eMAG。订单商品仍来自 `products_json`，第一版不新增 `order_items` 表、不新增 migration。
+
+**日期口径**：按站点当地自然日聚合，`shop_authorizations.region` 映射时区：RO=`Europe/Bucharest`、BG=`Europe/Sofia`、HU=`Europe/Budapest`。服务一次性拉取目标月份前后少量 UTC 缓冲区内订单，再在 Node 层按站点时区格式化为 `YYYY-MM-DD` 过滤，避免 UTC 跨日误差。
+
+**状态口径**：
+- `valid`（默认）：有效订单 `status IN (1,2,3,4)`。
+- `all`：全部订单。
+- `completed_only`：仅 `status=4`。
+- 退货/退款数量单独统计：`status=5` 或 `raw_json.refunded_amount > 0` 计入 `refundOrderCount/refundAmount`。
+
+**金额与毛利口径**：返回固定字段 `grossSales/refundAmount/netSales/productCost/commissionCost/fulfillmentCost/grossProfit/grossMargin/avgOrderValue`。Phase 3A 起 `grossSales` 固定为 `sum(products_json[].sale_price * quantity)`，即订单商品不含 VAT 成交额；`platform_orders.total` 是客户支付的含 VAT 金额，只汇总到 `amountWithVat` 作为展示/诊断字段，不参与毛利计算。`vatAmount = amountWithVat - grossSales`，允许因退款、四舍五入或订单结构出现小额差异。`grossProfit = netSales - productCost - commissionCost - fulfillmentCost`，仅表示订单毛利估算，不代表最终净利润。第一版只尝试用 `products.purchase_price` + `exchange_rates(CNY→订单币种)` 估算 `productCost`；`commissionCost` 暂不计入并返回 warning；`fulfillmentCost` 因 `products.fbe_fee` 币种口径未最终确认，暂不计入并返回 warning。SKU/PNK 匹配不到本地成本时置 `hasMissingCost=true`。
+
+**税口径字段（Phase 3A）**：`summary/days/currencyGroups.*` 统一返回 `amountWithVat/vatAmount/salesTaxMode/profitFormulaVersion`。`salesTaxMode='ex_vat'`，`profitFormulaVersion='order_profit_v1_ex_vat_phase3a'`。退款订单的 `raw_json.refunded_amount` 经样本验证多为含 VAT 金额；当前优先用 `raw_json.products[].sale_price * storno_qty` 计算不含 VAT `refundAmount`，无法从商品明细还原时才回退到原始退款金额并输出 warning。
+
+**完整毛利成本项（Phase 3B）**：`profitFormulaVersion='order_profit_v2_ex_vat_full_cost_phase3b'`。订单毛利不直接使用 `store_products.estimated_profit * quantity`，而是逐订单商品用真实不含税成交价计算：`commissionCost = sale_price * quantity * commissionRate`，`productCost = products.purchase_price(CNY) * CNY→订单币种 * quantity`，`firstLegCost = calcHeadFreightCny(length,width,height,actualWeight) * CNY→订单币种 * quantity`，`fulfillmentCost = FBE本地币费用 * quantity`，`returnLossCost = purchase_price(CNY) * return_loss_rate * CNY→订单币种 * quantity`。`grossProfit = netSales - commissionCost - productCost - firstLegCost - fulfillmentCost - returnLossCost`，`grossMargin = grossProfit / netSales * 100`。
+
+**订单 FBE 取值优先级（2026-05-30 修正）**：`orderProfitCalculator.ts` 中 `fulfillmentCost` 优先读取命中的 `StoreProduct.profitBreakdown.fbe`，仅当 `store_products.currency` 与 `profitBreakdown.currency` 同订单币种一致时直接使用，并在商品级 `profitBreakdown.fbeFeeSource` 返回 `store_product_profit_breakdown`；若不存在或币种不一致，再读取 `products.fbe_fee`（来源 `product_fbe_fee`）；仍缺失时按 0 估算（来源 `missing`）并输出 `profitWarnings`。这样平台订单页与平台产品页共用平台产品利润预计算出的 FBE 成本口径；注意 `store_products.profit_breakdown` 是缓存，汇率或 FBE 规则变更后需重算平台产品利润才能同步刷新。
+
+**利润可靠性（Phase 3B）**：`summary/days/currencyGroups.*` 返回 `firstLegCost/returnLossCost/profitWarnings/costReliabilityStatus`。`costReliabilityStatus` 可为 `complete/estimated/partial/missing`；`grossProfitReliable=true` 仅当采购成本、汇率、精确佣金率、FBE 运费、头程尺寸/重量等关键成本完整。缺 Product、采购价、汇率会进入 `partial/missing`；佣金率使用字典/默认值、FBE 缺失按 0、头程尺寸重量缺失按 0 会进入 `estimated`。如果 `StoreProduct.profitBreakdown.fbe` 标记 `isEstimatedFbe=true`，订单利润同样保持 `estimated` 可靠性状态。`returnLossRate` 为空时按 0 估算并记录 `profitWarnings`，但不单独拉低可靠性。FBE 运费本阶段沿用平台产品现有口径，按站点本地币种处理，不做二次 CNY 折算。
+
+**毛利展示控制字段（2026-05-30）**：订单日报 `summary/days/currencyGroups.*` 统一返回 `profitDisplayable` 与 `profitDisplayStatus`，用于区分“可展示但含估算”和“确实不可算”，前端不应再把 `grossProfitReliable=false` 直接等同于隐藏毛利。状态含义：`complete`=关键成本完整且可靠，`estimated`=主要成本已计入但存在默认值/预计算缓存/估算项，`partial`=部分成本缺失但仍有参考毛利，`unavailable`=净销售额无效、商品成本为 0、成本大面积缺失或毛利数值无效。`grossProfitReliable` 继续表示“是否完全可靠”，`profitDisplayable` 表示“是否允许展示估算毛利”。例如 RO 2026-05 当前 `costReliabilityStatus=estimated`、`grossProfitReliable=false`，但成本已全部命中且毛利已算出，因此 `profitDisplayable=true`、`profitDisplayStatus=estimated`。
+
+**共享订单利润服务**：订单日报与平台订单页共用 `services/orderProfitCalculator.ts`，避免两套公式漂移。`GET /api/orders` 与 `GET /api/orders/:id` 在原有 DTO 上兼容新增 `profitSummary`，并在 `products[].profitBreakdown` 返回商品级费用拆解；不删除原订单字段、商品字段或图片富化字段。计算过程按当前页订单批量解析 `products_json`，批量查询 `store_products/products/exchange_rates` 后用内存 Map 匹配，禁止逐商品 N+1 查询。
+
+**店铺主体多授权查询（2026-05-30）**：订单日报 `GET /api/analytics/orders/daily` 支持 `shopIds=5,6,7` 查询同一店铺主体下多站点授权，`shopIds` 优先于 `shopId`，并严格校验为逗号分隔正整数数组；`shopIds=abc`、空值、0 或负数返回 400，禁止降级为全部店铺。查询时先限定 `shop_authorizations.id IN shopIds`，再应用 `site=RO/BG/HU/ALL` 过滤，`site=ALL` 也只能在传入授权范围内统计。`currencyGroups[]` 增强返回 `site/region/shopId/shopIds/shopName/shopNames`，前端无需再用 `currency` 反推站点。`GET /api/orders` 已同步支持并严格校验 `shopIds`，用于订单日报每日“查看订单”跳转。
+
+**成本完整性字段**：`summary/days/currencyGroups.*` 统一返回 `costStatus/costMatchedItemCount/costMissingItemCount/grossProfitReliable`。有订单且有商品时，全部成本命中为 `complete` 且 `grossProfitReliable=true`；部分命中为 `partial`；全部缺失为 `missing`；`partial/missing` 时 `grossProfitReliable=false`，前端不得把 `grossMargin=100` 当作真实毛利展示。无订单日期固定返回 `complete` 与 `grossProfitReliable=true`。
+
+**订单商品成本匹配（Phase 2A）**：`products_json.sku/pnk` 保留原始大小写收集为候选 SKU，Prisma 查询 `products.sku IN (...)` 时严禁使用统一小写后的值；查询结果回到内存后再用 lower-case Map 做兼容匹配。优先级：`shopId + orderItem.sku → store_products.sku`、`shopId + orderItem.sku → store_products.vendor_sku`、`shopId + orderItem.pnk → store_products.sku/vendor_sku`，命中店铺商品后依次用 `mapped_inventory_sku/vendor_sku/sku/orderItem.sku/orderItem.pnk` 查 `products.sku`。第一版禁止商品名模糊匹配自动算成本；`purchase_price <= 0`、Product 缺失或汇率缺失均计入 `costMissingItemCount`。
+
+**币种口径**：单币种结果直接返回 `summary/days`；多币种默认不混加金额，`summary/days` 只保留订单数/件数等非金额字段并标记 `currency=MULTI`，真实金额查看 `currencyGroups`。如传 `currencyMode=converted&baseCurrency=CNY|EUR|RON|HUF`，且 `exchange_rates` 存在对应汇率，则额外输出统一折算后的 `summary/days`。
+
+**平台订单日期跳转兼容**：`GET /api/orders?date=YYYY-MM-DD&shopId=5&site=BG&page=1&pageSize=50` 会按站点当地自然日筛选订单 ID，再复用原有平台订单列表 DTO 和图片富化链路；未传 `date` 时保持原有 `startDate/endDate` 行为。
 
 ---
 

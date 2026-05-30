@@ -7,6 +7,7 @@ import { syncPlatformOrdersForShop, syncAllPlatformOrders, upsertOrderPublic } f
 import { statusMap, readOrdersForAllStatuses } from '../services/emagOrder';
 import { syncAndUpdatePurchaseOrderItem, isFetch1688OrderError } from '../services/alibabaOrderSync';
 import { getEmagCredentials } from '../services/emagClient';
+import { calculateOrderProfitBreakdowns } from '../services/orderProfitCalculator';
 
 function toStatusText(status: number): string {
   return statusMap[status] ?? `状态${status}`;
@@ -449,12 +450,18 @@ router.post('/', async (req: Request, res: Response) => {
 function parseShopIds(req: Request): number[] {
   const shopIdsRaw = req.query.shopIds;
   const shopIdRaw = req.query.shopId;
-  if (typeof shopIdsRaw === 'string') {
-    const arr = shopIdsRaw.split(',').map((s) => Number(s.trim())).filter((n) => !isNaN(n) && n > 0);
-    return [...new Set(arr)];
-  }
-  if (Array.isArray(shopIdsRaw)) {
-    const arr = shopIdsRaw.flatMap((s) => String(s).split(',')).map((s) => Number(s.trim())).filter((n) => !isNaN(n) && n > 0);
+  if (Object.prototype.hasOwnProperty.call(req.query, 'shopIds')) {
+    const parts = Array.isArray(shopIdsRaw)
+      ? shopIdsRaw.flatMap((s) => String(s).split(','))
+      : String(shopIdsRaw ?? '').split(',');
+    const normalized = parts.map((s) => s.trim());
+    if (normalized.length === 0 || normalized.some((s) => s === '')) {
+      throw new Error('shopIds 必须是逗号分隔的正整数数组');
+    }
+    const arr = normalized.map((s) => Number(s));
+    if (arr.some((n) => !Number.isInteger(n) || n <= 0)) {
+      throw new Error('shopIds 必须全部是正整数');
+    }
     return [...new Set(arr)];
   }
   if (shopIdRaw != null) {
@@ -466,6 +473,67 @@ function parseShopIds(req: Request): number[] {
     }
   }
   return [];
+}
+
+function isBadRequestMessage(message: string): boolean {
+  return /无效|必须|必填|合法值|shopIds/.test(message);
+}
+
+const ORDER_SITE_TIMEZONE_SQL = Prisma.sql`
+  CASE COALESCE(s.region::text, 'RO')
+    WHEN 'BG' THEN 'Europe/Sofia'
+    WHEN 'HU' THEN 'Europe/Budapest'
+    ELSE 'Europe/Bucharest'
+  END
+`;
+
+function parseSiteFilter(req: Request): 'RO' | 'BG' | 'HU' | 'ALL' | null {
+  const raw = req.query.site;
+  if (raw == null || raw === '') return null;
+  const value = String(Array.isArray(raw) ? raw[0] : raw).trim().toUpperCase();
+  if (value === 'RO' || value === 'BG' || value === 'HU' || value === 'ALL') return value;
+  return null;
+}
+
+function parseDateFilter(req: Request): string | null {
+  const raw = req.query.date;
+  if (raw == null || raw === '') return null;
+  const value = String(Array.isArray(raw) ? raw[0] : raw).trim();
+  return /^\d{4}-\d{2}-\d{2}$/.test(value) ? value : null;
+}
+
+async function findPlatformOrderIdsByLocalDate(params: {
+  shopIds: number[];
+  date: string;
+  site: 'RO' | 'BG' | 'HU' | 'ALL' | null;
+  status: number | null;
+  orderNumber: string;
+}): Promise<number[]> {
+  const conditions: Prisma.Sql[] = [
+    Prisma.sql`po.shop_id IN (${Prisma.join(params.shopIds)})`,
+    Prisma.sql`(((po.order_time AT TIME ZONE 'UTC') AT TIME ZONE ${ORDER_SITE_TIMEZONE_SQL})::date = ${params.date}::date)`,
+  ];
+
+  if (params.site && params.site !== 'ALL') {
+    conditions.push(Prisma.sql`s.region::text = ${params.site}`);
+  }
+  if (params.status !== null && !isNaN(params.status)) {
+    conditions.push(Prisma.sql`po.status = ${params.status}`);
+  }
+  if (params.orderNumber) {
+    conditions.push(Prisma.sql`po.emag_order_id::text LIKE ${'%' + params.orderNumber + '%'}`);
+  }
+
+  const rows = await prisma.$queryRaw<Array<{ id: number }>>(
+    Prisma.sql`
+      SELECT po.id::int AS id
+      FROM platform_orders po
+      JOIN shop_authorizations s ON s.id = po.shop_id
+      WHERE ${Prisma.join(conditions, ' AND ')}
+      ORDER BY po.order_time DESC
+    `,
+  );
+  return rows.map((row) => row.id);
 }
 
 // ── GET /api/orders ──────────────────────────────────────────
@@ -486,14 +554,42 @@ router.get('/', async (req: Request, res: Response) => {
       const orderNumber = String(req.query.orderNumber ?? '').trim();
       const startDate = String(req.query.startDate ?? '').trim();
       const endDate = String(req.query.endDate ?? '').trim();
+      const dateFilter = parseDateFilter(req);
+      const rawDate = req.query.date != null ? String(Array.isArray(req.query.date) ? req.query.date[0] : req.query.date).trim() : '';
+      if (rawDate && !dateFilter) {
+        res.status(400).json({ code: 400, data: null, message: 'date 格式无效，请使用 YYYY-MM-DD' });
+        return;
+      }
+      const siteFilter = parseSiteFilter(req);
+      if (req.query.site != null && !siteFilter) {
+        res.status(400).json({ code: 400, data: null, message: 'site 无效，合法值：RO/BG/HU/ALL' });
+        return;
+      }
       const statusFilter = req.query.status !== undefined && req.query.status !== ''
         ? Number(req.query.status)
         : null;
 
       const where: Prisma.PlatformOrderWhereInput = { shopId: { in: shopIds } };
 
-      // 订单号模糊查询（emagOrderId 转字符串匹配）
-      if (orderNumber) {
+      if (dateFilter) {
+        const matchedIds = await findPlatformOrderIdsByLocalDate({
+          shopIds,
+          date: dateFilter,
+          site: siteFilter,
+          status: statusFilter,
+          orderNumber,
+        });
+        if (matchedIds.length === 0) {
+          res.json({
+            code: 200,
+            data: { list: [], total: 0, currentPage, itemsPerPage },
+            message: 'success',
+          });
+          return;
+        }
+        where.id = { in: matchedIds };
+      } else if (orderNumber) {
+        // 订单号模糊查询（emagOrderId 转字符串匹配）
         const ids = await prisma.$queryRaw<{ emag_order_id: number }[]>`
           SELECT emag_order_id FROM platform_orders
           WHERE shop_id IN (${Prisma.join(shopIds)})
@@ -511,26 +607,31 @@ router.get('/', async (req: Request, res: Response) => {
         where.emagOrderId = { in: orderIds };
       }
 
-      // 下单时间范围（罗马尼亚 EET/EEST → UTC 偏移：冬令 -2h，夏令 -3h）
-      // 向外各扩展 3 小时，确保跨天边缘不丢单；前端展示时仍按 eMAG 本地日期即可
-      const orderTimeFilter: { gte?: Date; lte?: Date } = {};
-      if (startDate && /^\d{4}-\d{2}-\d{2}$/.test(startDate.slice(0, 10))) {
-        const base = new Date(`${startDate.slice(0, 10)}T00:00:00Z`);
-        base.setUTCHours(base.getUTCHours() - 3);
-        orderTimeFilter.gte = base;
-      }
-      if (endDate && /^\d{4}-\d{2}-\d{2}$/.test(endDate.slice(0, 10))) {
-        const base = new Date(`${endDate.slice(0, 10)}T23:59:59Z`);
-        base.setUTCHours(base.getUTCHours() + 3);
-        orderTimeFilter.lte = base;
-      }
-      if (Object.keys(orderTimeFilter).length > 0) {
-        where.orderTime = orderTimeFilter;
+      if (!dateFilter) {
+        // 下单时间范围（罗马尼亚 EET/EEST → UTC 偏移：冬令 -2h，夏令 -3h）
+        // 向外各扩展 3 小时，确保跨天边缘不丢单；前端展示时仍按 eMAG 本地日期即可
+        const orderTimeFilter: { gte?: Date; lte?: Date } = {};
+        if (startDate && /^\d{4}-\d{2}-\d{2}$/.test(startDate.slice(0, 10))) {
+          const base = new Date(`${startDate.slice(0, 10)}T00:00:00Z`);
+          base.setUTCHours(base.getUTCHours() - 3);
+          orderTimeFilter.gte = base;
+        }
+        if (endDate && /^\d{4}-\d{2}-\d{2}$/.test(endDate.slice(0, 10))) {
+          const base = new Date(`${endDate.slice(0, 10)}T23:59:59Z`);
+          base.setUTCHours(base.getUTCHours() + 3);
+          orderTimeFilter.lte = base;
+        }
+        if (Object.keys(orderTimeFilter).length > 0) {
+          where.orderTime = orderTimeFilter;
+        }
       }
 
       // 订单状态筛选
-      if (statusFilter !== null && !isNaN(statusFilter)) {
+      if (!dateFilter && statusFilter !== null && !isNaN(statusFilter)) {
         where.status = statusFilter;
+      }
+      if (!dateFilter && siteFilter && siteFilter !== 'ALL') {
+        where.shop = { region: siteFilter };
       }
 
       const [total, rows] = await prisma.$transaction([
@@ -554,11 +655,13 @@ router.get('/', async (req: Request, res: Response) => {
         ),
       ];
       const imageMap = await buildOrderImageMap(shopIds, allOrderSkus);
+      const profitMap = await calculateOrderProfitBreakdowns({ orders: rows });
 
       const list = rows.map((r) => {
+        const profit = profitMap.get(r.id);
         const rawProds: Array<{ sku?: string; [k: string]: unknown }> =
           r.productsJson ? JSON.parse(r.productsJson) : [];
-        const enrichedProds = rawProds.map((p) => {
+        const enrichedProds = rawProds.map((p, index) => {
           const sku     = String(p.sku ?? '').trim();
           const imgInfo = sku ? imageMap.get(sku) : undefined;
           const finalImg = imgInfo?.imageUrl ?? null;
@@ -571,9 +674,13 @@ router.get('/', async (req: Request, res: Response) => {
             image_url:     finalImg,
             display_image: finalImg,
             image_status:  imgInfo?.image_status ?? (sku ? '待补全平台产品资料' : '正常'),
+            profitBreakdown: profit?.itemBreakdowns[index] ?? null,
           };
         });
-        return mapOrderToDTO(r, enrichedProds);
+        return {
+          ...mapOrderToDTO(r, enrichedProds),
+          profitSummary: profit?.profitSummary ?? null,
+        };
       });
 
       // ── 诊断日志：打印包含 TS094 的第一个订单明细，以便验证富化结果 ──
@@ -766,7 +873,9 @@ router.get('/', async (req: Request, res: Response) => {
     });
   } catch (err) {
     console.error('[GET /api/orders]', err);
-    res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
+    const message = err instanceof Error ? err.message : '服务器内部错误';
+    const status = isBadRequestMessage(message) ? 400 : 500;
+    res.status(status).json({ code: status, data: null, message: status === 400 ? message : '服务器内部错误' });
   }
 });
 
@@ -811,8 +920,10 @@ router.get('/:id', async (req: Request, res: Response) => {
 
     const orderSkus = [...new Set(rawProducts.map((p) => String(p.sku ?? '').trim()).filter(Boolean))];
     const imageMap  = await buildOrderImageMap([row.shopId], orderSkus);
+    const profitMap = await calculateOrderProfitBreakdowns({ orders: [row] });
+    const profit = profitMap.get(row.id);
 
-    const enrichedProducts = rawProducts.map((p) => {
+    const enrichedProducts = rawProducts.map((p, index) => {
       const sku      = String(p.sku ?? '').trim();
       const imgInfo  = sku ? imageMap.get(sku) : undefined;
       const finalImg = imgInfo?.imageUrl ?? null;
@@ -824,17 +935,23 @@ router.get('/:id', async (req: Request, res: Response) => {
         image_url:     finalImg,
         display_image: finalImg,
         image_status:  imgInfo?.image_status ?? (sku ? '待补全平台产品资料' : '正常'),
+        profitBreakdown: profit?.itemBreakdowns[index] ?? null,
       };
     });
 
     res.json({
       code: 200,
-      data: mapOrderToDTO(row, enrichedProducts),
+      data: {
+        ...mapOrderToDTO(row, enrichedProducts),
+        profitSummary: profit?.profitSummary ?? null,
+      },
       message: 'success',
     });
   } catch (err) {
     console.error('[GET /api/orders/:id]', err);
-    res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
+    const message = err instanceof Error ? err.message : '服务器内部错误';
+    const status = isBadRequestMessage(message) ? 400 : 500;
+    res.status(status).json({ code: status, data: null, message: status === 400 ? message : '服务器内部错误' });
   }
 });
 
