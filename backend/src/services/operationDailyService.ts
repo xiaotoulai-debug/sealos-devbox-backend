@@ -106,6 +106,70 @@ export function isOperationManager(user?: JwtPayload): boolean {
   );
 }
 
+function normalizeRoleText(value: unknown): string {
+  return String(value ?? '').trim().toLowerCase().replace(/[\s_-]+/g, '');
+}
+
+function collectRoleLikeValues(user: unknown): unknown[] {
+  const source = (user ?? {}) as {
+    role?: { name?: unknown; code?: unknown } | unknown;
+    roleCode?: unknown;
+    roleName?: unknown;
+    roles?: unknown;
+  };
+  const values: unknown[] = [source.roleCode, source.roleName];
+
+  if (source.role && typeof source.role === 'object') {
+    const role = source.role as { name?: unknown; code?: unknown };
+    values.push(role.code, role.name);
+  } else {
+    values.push(source.role);
+  }
+
+  if (Array.isArray(source.roles)) {
+    for (const role of source.roles) {
+      if (role && typeof role === 'object') {
+        const item = role as { name?: unknown; code?: unknown; roleName?: unknown; roleCode?: unknown };
+        values.push(item.code, item.name, item.roleCode, item.roleName);
+      } else {
+        values.push(role);
+      }
+    }
+  }
+
+  return values.filter((value) => value != null && String(value).trim() !== '');
+}
+
+export function isOperationUser(user?: unknown): boolean {
+  const source = (user ?? {}) as { permissions?: unknown };
+  const operationRoleCodes = new Set([
+    'operation',
+    'operations',
+    'operator',
+    'operation_specialist',
+    'operations_specialist',
+    'operationspecialist',
+  ].map(normalizeRoleText));
+
+  const hasOperationRole = collectRoleLikeValues(user).some((value) => {
+    const raw = String(value);
+    const normalized = normalizeRoleText(raw);
+    if (!normalized) return false;
+    if (/仓库|warehouse/.test(raw.toLowerCase())) return false;
+    return raw.includes('运营专员') || operationRoleCodes.has(normalized) || normalized.includes('operationspecialist');
+  });
+  if (hasOperationRole) return true;
+
+  const permissions = Array.isArray(source.permissions) ? source.permissions : [];
+  return permissions.some((permission) => operationRoleCodes.has(normalizeRoleText(permission)));
+}
+
+function assertOperationUser(user: JwtPayload): void {
+  if (!isOperationUser(user)) {
+    throw Object.assign(new Error('仅运营专员需要提交每日任务'), { statusCode: 403 });
+  }
+}
+
 function todayString(): string {
   const parts = new Intl.DateTimeFormat('en-CA', {
     timeZone: BUSINESS_TIME_ZONE,
@@ -441,6 +505,7 @@ function formatLog(log: {
 }
 
 export async function createOperationDailyLog(user: JwtPayload, input: CreateOperationDailyLogInput) {
+  assertOperationUser(user);
   const workDateString = assertDateString(input.workDate, 'workDate');
   const taskType = parseTaskType(input.taskType);
   const platform = parsePlatform(input.platform);
@@ -477,6 +542,7 @@ export async function createOperationDailyLog(user: JwtPayload, input: CreateOpe
 }
 
 export async function submitOperationDailyReport(user: JwtPayload, input: SubmitOperationDailyReportInput) {
+  assertOperationUser(user);
   const workDateString = assertDateString(input.workDate, 'workDate');
   assertBackfillAllowed(workDateString, user);
   const items = normalizeReportItems(input.items);
@@ -528,6 +594,7 @@ export async function updateOperationDailyReport(
   reportId: number,
   input: SubmitOperationDailyReportInput,
 ) {
+  assertOperationUser(user);
   if (!Number.isInteger(reportId) || reportId <= 0) {
     throw new Error('reportId 必须是正整数');
   }
@@ -620,10 +687,6 @@ export async function getUserLogsForDate(userId: number, date: string) {
 }
 
 export async function getOperationDailyDashboard(params: { user: JwtPayload; date?: unknown; range?: unknown }) {
-  if (!isOperationManager(params.user)) {
-    throw Object.assign(new Error('无权限查看运营看板'), { statusCode: 403 });
-  }
-
   const targetDate = params.date ? assertDateString(params.date, 'date') : todayString();
   const range = String(params.range ?? '7d').trim();
   if (range !== '7d' && range !== '30d') {
@@ -655,19 +718,20 @@ export async function getOperationDailyDashboard(params: { user: JwtPayload; dat
           lte: dateStringToDbDate(targetDate),
         },
       },
-      select: { workDate: true, taskType: true, quantity: true },
+      select: { userId: true, workDate: true, taskType: true, quantity: true },
     }),
   ]);
 
-  const activeUserIds = new Set(activeUsers.map((user) => user.id));
+  const operationUsers = activeUsers.filter(isOperationUser);
+  const operationUserIds = new Set(operationUsers.map((user) => user.id));
   const reportsByUser = new Map(
     dayReports
-      .filter((report) => activeUserIds.has(report.userId))
+      .filter((report) => operationUserIds.has(report.userId))
       .map((report) => [report.userId, report]),
   );
   const dayLogsByUser = new Map<number, typeof dayLogs>();
   for (const log of dayLogs) {
-    if (!activeUserIds.has(log.userId)) continue;
+    if (!operationUserIds.has(log.userId)) continue;
     const list = dayLogsByUser.get(log.userId) ?? [];
     list.push(log);
     dayLogsByUser.set(log.userId, list);
@@ -676,7 +740,7 @@ export async function getOperationDailyDashboard(params: { user: JwtPayload; dat
   const registeredUserIds = new Set(reportsByUser.keys());
   const summaryCards = {
     registeredUserCount: registeredUserIds.size,
-    unregisteredUserCount: Math.max(0, activeUsers.length - registeredUserIds.size),
+    unregisteredUserCount: Math.max(0, operationUsers.length - registeredUserIds.size),
     productSelectionCount: 0,
     productListingCount: 0,
     approvedCount: 0,
@@ -685,12 +749,12 @@ export async function getOperationDailyDashboard(params: { user: JwtPayload; dat
   };
 
   for (const log of dayLogs) {
-    if (!activeUserIds.has(log.userId)) continue;
+    if (!operationUserIds.has(log.userId)) continue;
     const key = TASK_COUNT_KEY[log.taskType];
     summaryCards[key] += log.quantity;
   }
 
-  const employeeRankings = activeUsers.map((user) => {
+  const employeeRankings = operationUsers.map((user) => {
     const logs = dayLogsByUser.get(user.id) ?? [];
     const counts = taskCounts();
     let totalQuantity = 0;
@@ -717,7 +781,7 @@ export async function getOperationDailyDashboard(params: { user: JwtPayload; dat
     };
   }).sort((a, b) => b.score - a.score || b.totalQuantity - a.totalQuantity || a.userId - b.userId);
 
-  const missingUsers = activeUsers
+  const missingUsers = operationUsers
     .filter((user) => !registeredUserIds.has(user.id))
     .map((user) => ({ userId: user.id, name: user.name }));
 
@@ -726,7 +790,7 @@ export async function getOperationDailyDashboard(params: { user: JwtPayload; dat
     .map((row) => ({ userId: row.userId, name: row.name }));
 
   const blockedItems = dayLogs
-    .filter((log) => activeUserIds.has(log.userId) && (log.status === OperationLogStatus.BLOCKED || Boolean(log.blockerReason?.trim())))
+    .filter((log) => operationUserIds.has(log.userId) && (log.status === OperationLogStatus.BLOCKED || Boolean(log.blockerReason?.trim())))
     .map((log) => ({
       id: log.id,
       reportId: log.reportId,
@@ -755,6 +819,7 @@ export async function getOperationDailyDashboard(params: { user: JwtPayload; dat
   }
 
   for (const log of rangeLogs) {
+    if (!operationUserIds.has(log.userId)) continue;
     const date = log.workDate.toISOString().slice(0, 10);
     const item = trendMap.get(date);
     if (!item) continue;
@@ -780,10 +845,6 @@ export async function getOperationDailyDashboard(params: { user: JwtPayload; dat
 }
 
 export async function getOperationDailyMonthlyOverview(params: { user: JwtPayload; month?: unknown }) {
-  if (!isOperationManager(params.user)) {
-    throw Object.assign(new Error('无权限查看运营月度总览'), { statusCode: 403 });
-  }
-
   const month = params.month ? assertMonthString(params.month) : todayString().slice(0, 7);
   const { startDate, endDate, days } = monthRange(month);
   const today = todayString();
@@ -831,10 +892,11 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
     }),
   ]);
 
-  const activeUserIds = new Set(activeUsers.map((user) => user.id));
+  const operationUsers = activeUsers.filter(isOperationUser);
+  const operationUserIds = new Set(operationUsers.map((user) => user.id));
   const reportMap = new Map<string, { id: number; userId: number; workDate: Date; editCount: number }>();
   for (const report of monthReports) {
-    if (!activeUserIds.has(report.userId)) continue;
+    if (!operationUserIds.has(report.userId)) continue;
     reportMap.set(`${report.userId}:${report.workDate.toISOString().slice(0, 10)}`, report);
   }
 
@@ -850,7 +912,7 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
   };
 
   for (const log of monthLogs) {
-    if (!activeUserIds.has(log.userId)) continue;
+    if (!operationUserIds.has(log.userId)) continue;
     const date = log.workDate.toISOString().slice(0, 10);
     logMap.set(`${log.userId}:${date}:${log.taskType}`, log);
     const list = logsByUser.get(log.userId) ?? [];
@@ -865,13 +927,13 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
 
   const yesterdayRegisteredUserIds = new Set(
     yesterdayReports
-      .filter((report) => activeUserIds.has(report.userId))
+      .filter((report) => operationUserIds.has(report.userId))
       .map((report) => report.userId),
   );
   summaryCards.yesterdayRegisteredCount = yesterdayRegisteredUserIds.size;
-  summaryCards.yesterdayMissingCount = Math.max(0, activeUsers.length - yesterdayRegisteredUserIds.size);
+  summaryCards.yesterdayMissingCount = Math.max(0, operationUsers.length - yesterdayRegisteredUserIds.size);
 
-  const yesterdayMissingUsers = activeUsers
+  const yesterdayMissingUsers = operationUsers
     .filter((user) => !yesterdayRegisteredUserIds.has(user.id))
     .map((user) => ({
       userId: user.id,
@@ -879,7 +941,7 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
       roleName: user.role.name,
     }));
 
-  const monthlyScores = activeUsers.map((user) => {
+  const monthlyScores = operationUsers.map((user) => {
     const counts = taskCounts();
     const scoreBreakdown = {
       productSelectionScore: 0,
@@ -920,7 +982,7 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
     rank: index + 1,
   }));
 
-  const employees = activeUsers.map((user) => ({
+  const employees = operationUsers.map((user) => ({
     userId: user.id,
     name: user.name,
     roleName: user.role.name,
