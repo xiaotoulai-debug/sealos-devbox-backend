@@ -20,6 +20,15 @@ model User {
   roleId       Int        @map("role_id")
   products       Product[]
   fbeShipments   FbeShipment[]
+  operationDailyLogs OperationDailyLog[]
+  operationDailyReports OperationDailyReport[]
+  createdEmployeeTasks EmployeeTask[] @relation("EmployeeTaskCreator")
+  assignedEmployeeTasks EmployeeTask[] @relation("EmployeeTaskAssignee")
+  employeeTaskLogs EmployeeTaskLog[]
+  createdDailyReminderTemplates DailyReminderTemplate[] @relation("DailyReminderTemplateCreatedBy")
+  updatedDailyReminderTemplates DailyReminderTemplate[] @relation("DailyReminderTemplateUpdatedBy")
+  dailyReminderAssignments DailyReminderTemplateAssignment[]
+  dailyReminderChecks DailyReminderCheck[]
   role           Role       @relation(fields: [roleId], references: [id])
 
   @@map("users")
@@ -33,6 +42,7 @@ model Role {
   createdAt   DateTime         @default(now()) @map("created_at")
   permissions RolePermission[]
   users       User[]
+  dailyReminderAssignments DailyReminderTemplateAssignment[]
 
   @@map("roles")
 }
@@ -232,6 +242,9 @@ model ShopAuthorization {
   fbeShipments    FbeShipment[]
   purchaseOrders  PurchaseOrder[]
   purchasePlanProducts Product[]
+  operationDailyLogs OperationDailyLog[]
+  employeeTasks EmployeeTask[]
+  dailyReminderTemplates DailyReminderTemplate[]
 
   @@index([platform])
   @@index([status])
@@ -388,6 +401,187 @@ model SyncLog {
   @@map("sync_logs")
 }
 
+/// 运营每日事务登记：员工每天登记运营动作，供首页运营作战看板聚合
+model OperationDailyLog {
+  id            Int                @id @default(autoincrement())
+  reportId      Int?               @map("report_id")
+  userId        Int                @map("user_id")
+  workDate      DateTime           @map("work_date") @db.Date
+  taskType      OperationTaskType  @map("task_type")
+  platform      OperationPlatform?
+  shopId        Int?               @map("shop_id")
+  quantity      Int                @default(0)
+  status        OperationLogStatus @default(DONE)
+  detail        String?            @db.Text
+  linksJson     Json?              @map("links_json")
+  blockerReason String?            @map("blocker_reason") @db.Text
+  createdAt     DateTime           @default(now()) @map("created_at")
+  updatedAt     DateTime           @updatedAt @map("updated_at")
+
+  report OperationDailyReport? @relation(fields: [reportId], references: [id], onDelete: Cascade)
+  user User @relation(fields: [userId], references: [id])
+  shop ShopAuthorization? @relation(fields: [shopId], references: [id], onDelete: SetNull)
+
+  @@index([reportId])
+  @@index([userId, workDate])
+  @@index([workDate])
+  @@index([taskType, workDate])
+  @@index([status, workDate])
+  @@index([workDate, userId])
+  @@map("operation_daily_logs")
+}
+
+/// 运营每日事务日报主单：每个员工每天一张，控制提交与修改次数
+model OperationDailyReport {
+  id           Int                   @id @default(autoincrement())
+  userId       Int                   @map("user_id")
+  workDate     DateTime              @map("work_date") @db.Date
+  status       OperationReportStatus @default(SUBMITTED)
+  editCount    Int                   @default(0) @map("edit_count")
+  submittedAt  DateTime              @default(now()) @map("submitted_at")
+  lastEditedAt DateTime?             @map("last_edited_at")
+  createdAt    DateTime              @default(now()) @map("created_at")
+  updatedAt    DateTime              @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id])
+  logs OperationDailyLog[]
+
+  @@unique([userId, workDate])
+  @@index([workDate])
+  @@index([userId, workDate])
+  @@map("operation_daily_reports")
+}
+
+/// 员工个人任务中心：仅用于“我创建/指派给我”的任务协作，不承载全员任务看板
+model EmployeeTask {
+  id             Int                  @id @default(autoincrement())
+  title          String
+  description    String?              @db.Text
+  taskType       EmployeeTaskType     @map("task_type")
+  platform       OperationPlatform?
+  shopId         Int?                 @map("shop_id")
+  priority       EmployeeTaskPriority @default(MEDIUM)
+  status         EmployeeTaskStatus   @default(TODO)
+  creatorId      Int                  @map("creator_id")
+  assigneeId     Int                  @map("assignee_id")
+  dueDate        DateTime             @map("due_date")
+  completedAt    DateTime?            @map("completed_at")
+  cancelledAt    DateTime?            @map("cancelled_at")
+  relatedSkuText String?              @map("related_sku_text") @db.Text
+  remark         String?              @db.Text
+  createdAt      DateTime             @default(now()) @map("created_at")
+  updatedAt      DateTime             @updatedAt @map("updated_at")
+
+  creator  User               @relation("EmployeeTaskCreator", fields: [creatorId], references: [id])
+  assignee User               @relation("EmployeeTaskAssignee", fields: [assigneeId], references: [id])
+  shop     ShopAuthorization? @relation(fields: [shopId], references: [id], onDelete: SetNull)
+  logs     EmployeeTaskLog[]
+
+  @@index([assigneeId, status, dueDate])
+  @@index([creatorId, status, dueDate])
+  @@index([dueDate])
+  @@index([status])
+  @@index([taskType])
+  @@index([platform])
+  @@index([createdAt])
+  @@map("employee_tasks")
+}
+
+/// 员工任务操作日志：记录创建、状态变更、内容修改和取消，便于后续审计
+model EmployeeTaskLog {
+  id         Int                   @id @default(autoincrement())
+  taskId     Int                   @map("task_id")
+  operatorId Int                   @map("operator_id")
+  action     EmployeeTaskLogAction
+  fromStatus EmployeeTaskStatus?   @map("from_status")
+  toStatus   EmployeeTaskStatus?   @map("to_status")
+  remark     String?               @db.Text
+  createdAt  DateTime              @default(now()) @map("created_at")
+
+  task     EmployeeTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  operator User         @relation(fields: [operatorId], references: [id])
+
+  @@index([taskId])
+  @@index([operatorId])
+  @@index([createdAt])
+  @@map("employee_task_logs")
+}
+
+/// 运营每日提醒模板：员工每日 SOP 检查项，不与 EmployeeTask 混用
+model DailyReminderTemplate {
+  id            Int               @id @default(autoincrement())
+  title         String
+  category      ReminderCategory
+  priority      ReminderPriority
+  frequency     ReminderFrequency
+  weekdays      Int[]
+  suggestedTime String?           @map("suggested_time")
+  requireCheck  Boolean           @default(true) @map("require_check")
+  platform      OperationPlatform?
+  shopId        Int?              @map("shop_id")
+  description   String?           @db.Text
+  isActive      Boolean           @default(true) @map("is_active")
+  createdById   Int               @map("created_by_id")
+  updatedById   Int?              @map("updated_by_id")
+  createdAt     DateTime          @default(now()) @map("created_at")
+  updatedAt     DateTime          @updatedAt @map("updated_at")
+
+  shop        ShopAuthorization? @relation(fields: [shopId], references: [id], onDelete: SetNull)
+  createdBy   User               @relation("DailyReminderTemplateCreatedBy", fields: [createdById], references: [id])
+  updatedBy   User?              @relation("DailyReminderTemplateUpdatedBy", fields: [updatedById], references: [id])
+  assignments DailyReminderTemplateAssignment[]
+  checks      DailyReminderCheck[]
+
+  @@index([isActive])
+  @@index([category])
+  @@index([priority])
+  @@index([frequency])
+  @@index([shopId])
+  @@index([createdAt])
+  @@map("daily_reminder_templates")
+}
+
+/// 运营每日提醒适用对象：支持按员工或角色分配
+model DailyReminderTemplateAssignment {
+  id         Int                          @id @default(autoincrement())
+  templateId Int                          @map("template_id")
+  targetType ReminderAssignmentTargetType @map("target_type")
+  userId     Int?                         @map("user_id")
+  roleId     Int?                         @map("role_id")
+  createdAt  DateTime                     @default(now()) @map("created_at")
+
+  template DailyReminderTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  user     User?                 @relation(fields: [userId], references: [id])
+  role     Role?                 @relation(fields: [roleId], references: [id])
+
+  @@index([templateId])
+  @@index([targetType, userId])
+  @@index([targetType, roleId])
+  @@map("daily_reminder_template_assignments")
+}
+
+/// 员工每日提醒检查记录：按 template + user + date 唯一 upsert
+model DailyReminderCheck {
+  id         Int                 @id @default(autoincrement())
+  templateId Int                 @map("template_id")
+  userId     Int                 @map("user_id")
+  checkDate  DateTime            @map("check_date") @db.Date
+  status     ReminderCheckStatus
+  note       String?             @db.Text
+  checkedAt  DateTime?           @map("checked_at")
+  createdAt  DateTime            @default(now()) @map("created_at")
+  updatedAt  DateTime            @updatedAt @map("updated_at")
+
+  template DailyReminderTemplate @relation(fields: [templateId], references: [id], onDelete: Cascade)
+  user     User                  @relation(fields: [userId], references: [id])
+
+  @@unique([templateId, userId, checkDate])
+  @@index([userId, checkDate])
+  @@index([templateId, checkDate])
+  @@index([status])
+  @@map("daily_reminder_checks")
+}
+
 /// 1688 授权令牌存储
 model AlibabaAuth {
   id                    Int       @id @default(autoincrement())
@@ -476,6 +670,115 @@ enum InventoryLogType {
   PURCHASE_IN     // 采购入库（本地仓入库，stockActual +）
   FBE_OUT         // FBE 出库（发货至 eMAG 仓，stockActual -）
   MANUAL_ADJUST   // 人工盘点调整（可正可负）
+}
+
+/// 运营每日事务类型
+enum OperationTaskType {
+  PRODUCT_SELECTION
+  PRODUCT_LISTING
+  APPROVED_COUNT
+  SHIPMENT_COUNT
+  QUALIFICATION
+  ADJUSTMENT
+  REVIEW_FIX
+  AFTER_SALES
+  OTHER
+}
+
+/// 运营登记涉及的平台
+enum OperationPlatform {
+  SHEIN
+  TEMU
+  ALIEXPRESS
+  EMAG
+  AMAZON
+  OTHER
+}
+
+/// 运营事务处理状态
+enum OperationLogStatus {
+  DONE
+  IN_PROGRESS
+  BLOCKED
+}
+
+/// 运营日报主单状态
+enum OperationReportStatus {
+  SUBMITTED
+}
+
+/// 员工任务中心任务类型
+enum EmployeeTaskType {
+  PRODUCT_LISTING
+  QUALIFICATION
+  AD_OPTIMIZATION
+  MARKETING_STRATEGY
+  SHIPPING
+  PURCHASE
+  OTHER
+}
+
+/// 员工任务中心任务状态
+enum EmployeeTaskStatus {
+  TODO
+  IN_PROGRESS
+  DONE
+  CANCELLED
+}
+
+/// 员工任务中心优先级
+enum EmployeeTaskPriority {
+  HIGH
+  MEDIUM
+  LOW
+}
+
+/// 员工任务中心操作日志动作
+enum EmployeeTaskLogAction {
+  CREATED
+  STATUS_CHANGED
+  UPDATED
+  CANCELLED
+}
+
+/// 运营每日提醒分类
+enum ReminderCategory {
+  PLATFORM_MESSAGE
+  QUALIFICATION
+  PRODUCT_REVIEW
+  AD_CHECK
+  SHIPPING_FOLLOW
+  INVENTORY_CHECK
+  AFTER_SALES
+  PRODUCT_SELECTION
+  OTHER
+}
+
+/// 运营每日提醒优先级
+enum ReminderPriority {
+  P0
+  P1
+  P2
+}
+
+/// 运营每日提醒频率
+enum ReminderFrequency {
+  DAILY
+  WORKDAY
+  WEEKLY
+}
+
+/// 员工提醒检查状态
+enum ReminderCheckStatus {
+  PENDING
+  CHECKED
+  ABNORMAL
+}
+
+/// 提醒模板适用对象类型
+enum ReminderAssignmentTargetType {
+  USER
+  ROLE
 }
 
 /// 库存流水表（进销存核心记录）

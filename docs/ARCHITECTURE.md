@@ -80,7 +80,8 @@ backend/
 │   │   ├── inventory.ts       # 进销存核心（POST batch-adjust / PUT purchase-orders receive / GET logs）
 │   │   ├── warehouse.ts       # 仓库管理（GET/POST /api/warehouses，PUT /:id — 含 skuCount 聚合、名称唯一性校验）
 │   │   ├── alibaba.ts         # 1688 OAuth、规格解析、下单、子单同步
-│   │   └── purchase.ts        # 采购管理（重构版）：create-local（一品一单）/ place-1688-order（解耦下单）
+│   │   ├── purchase.ts        # 采购管理（重构版）：create-local（一品一单）/ place-1688-order（解耦下单）
+│   │   └── operationDaily.ts  # 运营每日事务登记 + 首页运营作战看板
 │   ├── services/              # 核心业务逻辑
 │   │   ├── emagClient.ts      # eMAG API 客户端（Adapter）：BaseURL/货币/域名按 region 查表
 │   │   │                      # ★ 正向代理：所有 HTTPS 请求经 EMAG_PROXY_URL 代理转发（固定 IP 白名单）
@@ -95,6 +96,7 @@ backend/
 │   │   ├── salesStats.ts             # 全站销量聚合（无 shopId/region 硬编码）
 │   │   ├── dashboardStats.ts         # 看板数据（getStatsFromLocalDB / getStatsByDateRange）
 │   │   ├── orderDailyAnalytics.ts    # 订单日报：按站点当地自然日聚合 platform_orders
+│   │   ├── operationDailyService.ts   # 运营日报登记、个人查询、管理员看板聚合
 │   │   ├── emagOrder.ts              # eMAG 订单相关操作
 │   │   ├── emagLogistics.ts          # eMAG 物流查询
 │   │   ├── emagRateLimit.ts          # 限流与延迟（3 req/s）
@@ -563,6 +565,38 @@ graph TD
 **币种口径**：单币种结果直接返回 `summary/days`；多币种默认不混加金额，`summary/days` 只保留订单数/件数等非金额字段并标记 `currency=MULTI`，真实金额查看 `currencyGroups`。如传 `currencyMode=converted&baseCurrency=CNY|EUR|RON|HUF`，且 `exchange_rates` 存在对应汇率，则额外输出统一折算后的 `summary/days`。
 
 **平台订单日期跳转兼容**：`GET /api/orders?date=YYYY-MM-DD&shopId=5&site=BG&page=1&pageSize=50` 会按站点当地自然日筛选订单 ID，再复用原有平台订单列表 DTO 和图片富化链路；未传 `date` 时保持原有 `startDate/endDate` 行为。
+
+### 4.9 运营每日事务登记与首页运营作战看板（Phase 1）
+
+**模块定位**：新增独立 `/api/operation-daily` 后端模块，支持员工登记每日运营动作，并给老板首页提供运营作战看板聚合；不复用 `SyncLog`、`InventoryLog`，不影响订单日报、订单同步、产品同步、库存同步和 1688 采购同步。
+
+**数据模型**：`OperationDailyReport` 是日报主表，`user_id + work_date` 唯一，控制“每个员工每天一张日报”和 `edit_count` 修改次数；`OperationDailyLog` 是明细行，保留原有散落日志字段，并新增可选 `report_id` 关联日报主表（`onDelete: Cascade`），用于兼容已存在的旧日志。`work_date` 使用 PostgreSQL DATE 作为业务自然日。任务类型枚举保留旧值 `QUALIFICATION/ADJUSTMENT/REVIEW_FIX/AFTER_SALES` 兼容历史数据，同时新增 `APPROVED_COUNT/SHIPMENT_COUNT`；新日报 API 只接受 `PRODUCT_SELECTION/PRODUCT_LISTING/APPROVED_COUNT/SHIPMENT_COUNT/OTHER`。
+
+**API**：新日报接口为 `GET /api/operation-daily/my-report?date=YYYY-MM-DD`、`POST /api/operation-daily/reports`、`PUT /api/operation-daily/reports/:reportId`、`GET /api/operation-daily/users/:userId/report?date=YYYY-MM-DD`。首页新版月度接口为 `GET /api/operation-daily/monthly-overview?month=YYYY-MM`，返回顶部 KPI、昨日未登记名单、本月积分榜 Top 5 和员工任务热力图。旧接口 `POST /api/operation-daily/logs`、`GET /api/operation-daily/my-today`、`GET /api/operation-daily/my-logs`、`GET /api/operation-daily/users/:userId/logs` 暂时保留，避免前端未切换时报错。`POST /reports` 和 `PUT /reports/:reportId` 均在 Prisma transaction 内整体写入 5 条固定明细，缺失事项自动补 0。
+
+**权限与统计口径**：所有接口必须登录；普通员工只能提交、查看、修改自己的日报，提交后仅允许修改一次，`edit_count >= 1` 时再次修改返回 400。管理员/老板可看 dashboard、monthly-overview、任意员工 report/logs，但 Phase 1 不开放管理员修改别人日报，避免审计风险。管理员判断兼容 `roleName` 含 `admin/超级管理员`，或 permissions 含 `* / ALL / ADMIN_FULL / VIEW_OPERATION_DASHBOARD / MANAGE_OPERATION_LOGS`。新版月度总览只统计新 5 类：`PRODUCT_SELECTION` 选品数量、`PRODUCT_LISTING` 上新数量、`APPROVED_COUNT` 通过数量、`SHIPMENT_COUNT` 发货数量、`OTHER` 其他说明；旧 `QUALIFICATION/ADJUSTMENT` 不自动映射为通过/发货，避免历史口径失真。积分预留使用临时规则 `PRODUCT_SELECTION=1`、`PRODUCT_LISTING=2`、`APPROVED_COUNT=2`、`SHIPMENT_COUNT=1`、`OTHER=0`。热力图按月份 `workDate` 范围查询 reports/logs 并补齐整月日期，未来日期标记 `isFuture=true`，OTHER 仅返回短摘要，完整内容由 report 详情接口查看。
+
+### 4.10 员工任务中心（Phase 1）
+
+**模块定位**：新增独立 `/api/employee-tasks` 后端模块，支持员工之间创建、指派、跟踪个人相关任务；它不是全员任务管理后台，也不复用 `OperationDailyReport/OperationDailyLog`。所有员工任务中心查询都必须限制为 `creatorId = 当前用户 OR assigneeId = 当前用户`，管理员在本模块内也只看自己的任务，全员任务管理后续单独开发。
+
+**数据模型**：`EmployeeTask` 记录任务标题、说明、任务类型、平台、可选店铺、优先级、状态、创建人、被指派人、截止时间、完成/取消时间、SKU/SKC 文本和备注；`EmployeeTaskLog` 记录创建、状态变更、内容修改和取消操作，包含操作者、动作、前后状态和备注。任务状态只包含 `TODO/IN_PROGRESS/DONE/CANCELLED`，逾期不入库，由 `status != DONE/CANCELLED && dueDate < now` 动态计算。任务不做物理删除，取消统一使用 `CANCELLED`。
+
+**API**：`POST /api/employee-tasks` 创建任务；`GET /api/employee-tasks/my-dashboard?weekStart=YYYY-MM-DD` 查询我的任务中心；`GET /api/employee-tasks/received` 与 `GET /api/employee-tasks/created` 分页查询我收到/我发起的任务；`GET /api/employee-tasks/:id` 查询任务详情和操作日志；`PATCH /api/employee-tasks/:id/status` 更新状态；`PATCH /api/employee-tasks/:id` 仅允许创建人有限编辑未完成/未取消任务；`GET /api/employee-tasks/assignable-users` 返回 ACTIVE 用户供选择指派人。所有响应保持 `{ code, data, message }`。
+
+**权限与统计口径**：所有接口必须登录。创建任务时 `creatorId` 只能取 `req.user.userId`，禁止读取前端传入的 creator；`assigneeId` 必须是 ACTIVE 用户。assignee 只能把自己收到的任务改为 `TODO/IN_PROGRESS/DONE`，creator 只能取消自己创建的任务，不能替 assignee 标记 DONE；`DONE/CANCELLED` 后第一期禁止再改状态。`my-dashboard` 只统计当前用户相关任务：本周未完成按 `dueDate` 落在本周且非 DONE/CANCELLED，本周已完成按 `completedAt` 落在本周且 DONE，本月完成率按当前月 `dueDate` 内非 CANCELLED 任务计算 `DONE/总数`。
+
+**上周汇总**：`GET /api/employee-tasks/weekly-summary?weekStart=YYYY-MM-DD` 实时聚合当前登录用户自己的周数据，不保存周报、不接 AI、不允许传 `userId`，管理员也只能看自己的汇总。`weekStart` 不传时默认上周周一，传入时必须是周一；范围固定为 7 天。日报部分只查当前用户 `OperationDailyReport/OperationDailyLog` 的新 5 类任务；收到任务只查 `assigneeId=当前用户` 且 `dueDate/completedAt` 落周内；发起任务只查 `creatorId=当前用户` 且 `createdAt/dueDate/completedAt` 落周内。返回 `summaryText` 为规则模板生成，`aiStatus=NOT_ENABLED`。
+
+### 4.11 运营每日提醒 / 今日必做清单（Phase 1）
+
+**模块定位**：新增独立 `/api/daily-reminders` 后端模块，用于员工每日 SOP 检查提醒；它不是 `EmployeeTask`，不写入员工任务中心任务，也不影响每日任务总览、订单日报、登录和权限主流程。第一期只做模板管理、员工今日提醒、员工检查 upsert，不做积分、不接 AI、不做全员检查统计页。
+
+**数据模型**：`DailyReminderTemplate` 保存提醒标题、分类、优先级、频率、`weekdays(1-7)`、建议完成时间、平台、店铺、说明和启停状态；`DailyReminderTemplateAssignment` 保存模板适用对象，支持 `USER/ROLE`；`DailyReminderCheck` 保存员工每天对模板的检查结果，按 `templateId + userId + checkDate` 唯一 upsert。逾期不入库，由 `checkStatus=PENDING + suggestedTime + 当前时间` 动态计算。
+
+**API**：员工接口为 `GET /api/daily-reminders/today?date=YYYY-MM-DD` 和 `POST /api/daily-reminders/:templateId/check`；管理员/上级接口为 `POST /api/daily-reminders/templates`、`GET /api/daily-reminders/templates`、`GET /api/daily-reminders/templates/:id`、`PATCH /api/daily-reminders/templates/:id`、`PATCH /api/daily-reminders/templates/:id/status`。所有接口保持 `{ code, data, message }`。
+
+**权限与匹配口径**：所有接口必须登录。模板管理复用运营管理员判断：`roleName` 含 `admin/超级管理员`，或 permissions 含 `* / ALL / ADMIN_FULL / VIEW_OPERATION_DASHBOARD / MANAGE_OPERATION_LOGS`。普通员工只能查看分配给自己的今日提醒并提交自己的检查记录；管理员进入 today 也只看自己适用的提醒。today 仅返回 `isActive=true` 且 assignment 命中当前 `userId` 或 `roleId` 的模板，并按 `DAILY/WORKDAY/WEEKLY` 频率过滤日期；`ABNORMAL` 检查必须填写 note。
 
 ---
 

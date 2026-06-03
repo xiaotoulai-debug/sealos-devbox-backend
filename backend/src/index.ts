@@ -26,6 +26,9 @@ import fbeShipmentRouter from './routes/fbeShipment';
 import inventoryRouter from './routes/inventory';
 import warehouseRouter from './routes/warehouse';
 import purchaseRouter from './routes/purchase';
+import operationDailyRouter from './routes/operationDaily';
+import employeeTasksRouter from './routes/employeeTasks';
+import dailyRemindersRouter from './routes/dailyReminders';
 import { startSyncCrons } from './services/syncCron';
 import { backfillProductImages } from './services/storeProductSync';
 
@@ -72,6 +75,9 @@ app.use('/api/fbe-shipments', fbeShipmentRouter);   // FBE 发货单管理（在
 app.use('/api/inventory',    inventoryRouter);      // 进销存：batch-adjust / purchase-orders receive / logs
 app.use('/api/warehouses',   warehouseRouter);     // 仓库管理：列表 / 创建 / 编辑
 app.use('/api/purchases',   purchaseRouter);     // 采购管理（重构版）：create-local（一品一单）/ place-1688-order
+app.use('/api/operation-daily', operationDailyRouter); // 运营每日事务登记 + 首页运营作战看板
+app.use('/api/employee-tasks', employeeTasksRouter); // 员工个人任务中心（仅本人相关任务）
+app.use('/api/daily-reminders', dailyRemindersRouter); // 运营每日提醒 / 今日必做清单
 
 // ── 启动时打印关键路由（确认 sync-urls 已注册）────────────────────
 function printRegisteredRoutes() {
