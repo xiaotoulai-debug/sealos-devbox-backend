@@ -1,3 +1,4 @@
+import type { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import {
   calculateComprehensiveSales,
@@ -7,6 +8,8 @@ import {
   PRODUCT_CLASSES,
   STOCK_STATUSES,
   type ProductClass,
+  type ClassifyStoreProductResult,
+  type ClassificationSalesStats,
   type StockStatus,
 } from './productClassification';
 import { getSalesForProduct, getSalesStatsByShop } from './salesStats';
@@ -30,7 +33,7 @@ export type PurchaseSuggestion = {
   suggestAmount: number;
   coverageStock: number;
   replenishReferenceDailySales: number;
-  inventoryTag: 'NEW' | 'DEAD' | 'HOT' | 'POTENTIAL' | 'NORMAL' | 'OUT_OF_STOCK_WATCH' | 'TO_BE_ELIMINATED';
+  inventoryTag: ProductClass;
   text?: string;
   label?: string;
   reason?: string;
@@ -46,6 +49,7 @@ type BuildPurchaseSuggestionInput = {
   planningStock: number;
   comprehensiveSales: number;
   sales30: number;
+  sales60?: number;
   sales90?: number;
   sales180?: number;
   lastOrderAt?: Date | null;
@@ -89,6 +93,65 @@ function normalizeProductClass(value: string | null): ProductClass {
   return value && isProductClass(value) ? value : 'NORMAL';
 }
 
+function normalizeNullableDate(value: Date | string | null | undefined): Date | null {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+type RealtimeClassifiableProduct = {
+  id: number;
+  pnk: string;
+  sku: string | null;
+  vendorSku: string | null;
+  mappedInventorySku: string | null;
+  stock: number;
+  syncedAt?: Date;
+  mainImage?: string | null;
+  imageUrl?: string | null;
+  estimatedProfit?: unknown;
+};
+
+export type RealtimeProductClassification = {
+  sales: ClassificationSalesStats;
+  comprehensiveSales: number;
+  classified: ClassifyStoreProductResult;
+};
+
+type StoreProductWhereInput = Prisma.StoreProductWhereInput;
+
+export function classifyProductWithRealtimeSales(
+  product: RealtimeClassifiableProduct,
+  sales: ClassificationSalesStats,
+  inTransitStock = 0,
+): RealtimeProductClassification {
+  const comprehensiveSales = calculateComprehensiveSales(sales, product.stock);
+  const classified = classifyStoreProduct({
+    stock: product.stock,
+    inTransitStock,
+    syncedAt: product.syncedAt,
+    mappedInventorySku: product.mappedInventorySku,
+    mainImage: product.mainImage,
+    imageUrl: product.imageUrl,
+    estimatedProfit: product.estimatedProfit != null ? Number(product.estimatedProfit) : null,
+  }, sales);
+  return { sales, comprehensiveSales, classified };
+}
+
+export async function buildRealtimeClassificationMap(
+  shopId: number,
+  products: RealtimeClassifiableProduct[],
+  forceRefresh = false,
+): Promise<Map<number, RealtimeProductClassification>> {
+  const salesStats = await getSalesStatsByShop(shopId, forceRefresh);
+  const result = new Map<number, RealtimeProductClassification>();
+  for (const product of products) {
+    const sales = getSalesForProduct(salesStats.map, product.sku, product.vendorSku, product.pnk);
+    result.set(product.id, classifyProductWithRealtimeSales(product, sales));
+  }
+  return result;
+}
+
 export function isStockStatusFilter(value: string): value is StockStatus {
   return (STOCK_STATUS_FILTERS as readonly string[]).includes(value);
 }
@@ -125,7 +188,6 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
     sales30,
     sales90,
     sales180,
-    daysSinceSynced,
   } = input;
 
   const replenishReferenceDailySales = calculateReplenishReferenceDailySales(
@@ -138,11 +200,8 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
   const coverageStock = platformStock + platformInTransit + localStock + purchasingInTransit + planningStock;
   const suggestAmount = Math.max(0, targetStock - coverageStock);
 
-  const isToBeEliminated = productClass === 'TO_BE_ELIMINATED';
-  const isNewProduct = productClass === 'NEW';
-  const isDeadProduct = productClass === 'DEAD';
   const isNormalProduct = productClass === 'NORMAL';
-  const isOutOfStockWatch = productClass === 'OUT_OF_STOCK_WATCH';
+  const isClearanceProduct = productClass === 'CLEARANCE';
   const isOutOfStockWithSales = platformStock === 0 && replenishReferenceDailySales > 0;
   const isHotOrPotentialOutOfStock = (productClass === 'HOT' || productClass === 'POTENTIAL') && platformStock === 0;
   const isHotOrPotentialLowStockWarning =
@@ -150,21 +209,7 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
     platformStock > 0 &&
     (stockStatus === 'LOW_STOCK' || stockStatus === 'WARNING');
 
-  let inventoryTag: PurchaseSuggestion['inventoryTag'];
-  if (isToBeEliminated) inventoryTag = 'TO_BE_ELIMINATED';
-  else if (isNewProduct) inventoryTag = 'NEW';
-  else if (isDeadProduct) inventoryTag = 'DEAD';
-  else if (isNormalProduct) inventoryTag = 'NORMAL';
-  else if (isOutOfStockWatch) inventoryTag = 'OUT_OF_STOCK_WATCH';
-  else if (isHotOrPotentialOutOfStock || isHotOrPotentialLowStockWarning) inventoryTag = productClass;
-  else if (daysSinceSynced <= 30) inventoryTag = 'NEW';
-  else if (replenishReferenceDailySales === 0 && platformStock + localStock > 0) inventoryTag = 'DEAD';
-  else if (replenishReferenceDailySales > 0) {
-    const turnoverDays = (platformStock + localStock) / replenishReferenceDailySales;
-    inventoryTag = turnoverDays < 15 ? 'HOT' : 'NORMAL';
-  } else {
-    inventoryTag = 'NORMAL';
-  }
+  const inventoryTag: PurchaseSuggestion['inventoryTag'] = productClass;
 
   let text: string | undefined;
   let reason: string | undefined;
@@ -188,30 +233,16 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
       text = '仍需补货';
       reason = '当前平台库存为0且历史/近期有销量，建议复核库存保障并安排补货。';
     }
-  } else if (isToBeEliminated) {
-    text = '暂停补货';
-    reason = '近30天无销量，且当前无平台库存、无在途库存，建议人工确认是否继续采购或下架。';
-  } else if (isNewProduct) {
-    if (platformStock === 0 && platformInTransit > 0) {
-      text = '新品待到货';
-      reason = '新品当前平台库存为0，但存在在途库存，建议等待到货后观察销售表现。';
-    } else if (platformStock > 0) {
-      text = '新品观察';
-      reason = '新品已有平台库存，但暂无销量，建议观察销售表现后再决定是否补货。';
-    } else {
-      text = '待采购确认';
-      reason = '新品暂无平台库存且无在途库存，建议确认是否需要采购或继续上架。';
-    }
-  } else if (isDeadProduct) {
-    if (platformStock >= 10) {
+  } else if (isClearanceProduct) {
+    if (platformStock >= 10 || stockStatus === 'OVERSTOCK') {
       text = '清仓处理';
-      reason = '滞销产品近30天暂无销量，且当前仍有较多平台库存，建议降价清仓，避免继续占用库存。';
+      reason = '清理款销量弱且存在库存压力，建议降价清仓，回收资金并停止继续采购。';
     } else if (platformStock > 0) {
       text = '停止补货';
-      reason = '滞销产品近30天暂无销量，建议停止补货，观察是否自然售出。';
+      reason = '清理款仍有少量平台库存，建议停止补货，观察是否自然售出。';
     } else {
       text = '停止补货';
-      reason = '滞销产品暂无平台库存，建议不再补货，除非人工确认重新开发。';
+      reason = '清理款暂无平台库存，建议不再补货，除非人工确认重新开发。';
     }
   } else if (isNormalProduct) {
     if (stockStatus === 'LOW_STOCK') {
@@ -431,24 +462,67 @@ async function buildLocalProductAssets(
   };
 }
 
-export async function getProductStructureSummary(shopId: number): Promise<StoreProductOverview['productStructure']> {
-  const grouped = await prisma.storeProduct.groupBy({
-    by: ['productClass'],
-    where: { shopId, isArchived: false },
-    _count: { _all: true },
+export async function getProductStructureSummary(
+  shopId: number,
+  where: StoreProductWhereInput = { shopId, isArchived: false },
+): Promise<StoreProductOverview['productStructure']> {
+  const products = await prisma.storeProduct.findMany({
+    where,
+    select: {
+      id: true,
+      pnk: true,
+      sku: true,
+      vendorSku: true,
+      mappedInventorySku: true,
+      stock: true,
+      syncedAt: true,
+      mainImage: true,
+      imageUrl: true,
+      estimatedProfit: true,
+    },
+    orderBy: { id: 'asc' },
   });
-
+  const classificationMap = await buildRealtimeClassificationMap(shopId, products);
   const counts = emptyRecord(PRODUCT_STRUCTURE_KEYS) as Record<ProductClass, number>;
-  for (const row of grouped) {
-    counts[normalizeProductClass(row.productClass)] += row._count._all;
+  for (const product of products) {
+    const productClass = classificationMap.get(product.id)?.classified.productClass ?? 'NORMAL';
+    counts[productClass]++;
   }
   const total = PRODUCT_STRUCTURE_KEYS.reduce((sum, key) => sum + counts[key], 0);
   return { total, ...counts };
 }
 
+export async function getMatchedStoreProductIdsByProductClass(
+  shopId: number,
+  productClass: ProductClass,
+  where: StoreProductWhereInput = { shopId, isArchived: false },
+): Promise<number[]> {
+  const products = await prisma.storeProduct.findMany({
+    where,
+    select: {
+      id: true,
+      pnk: true,
+      sku: true,
+      vendorSku: true,
+      mappedInventorySku: true,
+      stock: true,
+      syncedAt: true,
+      mainImage: true,
+      imageUrl: true,
+      estimatedProfit: true,
+    },
+    orderBy: { id: 'asc' },
+  });
+  const classificationMap = await buildRealtimeClassificationMap(shopId, products);
+  return products
+    .filter((product) => classificationMap.get(product.id)?.classified.productClass === productClass)
+    .map((product) => product.id);
+}
+
 export async function getMatchedStoreProductIdsByOverviewFilters(
   shopId: number,
   filters: { stockStatus?: StockStatus; purchaseAction?: PurchaseActionKey },
+  where: StoreProductWhereInput = { shopId, isArchived: false },
 ): Promise<number[]> {
   if (!filters.stockStatus && !filters.purchaseAction) {
     return [];
@@ -458,7 +532,7 @@ export async function getMatchedStoreProductIdsByOverviewFilters(
   const [salesStats, products] = await Promise.all([
     getSalesStatsByShop(shopId),
     prisma.storeProduct.findMany({
-      where: { shopId, isArchived: false },
+      where,
       select: {
         id: true,
         pnk: true,
@@ -480,7 +554,7 @@ export async function getMatchedStoreProductIdsByOverviewFilters(
 
   for (const product of products) {
     const sales = getSalesForProduct(salesStats.map, product.sku, product.vendorSku, product.pnk);
-    const comprehensiveSales = calculateComprehensiveSales(sales.d7, sales.d14, sales.d30);
+    const comprehensiveSales = calculateComprehensiveSales(sales, product.stock);
     const stockStatusResult = calculateStockStatus(product.stock, comprehensiveSales, sales.d30);
     if (filters.stockStatus && stockStatusResult.stockStatus !== filters.stockStatus) {
       continue;
@@ -494,20 +568,13 @@ export async function getMatchedStoreProductIdsByOverviewFilters(
       const localStock = localProductId ? assets.localStockByProductId.get(localProductId) ?? 0 : 0;
       const purchasingInTransit = localProductId ? assets.purchasingInTransitByProductId.get(localProductId) ?? 0 : 0;
       const planningStock = skuKey ? assets.planningStockBySku.get(skuKey) ?? 0 : 0;
-      const storedProductClass = product.productClass && isProductClass(product.productClass) ? product.productClass : null;
       const fallbackClassification = classifyStoreProduct({
         stock: product.stock,
         inTransitStock: platformInTransit,
         syncedAt: product.syncedAt,
-        sales7: sales.d7,
-        sales14: sales.d14,
-        sales30: sales.d30,
-        sales90: sales.d90,
-        sales180: sales.d180,
-        lastOrderAt: sales.lastOrderAt,
-        comprehensiveSales,
-      });
-      const productClass = storedProductClass ?? fallbackClassification.productClass;
+        mappedInventorySku: product.mappedInventorySku,
+      }, sales);
+      const productClass = fallbackClassification.productClass;
       const daysSinceSynced = Math.max(0, Math.floor((nowMs - product.syncedAt.getTime()) / dayMs));
       const suggestion = buildPurchaseSuggestion({
         productClass,
@@ -519,9 +586,10 @@ export async function getMatchedStoreProductIdsByOverviewFilters(
         planningStock,
         comprehensiveSales,
         sales30: sales.d30,
+        sales60: sales.d60,
         sales90: sales.d90,
         sales180: sales.d180,
-        lastOrderAt: sales.lastOrderAt,
+        lastOrderAt: normalizeNullableDate(sales.lastOrderAt),
         daysSinceSynced,
       });
       if (mapPurchaseAction(suggestion) !== filters.purchaseAction) {
@@ -541,8 +609,7 @@ export async function getStoreProductOverview(shopId: number): Promise<StoreProd
   }
 
   // 第一版暂不做缓存；后续可在这里按 shopId 增加 1-5 分钟 TTL 缓存。
-  const [productStructure, salesStats, products] = await Promise.all([
-    getProductStructureSummary(shopId),
+  const [salesStats, products] = await Promise.all([
     getSalesStatsByShop(shopId),
     prisma.storeProduct.findMany({
       where: { shopId, isArchived: false },
@@ -555,10 +622,21 @@ export async function getStoreProductOverview(shopId: number): Promise<StoreProd
         stock: true,
         productClass: true,
         syncedAt: true,
+        mainImage: true,
+        imageUrl: true,
+        estimatedProfit: true,
       },
       orderBy: { id: 'asc' },
     }),
   ]);
+
+  const classificationMap = await buildRealtimeClassificationMap(shopId, products);
+  const productStructure = emptyRecord(PRODUCT_STRUCTURE_KEYS) as StoreProductOverview['productStructure'];
+  productStructure.total = products.length;
+  for (const product of products) {
+    const productClass = classificationMap.get(product.id)?.classified.productClass ?? 'NORMAL';
+    productStructure[productClass]++;
+  }
 
   const assets = await buildLocalProductAssets(shopId, products);
   const stockRisk = emptyRecord(STOCK_RISK_KEYS);
@@ -568,7 +646,7 @@ export async function getStoreProductOverview(shopId: number): Promise<StoreProd
 
   for (const product of products) {
     const sales = getSalesForProduct(salesStats.map, product.sku, product.vendorSku, product.pnk);
-    const comprehensiveSales = calculateComprehensiveSales(sales.d7, sales.d14, sales.d30);
+    const comprehensiveSales = classificationMap.get(product.id)?.comprehensiveSales ?? calculateComprehensiveSales(sales, product.stock);
     const stockStatusResult = calculateStockStatus(product.stock, comprehensiveSales, sales.d30);
     stockRisk[stockStatusResult.stockStatus]++;
 
@@ -578,7 +656,7 @@ export async function getStoreProductOverview(shopId: number): Promise<StoreProd
     const localStock = localProductId ? assets.localStockByProductId.get(localProductId) ?? 0 : 0;
     const purchasingInTransit = localProductId ? assets.purchasingInTransitByProductId.get(localProductId) ?? 0 : 0;
     const planningStock = skuKey ? assets.planningStockBySku.get(skuKey) ?? 0 : 0;
-    const productClass = normalizeProductClass(product.productClass);
+    const productClass = classificationMap.get(product.id)?.classified.productClass ?? normalizeProductClass(product.productClass);
     const daysSinceSynced = Math.max(0, Math.floor((nowMs - product.syncedAt.getTime()) / dayMs));
 
     const suggestion = buildPurchaseSuggestion({
@@ -591,9 +669,10 @@ export async function getStoreProductOverview(shopId: number): Promise<StoreProd
       planningStock,
       comprehensiveSales,
       sales30: sales.d30,
+      sales60: sales.d60,
       sales90: sales.d90,
       sales180: sales.d180,
-      lastOrderAt: sales.lastOrderAt,
+      lastOrderAt: normalizeNullableDate(sales.lastOrderAt),
       daysSinceSynced,
     });
     purchaseActions[mapPurchaseAction(suggestion)]++;

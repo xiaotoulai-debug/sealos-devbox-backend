@@ -19,7 +19,7 @@ const OTHER_SUMMARY_MAX_LENGTH = 16;
 const DAILY_TASK_METRICS = [
   { taskType: OperationTaskType.PRODUCT_SELECTION, taskName: '选品数量', metricName: '选品数量', valueType: 'quantity' },
   { taskType: OperationTaskType.PRODUCT_LISTING, taskName: '上新数量', metricName: '上新数量', valueType: 'quantity' },
-  { taskType: OperationTaskType.APPROVED_COUNT, taskName: '通过数量', metricName: '通过数量', valueType: 'quantity' },
+  { taskType: OperationTaskType.APPROVED_COUNT, taskName: '合规数量', metricName: '合规数量', valueType: 'quantity' },
   { taskType: OperationTaskType.SHIPMENT_COUNT, taskName: '发货数量', metricName: '发货数量', valueType: 'quantity' },
   { taskType: OperationTaskType.OTHER, taskName: '其他说明', metricName: '其他说明', valueType: 'text' },
 ] as const;
@@ -40,7 +40,7 @@ export const OPERATION_SCORE_RULES: Record<OperationTaskType, number> = {
 const REPORT_TASK_NAMES: Record<ReportTaskType, string> = {
   PRODUCT_SELECTION: '选品数量',
   PRODUCT_LISTING: '上新数量',
-  APPROVED_COUNT: '通过数量',
+  APPROVED_COUNT: '合规数量',
   SHIPMENT_COUNT: '发货数量',
   OTHER: '其他说明',
 };

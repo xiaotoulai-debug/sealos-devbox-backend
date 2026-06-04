@@ -12,6 +12,8 @@ import { prisma } from '../lib/prisma';
 import { EmagCredentials, getEmagCredentials, REGION_DOMAIN } from './emagClient';
 import { readProductOffers, findDocumentationByEans, readProductsByPnk } from './emagProduct';
 import { normalizeEmagProduct, slugifyProductName } from './emagProductNormalizer';
+import { getSalesForProduct, getSalesStatsByShop } from './salesStats';
+import { calculateComprehensiveSales, classifyStoreProduct } from './productClassification';
 
 // ★ 降级配置（2026-04-15）：eMAG RO product_offer/read 响应极慢（实测 156s），
 //   缩小单页大小 + 加大页间间隔，减轻单次请求的服务端处理压力。
@@ -653,80 +655,68 @@ export async function backfillProductImages(): Promise<{ updated: number; total:
 }
 
 /**
- * 回填综合日销 — 从 platform_orders 聚合 7/14/30 日销量，计算综合日销并写入 store_products.comprehensive_sales
- * 公式: (d7/7 * 0.3) + (d14/14 * 0.3) + (d30/30 * 0.4)
- * 支持全量回填（不传 shopId）或指定店铺回填（传 shopId）
+ * 回填综合日销与分类缓存。
+ *
+ * 前台列表/卡片以实时计算为准；这里仅刷新旧落库字段，作为排序、历史兼容和后台诊断缓存。
  */
 export async function backfillComprehensiveSales(shopId?: number): Promise<{ updated: number; errors: string[] }> {
   const result = { updated: 0, errors: [] as string[] };
 
-  const now = new Date();
-  const d7Date = new Date(now); d7Date.setDate(d7Date.getDate() - 7);
-  const d14Date = new Date(now); d14Date.setDate(d14Date.getDate() - 14);
-  const d30Date = new Date(now); d30Date.setDate(d30Date.getDate() - 30);
-
-  const shopWhere = shopId != null ? `AND po.shop_id = ${shopId}` : '';
-  const skuExpr = `LOWER(TRIM(REPLACE(REPLACE(COALESCE(elem->>'sku', elem->>'ext_part_number', ''), E'\\r', ''), E'\\n', '')))`;
-  const qtyExpr = `COALESCE((elem->>'quantity')::int, 0)`;
-  const baseStatus = `po.status IN (1,2,3,4)`;
-
   try {
-    // 聚合三个时间段的销量
-    const [d7Rows, d14Rows, d30Rows] = await Promise.all([
-      prisma.$queryRawUnsafe<Array<{ shop_id: number; sku: string; total: string }>>(
-        `SELECT po.shop_id, ${skuExpr} as sku, SUM(${qtyExpr}) as total FROM platform_orders po, jsonb_array_elements(products_json::jsonb) as elem WHERE ${baseStatus} AND po.order_time >= '${d7Date.toISOString().slice(0, 10)}' ${shopWhere} GROUP BY po.shop_id, 2`
-      ),
-      prisma.$queryRawUnsafe<Array<{ shop_id: number; sku: string; total: string }>>(
-        `SELECT po.shop_id, ${skuExpr} as sku, SUM(${qtyExpr}) as total FROM platform_orders po, jsonb_array_elements(products_json::jsonb) as elem WHERE ${baseStatus} AND po.order_time >= '${d14Date.toISOString().slice(0, 10)}' ${shopWhere} GROUP BY po.shop_id, 2`
-      ),
-      prisma.$queryRawUnsafe<Array<{ shop_id: number; sku: string; total: string }>>(
-        `SELECT po.shop_id, ${skuExpr} as sku, SUM(${qtyExpr}) as total FROM platform_orders po, jsonb_array_elements(products_json::jsonb) as elem WHERE ${baseStatus} AND po.order_time >= '${d30Date.toISOString().slice(0, 10)}' ${shopWhere} GROUP BY po.shop_id, 2`
-      ),
-    ]);
-
-    // 按 shopId+sku 建立销量 Map
-    type SalesKey = string; // `${shopId}:${sku}`
-    const salesMap = new Map<SalesKey, { d7: number; d14: number; d30: number }>();
-    const mergeRows = (rows: Array<{ shop_id: number; sku: string; total: string }>, key: 'd7' | 'd14' | 'd30') => {
-      for (const r of rows) {
-        const k: SalesKey = `${r.shop_id}:${r.sku}`;
-        const s = salesMap.get(k) ?? { d7: 0, d14: 0, d30: 0 };
-        s[key] = Number(r.total) || 0;
-        salesMap.set(k, s);
-      }
-    };
-    mergeRows(d7Rows, 'd7');
-    mergeRows(d14Rows, 'd14');
-    mergeRows(d30Rows, 'd30');
-
-    // 查出所有需要回填的产品（sku 和 vendorSku 都要尝试匹配）
-    const products = await prisma.storeProduct.findMany({
-      where: { isArchived: false, ...(shopId != null ? { shopId } : {}) },
-      select: { id: true, shopId: true, sku: true, vendorSku: true },
-    });
+    const shops = shopId != null
+      ? [{ id: shopId }]
+      : await prisma.shopAuthorization.findMany({
+          where: { platform: { equals: 'emag', mode: 'insensitive' }, status: 'active' },
+          select: { id: true },
+          orderBy: { id: 'asc' },
+        });
 
     const BATCH = 200;
-    for (let i = 0; i < products.length; i += BATCH) {
-      const batch = products.slice(i, i + BATCH);
-      await Promise.all(batch.map(async (p) => {
-        const keys = new Set(
-          [p.sku, p.vendorSku]
-            .filter(Boolean)
-            .map((s) => s!.trim().toLowerCase())
-        );
-        let d7 = 0, d14 = 0, d30 = 0;
-        for (const sku of keys) {
-          const k: SalesKey = `${p.shopId}:${sku}`;
-          const s = salesMap.get(k);
-          if (s) { d7 += s.d7; d14 += s.d14; d30 += s.d30; }
-        }
-        const compSales = parseFloat(((d7 / 7) * 0.3 + (d14 / 14) * 0.3 + (d30 / 30) * 0.4).toFixed(2));
-        await prisma.storeProduct.update({
-          where: { id: p.id },
-          data: { comprehensiveSales: compSales },
-        });
-        result.updated++;
-      }));
+    for (const shop of shops) {
+      const salesStats = await getSalesStatsByShop(shop.id, true);
+      const products = await prisma.storeProduct.findMany({
+        where: { shopId: shop.id, isArchived: false },
+        select: {
+          id: true,
+          pnk: true,
+          sku: true,
+          vendorSku: true,
+          mappedInventorySku: true,
+          stock: true,
+          syncedAt: true,
+          mainImage: true,
+          imageUrl: true,
+          estimatedProfit: true,
+        },
+      });
+
+      for (let i = 0; i < products.length; i += BATCH) {
+        const batch = products.slice(i, i + BATCH);
+        await Promise.all(batch.map(async (p) => {
+          const sales = getSalesForProduct(salesStats.map, p.sku, p.vendorSku, p.pnk);
+          const compSales = calculateComprehensiveSales(sales, p.stock);
+          const classified = classifyStoreProduct({
+            stock: p.stock,
+            syncedAt: p.syncedAt,
+            mappedInventorySku: p.mappedInventorySku,
+            mainImage: p.mainImage,
+            imageUrl: p.imageUrl,
+            estimatedProfit: p.estimatedProfit != null ? Number(p.estimatedProfit) : null,
+          }, sales);
+
+          await prisma.storeProduct.update({
+            where: { id: p.id },
+            data: {
+              comprehensiveSales: compSales,
+              productClass: classified.productClass,
+              classificationReason: classified.reason,
+              classificationMetrics: { ...classified.metrics, riskTags: classified.riskTags } as Prisma.InputJsonValue,
+              classifiedAt: new Date(),
+            },
+          });
+          result.updated++;
+        }));
+      }
     }
 
     console.log(`[backfillComprehensiveSales] 完成，共更新 ${result.updated} 条产品综合日销`);

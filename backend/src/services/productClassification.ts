@@ -6,13 +6,17 @@ export const PRODUCT_CLASSES = [
   'HOT',
   'POTENTIAL',
   'NORMAL',
-  'DEAD',
-  'OUT_OF_STOCK_WATCH',
-  'TO_BE_ELIMINATED',
-  'NEW',
+  'CLEARANCE',
 ] as const;
 
 export type ProductClass = typeof PRODUCT_CLASSES[number];
+
+export const PRODUCT_CLASS_NAMES: Record<ProductClass, string> = {
+  HOT: '主推款',
+  POTENTIAL: '成长款',
+  NORMAL: '常规款',
+  CLEARANCE: '清理款',
+};
 
 export const STOCK_STATUSES = [
   'OUT_OF_STOCK',
@@ -25,46 +29,58 @@ export const STOCK_STATUSES = [
 export type StockStatus = typeof STOCK_STATUSES[number];
 
 export const PRODUCT_CLASS_RULES = {
-  newDays: 30,
-  hotComprehensiveSales: 1,
-  hotSales30: 30,
-  hotSales7: 7,
-  potentialComprehensiveSales: 0.2,
-  potentialSales30: 5,
-  potentialSales7: 2,
-  deadComprehensiveSales: 0.05,
+  hotComprehensiveSales: 0.8,
+  hotSales30: 15,
+  hotStockoutSales60: 20,
+  hotStockoutSales90: 30,
+  potentialComprehensiveSales: 0.15,
+  clearanceComprehensiveSales: 0.03,
 } as const;
 
 export type ClassifyStoreProductInput = {
   stock: number;
   inTransitStock?: number;
-  syncedAt: Date;
-  sales7: number;
-  sales14: number;
-  sales30: number;
-  sales90?: number;
-  sales180?: number;
-  lastOrderAt?: Date | null;
-  comprehensiveSales: number;
+  syncedAt?: Date;
+  mappedInventorySku?: string | null;
+  mainImage?: string | null;
+  imageUrl?: string | null;
+  estimatedProfit?: number | null;
+};
+
+export type ClassificationSalesStats = {
+  d3?: number;
+  d7: number;
+  d14: number;
+  d30: number;
+  d60?: number;
+  d90?: number;
+  d180?: number;
+  lastOrderAt?: Date | string | null;
 };
 
 export type ClassificationMetrics = {
   stock: number;
   inTransitStock: number;
+  sales3: number;
   sales7: number;
   sales14: number;
   sales30: number;
+  sales60: number;
   sales90: number;
   sales180: number;
   lastOrderAt: string | null;
   daysSinceLastOrder: number | null;
+  sales3Daily: number;
   sales7Daily: number;
+  sales14Daily: number;
   sales30Daily: number;
+  sales60Daily: number;
+  sales90Daily: number;
+  baseComprehensiveSales: number;
+  stockoutProtectedSales: number;
   comprehensiveSales: number;
   daysSinceSynced: number;
-  availableDays90: null;
-  inStockDailySales90: null;
-  outOfStockHistoryProtected: boolean;
+  stockoutProtected: boolean;
 };
 
 export type StockStatusResult = {
@@ -75,8 +91,10 @@ export type StockStatusResult = {
 
 export type ClassifyStoreProductResult = {
   productClass: ProductClass;
+  classificationName: string;
   reason: string;
   metrics: ClassificationMetrics;
+  riskTags: string[];
 };
 
 export type ProductClassRecalcOptions = {
@@ -104,11 +122,49 @@ export function normalizeProductClassQuery(raw: unknown): ProductClass | 'all' |
   if (raw == null) return null;
   const value = String(Array.isArray(raw) ? raw[0] : raw).trim().toUpperCase();
   if (!value || value === 'ALL') return 'all';
+  if (value === 'DEAD' || value === 'TO_BE_ELIMINATED') return 'CLEARANCE';
+  if (value === 'NEW' || value === 'OUT_OF_STOCK_WATCH') return 'NORMAL';
   return isProductClass(value) ? value : null;
 }
 
-export function calculateComprehensiveSales(sales7: number, sales14: number, sales30: number): number {
-  return parseFloat((((sales7 / 7) * 0.3) + ((sales14 / 14) * 0.3) + ((sales30 / 30) * 0.4)).toFixed(2));
+function numberValue(value: unknown): number {
+  const n = Number(value ?? 0);
+  return Number.isFinite(n) ? n : 0;
+}
+
+function normalizeDate(value: Date | string | null | undefined): Date | null {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
+
+export function calculateBaseComprehensiveSales(salesStats: ClassificationSalesStats): number {
+  const d3 = numberValue(salesStats.d3);
+  const d7 = numberValue(salesStats.d7);
+  const d14 = numberValue(salesStats.d14);
+  const d30 = numberValue(salesStats.d30);
+  const d60 = numberValue(salesStats.d60);
+  const d90 = numberValue(salesStats.d90);
+  return (d3 / 3) * 0.20 +
+    (d7 / 7) * 0.20 +
+    (d14 / 14) * 0.20 +
+    (d30 / 30) * 0.20 +
+    (d60 / 60) * 0.10 +
+    (d90 / 90) * 0.10;
+}
+
+export function calculateStockoutProtectedSales(salesStats: ClassificationSalesStats, stock: number): number {
+  const d60 = numberValue(salesStats.d60);
+  const d90 = numberValue(salesStats.d90);
+  return stock <= 0 && (d60 > 0 || d90 > 0)
+    ? Math.max(d60 / 60, d90 / 90) * 0.7
+    : 0;
+}
+
+export function calculateComprehensiveSales(salesStats: ClassificationSalesStats, stock = 0): number {
+  const baseComprehensiveSales = calculateBaseComprehensiveSales(salesStats);
+  const stockoutProtectedSales = calculateStockoutProtectedSales(salesStats, stock);
+  return parseFloat(Math.max(baseComprehensiveSales, stockoutProtectedSales).toFixed(4));
 }
 
 export function calculateStockStatus(platformStock: number, comprehensiveSales: number, sales30: number): StockStatusResult {
@@ -139,132 +195,136 @@ export function calculateStockStatus(platformStock: number, comprehensiveSales: 
   return { stockStatus: 'OVERSTOCK', stockDays, referenceDailySales: roundedReferenceDailySales };
 }
 
-export function classifyStoreProduct(input: ClassifyStoreProductInput, now = new Date()): ClassifyStoreProductResult {
-  const stock = Number(input.stock ?? 0);
-  const inTransitStock = Number(input.inTransitStock ?? 0);
-  const sales7 = Number(input.sales7 ?? 0);
-  const sales14 = Number(input.sales14 ?? 0);
-  const sales30 = Number(input.sales30 ?? 0);
-  const sales90 = Number(input.sales90 ?? 0);
-  const sales180 = Number(input.sales180 ?? 0);
-  const comprehensiveSales = Number(input.comprehensiveSales ?? 0);
-  const daysSinceSynced = Math.max(0, Math.floor((now.getTime() - input.syncedAt.getTime()) / DAY_MS));
-  const lastOrderAt = input.lastOrderAt instanceof Date && !Number.isNaN(input.lastOrderAt.getTime())
-    ? input.lastOrderAt
-    : null;
+function buildClassificationMetrics(input: ClassifyStoreProductInput, salesStats: ClassificationSalesStats, now: Date): ClassificationMetrics {
+  const stock = numberValue(input.stock);
+  const inTransitStock = numberValue(input.inTransitStock);
+  const sales3 = numberValue(salesStats.d3);
+  const sales7 = numberValue(salesStats.d7);
+  const sales14 = numberValue(salesStats.d14);
+  const sales30 = numberValue(salesStats.d30);
+  const sales60 = numberValue(salesStats.d60);
+  const sales90 = numberValue(salesStats.d90);
+  const sales180 = numberValue(salesStats.d180);
+  const baseComprehensiveSales = calculateBaseComprehensiveSales(salesStats);
+  const stockoutProtectedSales = calculateStockoutProtectedSales(salesStats, stock);
+  const comprehensiveSales = calculateComprehensiveSales(salesStats, stock);
+  const syncedAt = normalizeDate(input.syncedAt);
+  const daysSinceSynced = syncedAt ? Math.max(0, Math.floor((now.getTime() - syncedAt.getTime()) / DAY_MS)) : -1;
+  const lastOrderAt = normalizeDate(salesStats.lastOrderAt);
   const daysSinceLastOrder = lastOrderAt
     ? Math.max(0, Math.floor((now.getTime() - lastOrderAt.getTime()) / DAY_MS))
     : null;
-  const sales7Daily = sales7 / 7;
-  const sales30Daily = sales30 / 30;
-  const isOutOfStockHistoryProtected =
-    stock === 0 &&
-    (
-      sales90 > 0 ||
-      (sales180 >= 3 && daysSinceLastOrder !== null && daysSinceLastOrder <= 120)
-    );
 
-  const metrics: ClassificationMetrics = {
+  return {
     stock,
     inTransitStock,
+    sales3,
     sales7,
     sales14,
     sales30,
+    sales60,
     sales90,
     sales180,
     lastOrderAt: lastOrderAt ? lastOrderAt.toISOString() : null,
     daysSinceLastOrder,
-    sales7Daily: parseFloat(sales7Daily.toFixed(4)),
-    sales30Daily: parseFloat(sales30Daily.toFixed(4)),
+    sales3Daily: parseFloat((sales3 / 3).toFixed(4)),
+    sales7Daily: parseFloat((sales7 / 7).toFixed(4)),
+    sales14Daily: parseFloat((sales14 / 14).toFixed(4)),
+    sales30Daily: parseFloat((sales30 / 30).toFixed(4)),
+    sales60Daily: parseFloat((sales60 / 60).toFixed(4)),
+    sales90Daily: parseFloat((sales90 / 90).toFixed(4)),
+    baseComprehensiveSales: parseFloat(baseComprehensiveSales.toFixed(4)),
+    stockoutProtectedSales: parseFloat(stockoutProtectedSales.toFixed(4)),
     comprehensiveSales,
     daysSinceSynced,
-    availableDays90: null,
-    inStockDailySales90: null,
-    outOfStockHistoryProtected: isOutOfStockHistoryProtected,
+    stockoutProtected: stockoutProtectedSales > 0,
   };
+}
 
-  const isSyncedNewWithoutSales = daysSinceSynced <= PRODUCT_CLASS_RULES.newDays && sales30 === 0;
-  const isIncomingNewWithoutSales =
-    sales7 === 0 &&
-    sales14 === 0 &&
-    sales30 === 0 &&
-    comprehensiveSales < PRODUCT_CLASS_RULES.deadComprehensiveSales &&
-    stock === 0 &&
-    inTransitStock > 0;
+export function getProductRiskTags(input: ClassifyStoreProductInput, salesStats: ClassificationSalesStats): string[] {
+  const stock = numberValue(input.stock);
+  const d30 = numberValue(salesStats.d30);
+  const d60 = numberValue(salesStats.d60);
+  const d90 = numberValue(salesStats.d90);
+  const comprehensiveSales = calculateComprehensiveSales(salesStats, stock);
+  const tags: string[] = [];
 
-  if (isSyncedNewWithoutSales || isIncomingNewWithoutSales) {
-    return {
-      productClass: 'NEW',
-      reason: isIncomingNewWithoutSales
-        ? '近7/14/30天暂无销量、平台库存为0且存在FBE在途库存，说明产品尚未真正开始售卖，归为新品待到货。'
-        : '基于 StoreProduct.syncedAt 判断为 ERP 新同步产品，且近30天暂无销量；该时间不是 eMAG 真实上架时间。',
-      metrics,
-    };
-  }
+  if (stock <= 0 && (d30 > 0 || d60 > 0 || d90 > 0)) tags.push('断货');
+  if (stock > 0 && comprehensiveSales > 0 && stock / comprehensiveSales <= 7) tags.push('低库存');
+  if (stock > 0 && comprehensiveSales > 0 && stock / comprehensiveSales >= 60) tags.push('库存偏多');
+  if (d30 === 0 && d60 === 0 && d90 === 0) tags.push('无销量');
+  if (!String(input.mappedInventorySku ?? '').trim()) tags.push('未关联SKU');
+  if (!String(input.mainImage ?? '').trim() && !String(input.imageUrl ?? '').trim()) tags.push('无图片');
+  if (input.estimatedProfit != null && Number(input.estimatedProfit) < 0) tags.push('负毛利');
 
-  if (isOutOfStockHistoryProtected) {
-    return {
-      productClass: 'OUT_OF_STOCK_WATCH',
-      reason: sales90 > 0
-        ? '当前平台库存为0，但近90天有销量，判断为断货观察款，避免误判为滞销或待淘汰。'
-        : '当前平台库存为0，近180天历史销量达到保护阈值且最后出单距今不超过120天，判断为断货观察款。',
-      metrics,
-    };
-  }
+  return tags;
+}
+
+export function classifyStoreProduct(
+  input: ClassifyStoreProductInput,
+  salesStats: ClassificationSalesStats,
+  now = new Date(),
+): ClassifyStoreProductResult {
+  const metrics = buildClassificationMetrics(input, salesStats, now);
+  const stock = metrics.stock;
+  const sales3 = metrics.sales3;
+  const sales7 = metrics.sales7;
+  const sales14 = metrics.sales14;
+  const sales30 = metrics.sales30;
+  const sales60 = metrics.sales60;
+  const sales90 = metrics.sales90;
+  const comprehensiveSales = metrics.comprehensiveSales;
+  const riskTags = getProductRiskTags(input, salesStats);
 
   if (
     comprehensiveSales >= PRODUCT_CLASS_RULES.hotComprehensiveSales ||
     sales30 >= PRODUCT_CLASS_RULES.hotSales30 ||
-    sales7 >= PRODUCT_CLASS_RULES.hotSales7
+    (stock <= 0 && (sales60 >= PRODUCT_CLASS_RULES.hotStockoutSales60 || sales90 >= PRODUCT_CLASS_RULES.hotStockoutSales90))
   ) {
     return {
       productClass: 'HOT',
-      reason: '综合日销、近30天销量或近7天销量达到热销阈值。',
+      classificationName: PRODUCT_CLASS_NAMES.HOT,
+      reason: stock <= 0 && (sales60 >= PRODUCT_CLASS_RULES.hotStockoutSales60 || sales90 >= PRODUCT_CLASS_RULES.hotStockoutSales90)
+        ? '当前断货但 60/90 天历史销量达到主推阈值，需要重点保供。'
+        : '综合日销或近30天销量达到主推阈值。',
       metrics,
+      riskTags,
     };
   }
 
-  if (
-    comprehensiveSales >= PRODUCT_CLASS_RULES.potentialComprehensiveSales ||
-    sales30 >= PRODUCT_CLASS_RULES.potentialSales30 ||
-    sales7 >= PRODUCT_CLASS_RULES.potentialSales7
-  ) {
+  if (sales3 > 0 || sales7 > 0 || sales14 > 0 || comprehensiveSales >= PRODUCT_CLASS_RULES.potentialComprehensiveSales) {
     return {
       productClass: 'POTENTIAL',
-      reason: '综合日销、近30天销量或近7天销量达到潜力款阈值。',
+      classificationName: PRODUCT_CLASS_NAMES.POTENTIAL,
+      reason: sales3 > 0 || sales7 > 0 || sales14 > 0
+        ? '近3/7/14天已有动销，归为成长款继续观察。'
+        : '综合日销达到成长款阈值。',
       metrics,
-    };
-  }
-
-  if (stock > 0 && daysSinceSynced > PRODUCT_CLASS_RULES.newDays && sales30 === 0 && comprehensiveSales < PRODUCT_CLASS_RULES.deadComprehensiveSales) {
-    return {
-      productClass: 'DEAD',
-      reason: '当前有平台库存但近30天无销量且综合日销低于0.05；第一阶段尚无 90 天有货天数，当前仅为弱滞销判断。',
-      metrics,
+      riskTags,
     };
   }
 
   if (
-    sales7 === 0 &&
-    sales14 === 0 &&
-    sales30 === 0 &&
-    sales180 === 0 &&
-    comprehensiveSales < PRODUCT_CLASS_RULES.deadComprehensiveSales &&
-    stock === 0 &&
-    inTransitStock === 0 &&
-    daysSinceSynced > PRODUCT_CLASS_RULES.newDays
+    (stock > 0 && sales30 === 0 && sales60 === 0 && sales90 === 0) ||
+    (stock > 0 && comprehensiveSales < PRODUCT_CLASS_RULES.clearanceComprehensiveSales)
   ) {
     return {
-      productClass: 'TO_BE_ELIMINATED',
-      reason: '近7/14/30天暂无销量，平台库存为0且无在途库存，说明当前没有继续销售或补货动作，归为待淘汰款，建议人工确认是否继续采购或下架。',
+      productClass: 'CLEARANCE',
+      classificationName: PRODUCT_CLASS_NAMES.CLEARANCE,
+      reason: sales30 === 0 && sales60 === 0 && sales90 === 0
+        ? '当前有库存但近30/60/90天均无销量，建议清理库存。'
+        : '当前有库存且综合日销低于清理阈值，建议降价、清仓或停止采购。',
       metrics,
+      riskTags,
     };
   }
 
   return {
     productClass: 'NORMAL',
-    reason: '未命中新品、热销、潜力、弱滞销或待淘汰规则，归为普通款。',
+    classificationName: PRODUCT_CLASS_NAMES.NORMAL,
+    reason: '未命中主推、成长或清理规则，归为常规款。',
     metrics,
+    riskTags,
   };
 }
 
@@ -336,6 +396,9 @@ async function recalcForProducts(shopId: number, dryRun: boolean): Promise<Produ
       stock: true,
       syncedAt: true,
       productClass: true,
+      mainImage: true,
+      imageUrl: true,
+      estimatedProfit: true,
     },
     orderBy: { id: 'asc' },
   });
@@ -370,27 +433,24 @@ async function recalcForProducts(shopId: number, dryRun: boolean): Promise<Produ
     id: number;
     productClass: ProductClass;
     reason: string;
-    metrics: ClassificationMetrics;
+    metrics: Prisma.InputJsonValue;
     comprehensiveSales: number;
   }> = [];
 
   for (const p of products) {
     const sales = getSalesForProduct(salesMap, p.sku, p.vendorSku, p.pnk);
-    const comprehensiveSales = calculateComprehensiveSales(sales.d7, sales.d14, sales.d30);
+    const comprehensiveSales = calculateComprehensiveSales(sales, p.stock);
     const localProductId = productIdByPnk.get(p.pnk);
     const inTransitStock = localProductId ? inTransitByProductId.get(localProductId) ?? 0 : 0;
     const classified = classifyStoreProduct({
       stock: p.stock,
       inTransitStock,
       syncedAt: p.syncedAt,
-      sales7: sales.d7,
-      sales14: sales.d14,
-      sales30: sales.d30,
-      sales90: sales.d90,
-      sales180: sales.d180,
-      lastOrderAt: sales.lastOrderAt,
-      comprehensiveSales,
-    }, now);
+      mappedInventorySku: p.mappedInventorySku,
+      mainImage: p.mainImage,
+      imageUrl: p.imageUrl,
+      estimatedProfit: p.estimatedProfit != null ? Number(p.estimatedProfit) : null,
+    }, sales, now);
 
     summary.counts[classified.productClass]++;
     if (summary.samples[classified.productClass].length < 5) {
@@ -408,7 +468,7 @@ async function recalcForProducts(shopId: number, dryRun: boolean): Promise<Produ
         id: p.id,
         productClass: classified.productClass,
         reason: classified.reason,
-        metrics: classified.metrics,
+        metrics: { ...classified.metrics, riskTags: classified.riskTags } as Prisma.InputJsonValue,
         comprehensiveSales,
       });
     }
@@ -426,7 +486,7 @@ async function recalcForProducts(shopId: number, dryRun: boolean): Promise<Produ
       data: {
         productClass: item.productClass,
         classificationReason: item.reason,
-        classificationMetrics: item.metrics as unknown as Prisma.InputJsonValue,
+        classificationMetrics: item.metrics,
         classifiedAt: now,
         comprehensiveSales: item.comprehensiveSales,
       },

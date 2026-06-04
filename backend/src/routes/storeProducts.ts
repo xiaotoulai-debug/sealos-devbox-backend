@@ -19,7 +19,9 @@ import { syncExchangeRates } from '../services/exchangeRateSync';
 import { buildOperationAdvice } from '../services/operationAdvice';
 import {
   buildPurchaseSuggestion,
+  getMatchedStoreProductIdsByProductClass,
   getMatchedStoreProductIdsByOverviewFilters,
+  getProductStructureSummary,
   getStoreProductOverview,
   isPurchaseActionFilter,
   isStockStatusFilter,
@@ -28,9 +30,9 @@ import {
   STOCK_STATUS_FILTERS,
 } from '../services/storeProductOverview';
 import {
+  calculateComprehensiveSales,
   calculateStockStatus,
   classifyStoreProduct,
-  isProductClass,
   normalizeProductClassQuery,
   PRODUCT_CLASSES,
   recalcProductClassForAllShops,
@@ -42,6 +44,12 @@ const router = Router();
 router.use(authenticate);
 
 const PRODUCT_CLASS_SUMMARY_KEYS = PRODUCT_CLASSES;
+
+function normalizeNullableDate(value: Date | string | null | undefined): Date | null {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date;
+}
 
 function buildStoreProductListWhere(shopId: number, mappingStatus: string, search: string): Prisma.StoreProductWhereInput {
   const where: Prisma.StoreProductWhereInput = { shopId, isArchived: false };
@@ -455,29 +463,8 @@ router.get('/classification-summary', async (req: Request, res: Response) => {
     const search = String(req.query.search ?? req.query.query ?? '').trim();
     const where = buildStoreProductListWhere(shopId, mappingStatus, search);
 
-    const grouped = await prisma.storeProduct.groupBy({
-      by: ['productClass'],
-      where,
-      _count: { _all: true },
-    });
-
-    const summary = PRODUCT_CLASS_SUMMARY_KEYS.reduce((acc, cls) => {
-      acc[cls] = 0;
-      return acc;
-    }, {} as Record<(typeof PRODUCT_CLASS_SUMMARY_KEYS)[number], number>);
-
-    for (const row of grouped) {
-      const count = row._count._all;
-      const productClass = row.productClass;
-      if (productClass && isProductClass(productClass)) {
-        summary[productClass] += count;
-      } else {
-        summary.NORMAL += count;
-      }
-    }
-
-    const total = PRODUCT_CLASS_SUMMARY_KEYS.reduce((sum, cls) => sum + summary[cls], 0);
-    res.json({ code: 200, data: { total, ...summary }, message: 'success' });
+    const summary = await getProductStructureSummary(shopId, where);
+    res.json({ code: 200, data: summary, message: 'success' });
   } catch (err) {
     console.error('[GET /api/store-products/classification-summary] Error:', err);
     res.status(500).json({ code: 500, data: null, message: err instanceof Error ? err.message : '分类统计失败' });
@@ -569,7 +556,7 @@ router.get('/', async (req: Request, res: Response) => {
       res.status(400).json({
         code: 400,
         data: null,
-        message: 'productClass 无效，合法值：HOT/POTENTIAL/NORMAL/DEAD/OUT_OF_STOCK_WATCH/NEW/TO_BE_ELIMINATED/all',
+        message: 'productClass 无效，合法值：HOT/POTENTIAL/NORMAL/CLEARANCE/all',
       });
       return;
     }
@@ -606,9 +593,6 @@ router.get('/', async (req: Request, res: Response) => {
 
     // Prisma 无法在一条 where 里同时表达「IS NULL OR = ''」，使用 OR 组合处理空字符串边界
     const where: Prisma.StoreProductWhereInput = { shopId, isArchived: false };
-    if (productClassFilter && productClassFilter !== 'all') {
-      where.productClass = productClassFilter;
-    }
 
     if (mappingStatus === 'mapped') {
       // 已关联：mappedInventorySku 不为 null 且不为空字符串
@@ -670,11 +654,22 @@ router.get('/', async (req: Request, res: Response) => {
       }
     }
 
+    const realtimeFilterIdSets: number[][] = [];
+    if (productClassFilter && productClassFilter !== 'all') {
+      realtimeFilterIdSets.push(await getMatchedStoreProductIdsByProductClass(shopId, productClassFilter, where));
+    }
+
     if (stockStatusFilter || purchaseActionFilter) {
       const matchedIds = await getMatchedStoreProductIdsByOverviewFilters(shopId, {
         ...(stockStatusFilter ? { stockStatus: stockStatusFilter } : {}),
         ...(purchaseActionFilter ? { purchaseAction: purchaseActionFilter } : {}),
-      });
+      }, where);
+      realtimeFilterIdSets.push(matchedIds);
+    }
+
+    if (realtimeFilterIdSets.length > 0) {
+      const [firstSet, ...restSets] = realtimeFilterIdSets.map((ids) => new Set(ids));
+      const matchedIds = [...firstSet].filter((id) => restSets.every((set) => set.has(id)));
       where.id = { in: matchedIds };
     }
 
@@ -969,19 +964,19 @@ router.get('/', async (req: Request, res: Response) => {
       }
 
       const salesStatsObj = {
+        d3: sales_stats.d3,
         d7: sales_stats.d7,
         d14: sales_stats.d14,
         d30: sales_stats.d30,
+        d60: sales_stats.d60,
         d90: sales_stats.d90,
         d180: sales_stats.d180,
         lastOrderAt: sales_stats.lastOrderAt,
       };
 
-      // ★ 强耦合计算：在同一作用域内用实时销量原子计算 comprehensive_sales
-      // 公式: (d7/7*0.3) + (d14/14*0.3) + (d30/30*0.4)，与 backfillComprehensiveSales 完全一致
-      const compSales = parseFloat(
-        (((sales_stats.d7 || 0) / 7) * 0.3 + ((sales_stats.d14 || 0) / 14) * 0.3 + ((sales_stats.d30 || 0) / 30) * 0.4).toFixed(2)
-      );
+      // ★ 强耦合计算：在同一作用域内用实时销量原子计算 comprehensive_sales。
+      // 统一使用 3/7/14/30/60/90 天窗口 + 断货保护，避免旧缓存分类与列表口径漂移。
+      const compSales = calculateComprehensiveSales(sales_stats, stockNum);
       const stockAgg = inv?.localProductId != null
         ? warehouseStockMap.get(inv.localProductId)
         : undefined;
@@ -991,18 +986,16 @@ router.get('/', async (req: Request, res: Response) => {
         stock: stockNum,
         inTransitStock: fbeInTransitQuantity,
         syncedAt: p.syncedAt,
-        sales7: sales_stats.d7,
-        sales14: sales_stats.d14,
-        sales30: sales_stats.d30,
-        sales90: sales_stats.d90,
-        sales180: sales_stats.d180,
-        lastOrderAt: sales_stats.lastOrderAt,
-        comprehensiveSales: compSales,
-      });
-      const storedProductClass = p.productClass && isProductClass(p.productClass) ? p.productClass : null;
-      const productClass = storedProductClass ?? fallbackClassification.productClass;
-      const classificationReason = p.classificationReason ?? fallbackClassification.reason;
-      const classificationMetrics = p.classificationMetrics ?? fallbackClassification.metrics;
+        mappedInventorySku: p.mappedInventorySku,
+        mainImage: p.mainImage,
+        imageUrl: p.imageUrl,
+        estimatedProfit: p.estimatedProfit != null ? Number(p.estimatedProfit) : null,
+      }, sales_stats);
+      const productClass = fallbackClassification.productClass;
+      const classificationReason = fallbackClassification.reason;
+      const classificationMetrics = fallbackClassification.metrics;
+      const classificationName = fallbackClassification.classificationName;
+      const riskTags = fallbackClassification.riskTags;
       const stockStatusResult = calculateStockStatus(stockNum, compSales, sales_stats.d30);
       const platformStock = stockNum;
       const platformInTransit = fbeInTransitQuantity;
@@ -1012,8 +1005,9 @@ router.get('/', async (req: Request, res: Response) => {
         : 0;
       const planningStock = planningStockMap.get(normalizeSkuKey(skuKey)) ?? 0;
       const daysSinceSynced = Math.floor((nowMs - p.syncedAt.getTime()) / DAY_MS);
-      const daysSinceLastOrder = sales_stats.lastOrderAt
-        ? Math.max(0, Math.floor((nowMs - sales_stats.lastOrderAt.getTime()) / DAY_MS))
+      const lastOrderAt = normalizeNullableDate(sales_stats.lastOrderAt);
+      const daysSinceLastOrder = lastOrderAt
+        ? Math.max(0, Math.floor((nowMs - lastOrderAt.getTime()) / DAY_MS))
         : null;
       const purchaseSuggestion = buildPurchaseSuggestion({
         productClass,
@@ -1025,9 +1019,10 @@ router.get('/', async (req: Request, res: Response) => {
         planningStock,
         comprehensiveSales: compSales,
         sales30: sales_stats.d30,
+        sales60: sales_stats.d60,
         sales90: sales_stats.d90,
-        sales180: sales_stats.d180,
-        lastOrderAt: sales_stats.lastOrderAt,
+        sales180: sales_stats.d180 ?? 0,
+        lastOrderAt,
         daysSinceSynced,
       });
       const estimatedProfit = p.estimatedProfit != null ? Number(p.estimatedProfit) : null;
@@ -1044,9 +1039,10 @@ router.get('/', async (req: Request, res: Response) => {
         sales7: sales_stats.d7,
         sales14: sales_stats.d14,
         sales30: sales_stats.d30,
+        sales60: sales_stats.d60,
         sales90: sales_stats.d90,
-        sales180: sales_stats.d180,
-        lastOrderAt: sales_stats.lastOrderAt,
+        sales180: sales_stats.d180 ?? 0,
+        lastOrderAt,
         daysSinceLastOrder,
         comprehensiveSales: compSales,
         replenishReferenceDailySales: purchaseSuggestion.replenishReferenceDailySales,
@@ -1110,14 +1106,25 @@ router.get('/', async (req: Request, res: Response) => {
         profit_breakdown:     p.profitBreakdown ?? null,
         profitBreakdown:      p.profitBreakdown ?? null,
         comprehensive_sales: compSales,   // 实时计算，与 sales_stats 强耦合，永不陈旧
+        comprehensiveSales: compSales,
+        sales3: sales_stats.d3,
+        sales7: sales_stats.d7,
+        sales14: sales_stats.d14,
+        sales30: sales_stats.d30,
+        sales60: sales_stats.d60,
+        sales90: sales_stats.d90,
         sales_stats: salesStatsObj,
         salesStats: salesStatsObj,
         product_class: productClass,
         productClass,
+        classification_name: classificationName,
+        classificationName,
         classification_reason: classificationReason,
         classificationReason,
         classification_metrics: classificationMetrics,
         classificationMetrics,
+        risk_tags: riskTags,
+        riskTags,
         stock_status: stockStatusResult.stockStatus,
         stockStatus: stockStatusResult.stockStatus,
         stock_days: stockStatusResult.stockDays,

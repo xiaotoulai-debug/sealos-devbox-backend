@@ -140,7 +140,7 @@ export async function createInventorySnapshotsForShop(
 
   const rows = products.map((p) => {
     const sales = getSalesForProduct(salesStats.map, p.sku, p.vendorSku, p.pnk);
-    const comprehensiveSales = calculateComprehensiveSales(sales.d7, sales.d14, sales.d30);
+    const comprehensiveSales = calculateComprehensiveSales(sales, p.stock);
     const localProductId = productIdByStoreProductId.get(p.id);
     return {
       storeProductId: p.id,

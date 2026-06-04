@@ -9,12 +9,14 @@
 import { prisma } from '../lib/prisma';
 
 export interface SalesStats {
+  d3: number;
   d7: number;
   d14: number;
   d30: number;
+  d60: number;
   d90: number;
-  d180: number;
-  lastOrderAt: Date | null;
+  d180?: number;
+  lastOrderAt?: Date | string | null;
 }
 
 const CACHE_TTL_MS = 2 * 60 * 1000; // 2 分钟
@@ -37,18 +39,21 @@ function pnkKey(pnk: string): string {
 }
 
 function emptySalesStats(): SalesStats {
-  return { d7: 0, d14: 0, d30: 0, d90: 0, d180: 0, lastOrderAt: null };
+  return { d3: 0, d7: 0, d14: 0, d30: 0, d60: 0, d90: 0, d180: 0, lastOrderAt: null };
 }
 
 function mergeStats(target: SalesStats, source: SalesStats): SalesStats {
   return {
+    d3: target.d3 + source.d3,
     d7: target.d7 + source.d7,
     d14: target.d14 + source.d14,
     d30: target.d30 + source.d30,
+    d60: target.d60 + source.d60,
     d90: target.d90 + source.d90,
-    d180: target.d180 + source.d180,
+    d180: Number(target.d180 ?? 0) + Number(source.d180 ?? 0),
     lastOrderAt: [target.lastOrderAt, source.lastOrderAt]
-      .filter((d): d is Date => d instanceof Date)
+      .map((d) => d instanceof Date ? d : (d ? new Date(d) : null))
+      .filter((d): d is Date => d instanceof Date && !Number.isNaN(d.getTime()))
       .sort((a, b) => b.getTime() - a.getTime())[0] ?? null,
   };
 }
@@ -88,12 +93,16 @@ export async function getSalesStatsByShop(shopId: number, forceRefresh = false):
  */
 async function aggregateSalesForShop(shopId: number): Promise<{ map: Map<string, SalesStats>; skusWithSales: string[] }> { // shopId 用于通用诊断日志
   const now = new Date();
+  const d3 = new Date(now);
+  d3.setDate(d3.getDate() - 3);
   const d7 = new Date(now);
   d7.setDate(d7.getDate() - 7);
   const d14 = new Date(now);
   d14.setDate(d14.getDate() - 14);
   const d30 = new Date(now);
   d30.setDate(d30.getDate() - 30);
+  const d60 = new Date(now);
+  d60.setDate(d60.getDate() - 60);
   const d90 = new Date(now);
   d90.setDate(d90.getDate() - 90);
   const d180 = new Date(now);
@@ -107,18 +116,22 @@ async function aggregateSalesForShop(shopId: number): Promise<{ map: Map<string,
   const rows = await prisma.$queryRawUnsafe<Array<{
     sku: string | null;
     pnk: string | null;
+    d3: string | number;
     d7: string | number;
     d14: string | number;
     d30: string | number;
+    d60: string | number;
     d90: string | number;
     d180: string | number;
     last_order_at: Date | string | null;
   }>>(
     `SELECT ${skuExpr} as sku,
             ${pnkExpr} as pnk,
+            SUM(CASE WHEN order_time >= '${d3.toISOString().slice(0, 10)}' THEN ${qtyExpr} ELSE 0 END) as d3,
             SUM(CASE WHEN order_time >= '${d7.toISOString().slice(0, 10)}' THEN ${qtyExpr} ELSE 0 END) as d7,
             SUM(CASE WHEN order_time >= '${d14.toISOString().slice(0, 10)}' THEN ${qtyExpr} ELSE 0 END) as d14,
             SUM(CASE WHEN order_time >= '${d30.toISOString().slice(0, 10)}' THEN ${qtyExpr} ELSE 0 END) as d30,
+            SUM(CASE WHEN order_time >= '${d60.toISOString().slice(0, 10)}' THEN ${qtyExpr} ELSE 0 END) as d60,
             SUM(CASE WHEN order_time >= '${d90.toISOString().slice(0, 10)}' THEN ${qtyExpr} ELSE 0 END) as d90,
             SUM(${qtyExpr}) as d180,
             MAX(order_time) as last_order_at
@@ -136,9 +149,11 @@ async function aggregateSalesForShop(shopId: number): Promise<{ map: Map<string,
 
   for (const row of rows) {
     const stats: SalesStats = {
+      d3: Number(row.d3) || 0,
       d7: Number(row.d7) || 0,
       d14: Number(row.d14) || 0,
       d30: Number(row.d30) || 0,
+      d60: Number(row.d60) || 0,
       d90: Number(row.d90) || 0,
       d180: Number(row.d180) || 0,
       lastOrderAt: row.last_order_at ? new Date(row.last_order_at) : null,
@@ -153,7 +168,7 @@ async function aggregateSalesForShop(shopId: number): Promise<{ map: Map<string,
   const skusWithSales = [...skuStats.keys()];
   const topSample = skusWithSales.slice(0, 3);
   if (topSample.length > 0) {
-    console.log(`[Sales shopId=${shopId}] 30天 Top3 SKU: ${topSample.map(k => `${k}(d30=${skuStats.get(k)?.d30 ?? 0},d180=${skuStats.get(k)?.d180 ?? 0})`).join(', ')}`);
+    console.log(`[Sales shopId=${shopId}] 30天 Top3 SKU: ${topSample.map(k => `${k}(d30=${skuStats.get(k)?.d30 ?? 0},d60=${skuStats.get(k)?.d60 ?? 0},d90=${skuStats.get(k)?.d90 ?? 0})`).join(', ')}`);
   } else {
     console.log(`[Sales shopId=${shopId}] 30天内无有效订单销量`);
   }
@@ -182,7 +197,7 @@ export function getSalesForProduct(
       stats = mergeStats(stats, s);
     }
   }
-  if (stats.d180 > 0 || stats.lastOrderAt) return stats;
+  if (Number(stats.d180 ?? 0) > 0 || stats.lastOrderAt) return stats;
 
   const normalizedPnk = normalizePnk(pnk);
   if (normalizedPnk) {

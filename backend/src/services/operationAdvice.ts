@@ -36,6 +36,7 @@ export type BuildOperationAdviceInput = {
   sales7: number;
   sales14: number;
   sales30: number;
+  sales60?: number;
   sales90: number;
   sales180: number;
   lastOrderAt: Date | null;
@@ -75,6 +76,7 @@ function buildMetrics(input: BuildOperationAdviceInput): Record<string, unknown>
     sales7: input.sales7,
     sales14: input.sales14,
     sales30: input.sales30,
+    sales60: input.sales60 ?? null,
     sales90: input.sales90,
     sales180: input.sales180,
     lastOrderAt: input.lastOrderAt ? input.lastOrderAt.toISOString() : null,
@@ -100,7 +102,7 @@ function withProfitDataTag(input: BuildOperationAdviceInput, tags: string[]): st
 }
 
 function isWeakSalesClass(productClass: ProductClass): boolean {
-  return productClass === 'DEAD' || productClass === 'TO_BE_ELIMINATED';
+  return productClass === 'CLEARANCE';
 }
 
 function isSalesClass(productClass: ProductClass): boolean {
@@ -125,7 +127,6 @@ export function buildOperationAdvice(input: BuildOperationAdviceInput): Operatio
     suggestAmount,
     estimatedProfit,
     profitMarginPct,
-    daysSinceSynced,
   } = input;
 
   const hasReplenishDemand = stock === 0 && replenishReferenceDailySales > 0;
@@ -247,8 +248,7 @@ export function buildOperationAdvice(input: BuildOperationAdviceInput): Operatio
   if (
     stock > 0 &&
     sales30 === 0 &&
-    daysSinceSynced > 30 &&
-    (productClass === 'DEAD' || productClass === 'NORMAL')
+    (productClass === 'CLEARANCE' || productClass === 'NORMAL')
   ) {
     return {
       priority: 'P2',
@@ -282,8 +282,7 @@ export function buildOperationAdvice(input: BuildOperationAdviceInput): Operatio
     profitMarginPct >= OPERATION_ADVICE_RULES.goodProfitMarginPct &&
     stock > 0 &&
     sales30 === 0 &&
-    daysSinceSynced > 30 &&
-    productClass !== 'NEW'
+    productClass !== 'HOT'
   ) {
     return {
       priority: 'P2',

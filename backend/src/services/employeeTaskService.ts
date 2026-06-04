@@ -62,7 +62,7 @@ const DAILY_REPORT_TASK_TYPES = [
 const DAILY_REPORT_TASK_NAMES: Record<(typeof DAILY_REPORT_TASK_TYPES)[number], string> = {
   PRODUCT_SELECTION: '选品数量',
   PRODUCT_LISTING: '上新数量',
-  APPROVED_COUNT: '通过数量',
+  APPROVED_COUNT: '合规数量',
   SHIPMENT_COUNT: '发货数量',
   OTHER: '其他说明',
 };
@@ -752,7 +752,7 @@ export async function getEmployeeTaskWeeklySummary(user: JwtPayload, params: { w
     createdTaskSummary,
   });
   const summaryText = {
-    dailyReport: `上周共提交日报 ${dailyReportSummary.submittedDays} 天，缺失 ${dailyReportSummary.missingDays} 天；累计选品 ${dailyReportSummary.productSelectionCount} 个，上新 ${dailyReportSummary.productListingCount} 个，通过 ${dailyReportSummary.approvedCount} 个，发货 ${dailyReportSummary.shipmentCount} 个。`,
+    dailyReport: `上周共提交日报 ${dailyReportSummary.submittedDays} 天，缺失 ${dailyReportSummary.missingDays} 天；累计选品 ${dailyReportSummary.productSelectionCount} 个，上新 ${dailyReportSummary.productListingCount} 个，合规 ${dailyReportSummary.approvedCount} 个，发货 ${dailyReportSummary.shipmentCount} 个。`,
     receivedTasks: `上周收到任务 ${receivedTaskSummary.totalCount} 个，完成 ${receivedTaskSummary.doneCount} 个，未完成 ${receivedTaskSummary.pendingCount} 个，逾期 ${receivedTaskSummary.overdueCount} 个。`,
     createdTasks: `上周发起任务 ${createdTaskSummary.totalCount} 个，已完成 ${createdTaskSummary.doneCount} 个，待跟进 ${createdTaskSummary.pendingCount} 个，逾期 ${createdTaskSummary.overdueCount} 个。`,
     nextWeekPlan: planSuggestions.join(' '),

@@ -253,8 +253,8 @@ graph TD
 
 | 字段 | 所在表 | 说明 |
 |------|--------|------|
-| `sales_7d` / `sales_14d` / `sales_30d` | `store_products` | 近 7/14/30 天的订单实销量，由 `salesStats.ts` 聚合写入 |
-| `comprehensive_sales` | `store_products` | 综合日销 = `(sales7d/7×0.3) + (sales14d/14×0.3) + (sales30d/30×0.4)`，保留两位小数 |
+| `sales_7d` / `sales_14d` / `sales_30d` | `store_products` | 近 7/14/30 天的兼容销量字段；平台产品接口仍返回 `sales7/sales14/sales30`，前端表格继续只展示 7/14/30 天销量 |
+| `comprehensive_sales` | `store_products` | 综合日销缓存字段；前台展示、卡片统计和筛选优先使用实时 `calculateComprehensiveSales(salesStats, stock)`，落库字段仅作排序、历史兼容和后台诊断缓存 |
 
 ### 4.2 销量聚合管线 (`salesStats.ts`)
 
@@ -265,25 +265,43 @@ aggregateSalesForShop(shopId)
   └── 从 platform_orders 聚合订单销量
         WHERE shop_id = shopId          ← 动态传入，覆盖所有站点
         AND   status IN (有效状态集)     ← 通过 shopId 关联 region，查表动态匹配
-        AND   order_date >= NOW() - INTERVAL '30 days'
-  └── 按 vendor_sku（归一化后）GROUP BY，统计 d7/d14/d30 销量
-  └── 批量 UPDATE store_products SET sales_7d, sales_14d, sales_30d
-  └── 触发 comprehensive_sales 联动计算（见 4.3）
+        AND   order_date >= NOW() - INTERVAL '180 days'
+  └── 按 sku / ext_part_number / pnk 归一化匹配，统计 d3/d7/d14/d30/d60/d90/d180 与 lastOrderAt
+  └── GET /api/store-products 实时返回 d7/d14/d30 兼容字段；d3/d60/d90 仅供后端算法使用或调试返回
+  └── 触发 comprehensive_sales 与 productClass 兼容缓存刷新（见 4.3 / 4.5.2）
 ```
 
-**时区处理**：日期窗口（7/14/30天）使用 UTC 统一计算，不依赖店铺所在时区，避免多站点数据不一致。
+**时区处理**：日期窗口（3/7/14/30/60/90天）使用 UTC 统一计算，不依赖店铺所在时区，避免多站点数据不一致。
 
 **订单状态映射**：通过 `shop_authorizations.region` 查 `REGION_CONFIG` 字典，动态获取该站点的有效订单状态（如 RO=`Finalizat`、BG/HU 对应值），不在聚合函数内硬编码任何状态字符串。
 
 ### 4.3 综合日销计算与落库
 
-综合日销公式（固化在 `backfillComprehensiveSales` 与 Normalizer 双入口）：
+综合日销统一封装在 `productClassification.ts` 的 `calculateComprehensiveSales(salesStats, stock)`。任何列表展示、卡片统计、分类筛选、回填和库存快照都必须调用该函数，不允许散落手写公式：
 
 ```typescript
-const comprehensiveSales = parseFloat(
-  ((sales7d / 7) * 0.3 + (sales14d / 14) * 0.3 + (sales30d / 30) * 0.4).toFixed(2)
+const baseComprehensiveSales =
+  (d3 / 3) * 0.20 +
+  (d7 / 7) * 0.20 +
+  (d14 / 14) * 0.20 +
+  (d30 / 30) * 0.20 +
+  (d60 / 60) * 0.10 +
+  (d90 / 90) * 0.10;
+
+const stockoutProtectedSales =
+  stock <= 0 && (d60 > 0 || d90 > 0)
+    ? Math.max(d60 / 60, d90 / 90) * 0.7
+    : 0;
+
+const comprehensiveSales = Math.max(
+  baseComprehensiveSales,
+  stockoutProtectedSales,
 );
 ```
+
+**窗口用途**：`d3` 识别突然起量，`d7` 识别近期趋势，`d14` 识别短中期趋势，`d30` 表达当前稳定表现，`d60` 保护较长周期表现，`d90` 保护历史热销产品；`d180/lastOrderAt` 保留兼容历史逻辑，但不参与主公式。
+
+**断货保护**：只有 `stock <= 0` 且 `d60/d90` 有历史销量时触发，避免历史热销产品断货超过 30 天后综合日销直接归零。断货保护只抬高综合日销参考值，不把断货本身作为主分类。
 
 **触发时机（两处联动）**：
 1. **同步管线触发**：`syncCron.ts` 的 `runProductRadar`（每 2 小时）在 `backfillProductImages` 完成后，自动调用 `backfillComprehensiveSales()`，全站无差别回填。
@@ -328,18 +346,12 @@ suggestAmount = Math.max(
 );
 ```
 
-库存健康度标签 `inventoryTag` 采用四步漏斗，并对特定业务分类输出采购建议主文案：
+`purchaseSuggestion.inventoryTag` 与实时 `productClass` 保持一致，只输出 `HOT/POTENTIAL/NORMAL/CLEARANCE` 四类，并叠加库存状态输出采购建议主文案：
 
-1. `productClass === TO_BE_ELIMINATED` → `TO_BE_ELIMINATED`，主文案 `暂停补货`，原因提示人工确认是否继续采购或下架。
-2. `productClass === NEW` → 按新品库存状态输出：平台无货且有在途为 `新品待到货`；平台有货为 `新品观察`；平台无货且无在途为 `待采购确认`。
-3. `productClass === DEAD` → 按滞销库存输出：平台库存 `>= 10` 为 `清仓处理`；平台库存 `< 10` 或无库存为 `停止补货`。
-4. `productClass === NORMAL` → 按库存状态输出温和建议：低库存 `少量补货`、预警 `观察补货`、库存充足 `暂不补货`、库存偏多 `暂停补货`、无货有在途 `等待到货`、无货无在途 `待确认补货`。
-5. `productClass in (HOT, POTENTIAL) && platformStock === 0` → 按平台缺货采购建议输出：无在途为 `立即补货`；有在途时根据 `inTransitStock / max(comprehensiveSales, sales30 / 30)` 是否覆盖 30 天，输出 `等待到货` 或 `仍需补货`。
-6. `productClass in (HOT, POTENTIAL) && platformStock > 0 && stockStatus in (LOW_STOCK, WARNING)` → 按低库存预警输出：热销低库存 `紧急补货`、热销预警 `建议补货`、潜力低库存 `小批量补货`、潜力预警 `观察备货`。
-7. `syncedAt` 距当前时间 `<= 30` 天 → `NEW`（ERP 新同步入库保护期）。
-8. `comprehensiveSales === 0 && (platformStock + localStock) > 0` → `DEAD`。
-9. `comprehensiveSales > 0` 且 `(platformStock + localStock) / comprehensiveSales < 15` → `HOT`。
-10. 其他 → `NORMAL`。
+1. `productClass === CLEARANCE`：有库存压力时 `清仓处理`，少量库存时 `停止补货`。
+2. `productClass === NORMAL`：按库存状态输出温和建议：低库存 `少量补货`、预警 `观察补货`、库存充足 `暂不补货`、库存偏多 `暂停补货`、无货有在途 `等待到货`、无货无在途 `待确认补货`。
+3. `productClass in (HOT, POTENTIAL) && platformStock === 0`：按平台缺货采购建议输出：无在途为 `立即补货`；有在途时根据 `inTransitStock / max(comprehensiveSales, sales30 / 30)` 是否覆盖 30 天，输出 `等待到货` 或 `仍需补货`。
+4. `productClass in (HOT, POTENTIAL) && platformStock > 0 && stockStatus in (LOW_STOCK, WARNING)`：按低库存预警输出：主推低库存 `紧急补货`、主推预警 `建议补货`、成长低库存 `小批量补货`、成长预警 `观察备货`。
 
 DTO 字段：
 
@@ -353,9 +365,7 @@ purchaseSuggestion: {
   planningStock,
   suggestAmount,
   inventoryTag,
-  text?,   // TO_BE_ELIMINATED 时为“暂停补货”
-           // NEW 时为“新品待到货/新品观察/待采购确认”
-           // DEAD 时为“清仓处理/停止补货”
+  text?,   // CLEARANCE 时为“清仓处理/停止补货”
            // NORMAL 时为“少量补货/观察补货/暂不补货/暂停补货/等待到货/待确认补货”
            // HOT/POTENTIAL 平台缺货时为“立即补货/等待到货/仍需补货”
            // HOT/POTENTIAL 平台低库存时为“紧急补货/建议补货/小批量补货/观察备货”
@@ -380,7 +390,7 @@ purchaseSuggestion: {
 ```typescript
 suggestAmount = Math.max(
   0,
-  Math.floor(comprehensiveSales * 60)
+  Math.ceil(replenishReferenceDailySales * 60)
     - platformStock
     - platformInTransit
     - localStock
@@ -395,42 +405,34 @@ suggestAmount = Math.max(
 OR: [{ shopId: currentShopId }, { shopId: null }]
 ```
 
-**库存健康度四步漏斗（严格顺序）**：
+**库存健康度标签**：库存健康风险由 `stockStatus` 与 `riskTags` 表达，不再把 `NEW/DEAD/OUT_OF_STOCK_WATCH` 作为主分类。新品判断需要真实 `firstSeenAt` 后再扩展，严禁使用 `syncedAt` 强判新品。
 
-1. **新品豁免**：`syncedAt` 距当前时间不足或等于 30 天，标记 `NEW`。因当前无平台真实上架时间，历史老数据首次接入时会获得 30 天 ERP 同步保护期。
-2. **滞销警报**：过保护期后，`comprehensiveSales === 0` 且 `(platformStock + localStock) > 0`，标记 `DEAD`。
-3. **热销/断货预警**：有日销且 `(platformStock + localStock) / comprehensiveSales < 15`，标记 `HOT`。
-4. **正常周转**：其他情况标记 `NORMAL`。
+### 4.5.2 平台产品业务分类 productClass（2026-06-04，统一实时口径）
 
-### 4.5.2 平台产品业务分类 productClass（2026-05-29，一阶段）
+`productClass` 是面向运营筛选的主分类。前台列表展示、分类卡片统计、`store-overview.productStructure`、`productClass` 筛选、运营建议和采购建议全部优先使用 `classifyStoreProduct(product, salesStats)` 实时计算结果，确保卡片数量与点击后的列表 total 同口径。
 
-`productClass` 是面向运营筛选的业务分类，和 `purchaseSuggestion.inventoryTag` 分离：前者用于平台产品分类筛选，后者用于库存健康/采购建议。第一阶段不使用毛利字段，也不伪造 90 天有货天数。
+**落库字段兼容**：`store_products.product_class`、`classification_reason`、`classification_metrics`、`classified_at` 继续保留，不删除、不新增 migration、不修改 Prisma schema。`backfillComprehensiveSales()` 与手动重算接口会刷新这些缓存字段，但前台最终口径不直接依赖旧落库值。
 
-**落库字段**：`store_products.product_class`、`classification_reason`、`classification_metrics`、`classified_at`。索引：`shop_id + product_class`，以及 `shop_id + product_class + comprehensive_sales DESC`。
-
-**合法值**：`HOT`（热销款）、`POTENTIAL`（潜力款）、`NORMAL`（普通款）、`DEAD`（滞销款）、`OUT_OF_STOCK_WATCH`（断货观察款）、`NEW`（新品）、`TO_BE_ELIMINATED`（待淘汰款）。`OUT_OF_STOCK_WATCH` 用于保护当前平台缺货但历史有销量的产品，避免误判为滞销或待淘汰；实时库存缺货状态仍由独立 `stockStatus` 表达。
+**合法主分类**：`HOT`（主推款）、`POTENTIAL`（成长款）、`NORMAL`（常规款）、`CLEARANCE`（清理款）。断货、低库存、无销量等只作为 `riskTags` 风险标签，不作为主分类；旧查询别名 `DEAD/TO_BE_ELIMINATED` 可兼容映射到 `CLEARANCE`，`NEW/OUT_OF_STOCK_WATCH` 可兼容映射到 `NORMAL`，但不会作为主分类输出。
 
 **严格优先级**：
 
-1. `NEW`：满足其一即归类新品：
-   - `daysSinceSynced <= 30 && sales30 === 0`，原因文案必须说明这是基于 ERP 首次同步时间的弱判断，不是 eMAG 真实上架时间。
-   - `sales7 === 0 && sales14 === 0 && sales30 === 0 && comprehensiveSales < 0.05 && stock === 0 && inTransitStock > 0`，表示平台暂无库存但存在 FBE 在途，尚未真正开始售卖，归为新品待到货。
-2. `OUT_OF_STOCK_WATCH`：`stock === 0 && (sales90 > 0 || (sales180 >= 3 && daysSinceLastOrder <= 120))`，表示当前平台缺货但历史有销量，先进入断货观察保护，暂不误判为滞销或待淘汰。
-3. `HOT`：`comprehensiveSales >= 1 || sales30 >= 30 || sales7 >= 7`。
-4. `POTENTIAL`：`comprehensiveSales >= 0.2 || sales30 >= 5 || sales7 >= 2`。
-5. `DEAD`：`stock > 0 && daysSinceSynced > 30 && sales30 === 0 && comprehensiveSales < 0.05`，原因文案必须说明第一阶段没有 90 天有货天数，仅为弱滞销。
-6. `TO_BE_ELIMINATED`：`sales7 === 0 && sales14 === 0 && sales30 === 0 && sales180 === 0 && comprehensiveSales < 0.05 && stock === 0 && inTransitStock === 0 && daysSinceSynced > 30`，表示无近期/历史销量、无平台库存、无在途补货动作，建议人工确认是否继续采购或下架。
-7. `NORMAL`：兜底分类。
+1. `HOT`：满足其一即主推款：`comprehensiveSales >= 0.8`、`d30 >= 15`、或 `stock <= 0 && (d60 >= 20 || d90 >= 30)`。第三条用于历史明显热销但当前断货的保供识别，断货本身仍只进入风险标签。
+2. `POTENTIAL`：不属于 HOT，且满足 `d3 > 0 || d7 > 0 || d14 > 0`，或 `comprehensiveSales >= 0.15`。
+3. `CLEARANCE`：不属于 HOT/POTENTIAL，且满足 `stock > 0 && d30 === 0 && d60 === 0 && d90 === 0`，或 `stock > 0 && comprehensiveSales < 0.03`。
+4. `NORMAL`：未命中以上规则，归为常规款。
+
+**风险标签 `riskTags`**：`getProductRiskTags(product, salesStats)` 输出可叠加标签，包括 `断货`、`低库存`、`库存偏多`、`无销量`、`未关联SKU`、`无图片`、`负毛利`。典型规则：`stock <= 0 && (d30 > 0 || d60 > 0 || d90 > 0)` 标记断货；`stock / comprehensiveSales <= 7` 标记低库存；`stock / comprehensiveSales >= 60` 标记库存偏多；`d30/d60/d90` 全为 0 标记无销量。
 
 **计算入口**：`src/services/productClassification.ts` 提供 `classifyStoreProduct()` 纯函数、`recalcProductClassForShop()` 和 `recalcProductClassForAllShops()`。脚本 `npm run ops:recalc-product-class` 默认 dry-run；追加 `-- --fix` 写库；支持 `-- --shopId=1 --fix` 单店重算。
 
-**API**：`GET /api/store-products?productClass=HOT|POTENTIAL|NORMAL|DEAD|OUT_OF_STOCK_WATCH|NEW|TO_BE_ELIMINATED|all`。不传或 `all` 不过滤，非法值返回 400。筛选在 Prisma `where` 层执行，`count` 与 `findMany` 复用同一条件，保证分页 total 准确。DTO 新增 `product_class/productClass`、`classification_reason/classificationReason`、`classification_metrics/classificationMetrics`。列表接口同时支持计算型筛选 `stockStatus=OUT_OF_STOCK|LOW_STOCK|WARNING|SAFE|OVERSTOCK` 与 `purchaseAction=REPLENISH_NOW|URGENT_REPLENISH|STILL_NEED_REPLENISH|WAIT_FOR_ARRIVAL|CLEARANCE|SAFE|UNKNOWN`；后端先按全店批量计算匹配的 `StoreProduct.id`，再写入 Prisma `where.id in (...)`，严禁分页后过滤，确保 `total` 与分页准确，并可与 `productClass/mappingStatus/search` 按 AND 组合。
+**API**：`GET /api/store-products?productClass=HOT|POTENTIAL|NORMAL|CLEARANCE|all`。不传或 `all` 不过滤，非法值返回 400。筛选先按 `shopId/mappingStatus/search` 得到候选范围，再批量计算实时分类匹配的 `StoreProduct.id`，最后写入 Prisma `where.id in (...)` 做 `count/findMany`，严禁分页后过滤。DTO 保留 `d7/d14/d30/sales7/sales14/sales30/comprehensiveSales/comprehensive_sales/productClass/classificationName/classificationReason`，可新增 `d3/d60/d90/riskTags`，但前端表格仍只展示 7/14/30 天销量。
 
-**分类统计 API**：`GET /api/store-products/classification-summary?shopId=5` 返回固定字段 `{ total, HOT, POTENTIAL, NORMAL, DEAD, OUT_OF_STOCK_WATCH, NEW, TO_BE_ELIMINATED }`，用于前端分类下拉框数量展示。统计基于 `store_products.product_class` 并按 `shopId`、`is_archived=false` 过滤；`null` 或未知分类归入 `NORMAL`。接口预留并支持 `mappingStatus/search`，采用与列表接口一致的 where 口径；底层使用 Prisma `groupBy`，不做分页后循环统计。
+**分类统计 API**：`GET /api/store-products/classification-summary?shopId=5` 返回固定字段 `{ total, HOT, POTENTIAL, NORMAL, CLEARANCE }`。统计不再直接 `groupBy store_products.product_class`，而是在与列表一致的候选范围内逐品调用实时分类函数，确保卡片数量与点击分类后的列表 total 一致。
 
-**店铺结构概览 API**：`GET /api/store-products/store-overview?shopId=5` 返回 `{ productStructure, stockRisk, purchaseActions, generatedAt }`，用于平台产品页第一阶段概览卡片。`productStructure` 复用分类统计口径，按 `shopId` 与 `is_archived=false` 过滤，`null` 或未知 `productClass` 归入 `NORMAL`；`stockRisk` 复用 `calculateStockStatus()`，基于实时 `salesStats` 计算 `comprehensiveSales` 与 `referenceDailySales` 后归入 `OUT_OF_STOCK/LOW_STOCK/WARNING/SAFE/OVERSTOCK`；`purchaseActions` 复用后端采购建议 helper 生成单品 `purchaseSuggestion`，再映射为 `REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/WAIT_FOR_ARRIVAL/CLEARANCE/SAFE/UNKNOWN`。第一版不新增数据库字段、不做 `operationAdvice`，全店计算使用批量查询本地库存、FBE 在途、采购在途和计划中数量，避免逐品 N+1；后续如访问频率升高，可在 service 入口按 `shopId` 增加 1-5 分钟 TTL 缓存。
+**店铺结构概览 API**：`GET /api/store-products/store-overview?shopId=5` 返回 `{ productStructure, stockRisk, purchaseActions, generatedAt }`。`productStructure` 与 `classification-summary` 共用实时分类函数；`stockRisk` 复用 `calculateStockStatus()`，基于实时 `salesStats` 计算 `comprehensiveSales` 与 `referenceDailySales` 后归入 `OUT_OF_STOCK/LOW_STOCK/WARNING/SAFE/OVERSTOCK`；`purchaseActions` 复用后端采购建议 helper。全店计算使用批量查询本地库存、FBE 在途、采购在途和计划中数量，避免逐品 N+1。
 
-**运营动作建议 operationAdvice（实时 DTO，不落库）**：`GET /api/store-products` 每行返回双命名 `operationAdvice/operation_advice`，用于回答“运营接下来做什么”，与 `purchaseSuggestion` 的供应链采购动作分离。第一阶段由 `src/services/operationAdvice.ts` 的规则引擎实时生成，不新增数据库字段、不做筛选/统计、不接 AI。动作集合：`REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/RAISE_PRICE/LOWER_PRICE/JOIN_CAMPAIGN/ADVERTISE/CLEARANCE/PAUSE_PURCHASE/WAIT_FOR_ARRIVAL/OBSERVE`；优先级：`P0/P1/P2/P3`。断货补货规则优先于普通调价、广告、活动和观察兜底：`stock=0 && replenishReferenceDailySales>0 && coverageStock<=0` 返回立即/紧急补货，`coverageStock<targetStock` 返回仍需补货，`coverageStock>=targetStock` 返回等待到货；`OUT_OF_STOCK_WATCH` 且有补货参考日销时不得误判为 `OBSERVE`。其他规则按顺序短路：负毛利动销异常、清仓处理、暂停采购、等待到货、建议涨价、建议降价、加广告、参加活动、观察即可。阈值集中配置为 `lowProfitMarginPct=15`、`goodProfitMarginPct=25`、`lowStockDays=30`、`warningStockDays=60`、`overstockDays=120`、`clearanceStockThreshold=10`；`profitMarginPct` 单位是百分数（`15` 表示 15%）。因当前缺少竞品价格、价格历史、广告 ROI、曝光点击转化数据，涨价/降价/广告/活动文案必须表达为“可考虑/测试”，不能作为强结论。
+**运营动作建议 operationAdvice（实时 DTO，不落库）**：`GET /api/store-products` 每行返回双命名 `operationAdvice/operation_advice`，用于回答“运营接下来做什么”，与 `purchaseSuggestion` 的供应链采购动作分离。规则引擎实时使用四类主分类与风险标签含义：主推款优先保供、补货和广告；成长款观察趋势并适度加广告；常规款正常维护；清理款降价、清仓或停止采购。动作集合：`REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/RAISE_PRICE/LOWER_PRICE/JOIN_CAMPAIGN/ADVERTISE/CLEARANCE/PAUSE_PURCHASE/WAIT_FOR_ARRIVAL/OBSERVE`；优先级：`P0/P1/P2/P3`。断货补货规则优先于普通调价、广告、活动和观察兜底：`stock=0 && replenishReferenceDailySales>0 && coverageStock<=0` 返回立即/紧急补货，`coverageStock<targetStock` 返回仍需补货，`coverageStock>=targetStock` 返回等待到货。其他规则按顺序短路：负毛利动销异常、清仓处理、暂停采购、等待到货、建议涨价、建议降价、加广告、参加活动、观察即可。阈值集中配置为 `lowProfitMarginPct=15`、`goodProfitMarginPct=25`、`lowStockDays=30`、`warningStockDays=60`、`overstockDays=120`、`clearanceStockThreshold=10`；`profitMarginPct` 单位是百分数（`15` 表示 15%）。因当前缺少竞品价格、价格历史、广告 ROI、曝光点击转化数据，涨价/降价/广告/活动文案必须表达为“可考虑/测试”，不能作为强结论。
 
 **补货参考日销**：`purchaseSuggestion` 与 `operationAdvice` 统一使用 `replenishReferenceDailySales = max(comprehensiveSales, sales30/30, sales90/90, sales180/180)`。该指标只用于采购建议和运营建议，不改变 `productClass` 分类；`targetStock = ceil(replenishReferenceDailySales * 60)`，`coverageStock = platformStock + platformInTransit + localStock + purchasingInTransit + planningStock`，`suggestAmount = max(0, targetStock - coverageStock)`。当平台库存为 0 且历史/近期有销量时，即使近 7/14/30 综合日销因断货归零，也能基于 90/180 天历史销量给出补货、仍需补货或等待到货建议。
 
@@ -461,7 +463,7 @@ DTO 输出双命名：`stockStatus/stock_status`、`stockDays/stock_days`、`ref
 - `platform_stock`：`StoreProduct.stock`，eMAG 当前平台库存。
 - `in_transit_stock`：当前店铺 `FbeShipment.status=SHIPPED` 的在途数量，按本地 `Product.id` 聚合。
 - `sales_7 / sales_14 / sales_30`：复用 `salesStats.ts` 从 `platform_orders.products_json` 聚合出的销量。
-- `comprehensive_sales`：同综合日销公式 `(d7/7*0.3)+(d14/14*0.3)+(d30/30*0.4)`。
+- `comprehensive_sales`：复用 `calculateComprehensiveSales(salesStats, stock)`，与平台产品列表、分类统计和回填口径一致。
 
 **脚本**：
 
@@ -574,7 +576,7 @@ graph TD
 
 **API**：新日报接口为 `GET /api/operation-daily/my-report?date=YYYY-MM-DD`、`POST /api/operation-daily/reports`、`PUT /api/operation-daily/reports/:reportId`、`GET /api/operation-daily/users/:userId/report?date=YYYY-MM-DD`。首页新版月度接口为 `GET /api/operation-daily/monthly-overview?month=YYYY-MM`，返回顶部 KPI、昨日未登记名单、本月积分榜 Top 5 和员工任务热力图。旧接口 `POST /api/operation-daily/logs`、`GET /api/operation-daily/my-today`、`GET /api/operation-daily/my-logs`、`GET /api/operation-daily/users/:userId/logs` 暂时保留，避免前端未切换时报错。`POST /reports` 和 `PUT /reports/:reportId` 均在 Prisma transaction 内整体写入 5 条固定明细，缺失事项自动补 0。
 
-**权限与统计口径**：所有接口必须登录；`dashboard`、`monthly-overview` 是公开看板，所有已登录用户均可查看，但登记对象和团队统计对象只包含运营专员。运营专员判断复用当前登录态/角色数据，兼容 `roleName/roleCode/role/roles/permissions` 中的 `运营专员/operation/operations/operator/OPERATION_SPECIALIST/operations_specialist`，不把超级管理员或仓库专员默认计入运营。非运营岗位提交 `POST /reports`、`PUT /reports/:reportId` 或旧 `POST /logs` 返回 403；运营专员只能提交、查看、修改自己的日报，提交后仅允许修改一次，`edit_count >= 1` 时再次修改返回 400。管理员/老板可看 dashboard、monthly-overview、任意员工 report/logs，但 Phase 1 不开放管理员修改别人日报，避免审计风险。管理员判断兼容 `roleName` 含 `admin/超级管理员`，或 permissions 含 `* / ALL / ADMIN_FULL / VIEW_OPERATION_DASHBOARD / MANAGE_OPERATION_LOGS`。新版月度总览只统计新 5 类：`PRODUCT_SELECTION` 选品数量、`PRODUCT_LISTING` 上新数量、`APPROVED_COUNT` 通过数量、`SHIPMENT_COUNT` 发货数量、`OTHER` 其他说明；旧 `QUALIFICATION/ADJUSTMENT` 不自动映射为通过/发货，避免历史口径失真。昨日未登记名单、本月积分榜 Top 5、热力图员工行、dashboard 人员排名和趋势累计均基于运营专员 userId 集合过滤，非运营专员历史误提交日志不计入团队统计。积分预留使用临时规则 `PRODUCT_SELECTION=1`、`PRODUCT_LISTING=2`、`APPROVED_COUNT=2`、`SHIPMENT_COUNT=1`、`OTHER=0`。热力图按月份 `workDate` 范围查询 reports/logs 并补齐整月日期，未来日期标记 `isFuture=true`，OTHER 仅返回短摘要，完整内容由 report 详情接口查看。
+**权限与统计口径**：所有接口必须登录；`dashboard`、`monthly-overview` 是公开看板，所有已登录用户均可查看，但登记对象和团队统计对象只包含运营专员。运营专员判断复用当前登录态/角色数据，兼容 `roleName/roleCode/role/roles/permissions` 中的 `运营专员/operation/operations/operator/OPERATION_SPECIALIST/operations_specialist`，不把超级管理员或仓库专员默认计入运营。非运营岗位提交 `POST /reports`、`PUT /reports/:reportId` 或旧 `POST /logs` 返回 403；运营专员只能提交、查看、修改自己的日报，提交后仅允许修改一次，`edit_count >= 1` 时再次修改返回 400。管理员/老板可看 dashboard、monthly-overview、任意员工 report/logs，但 Phase 1 不开放管理员修改别人日报，避免审计风险。管理员判断兼容 `roleName` 含 `admin/超级管理员`，或 permissions 含 `* / ALL / ADMIN_FULL / VIEW_OPERATION_DASHBOARD / MANAGE_OPERATION_LOGS`。新版月度总览只统计新 5 类：`PRODUCT_SELECTION` 选品数量、`PRODUCT_LISTING` 上新数量、`APPROVED_COUNT` 合规数量、`SHIPMENT_COUNT` 发货数量、`OTHER` 其他说明；旧 `QUALIFICATION/ADJUSTMENT` 不自动映射为合规/发货，避免历史口径失真。昨日未登记名单、本月积分榜 Top 5、热力图员工行、dashboard 人员排名和趋势累计均基于运营专员 userId 集合过滤，非运营专员历史误提交日志不计入团队统计。积分预留使用临时规则 `PRODUCT_SELECTION=1`、`PRODUCT_LISTING=2`、`APPROVED_COUNT=2`、`SHIPMENT_COUNT=1`、`OTHER=0`。热力图按月份 `workDate` 范围查询 reports/logs 并补齐整月日期，未来日期标记 `isFuture=true`，OTHER 仅返回短摘要，完整内容由 report 详情接口查看。
 
 ### 4.10 员工任务中心（Phase 1）
 
