@@ -432,6 +432,49 @@ OR: [{ shopId: currentShopId }, { shopId: null }]
 
 **店铺结构概览 API**：`GET /api/store-products/store-overview?shopId=5` 返回 `{ productStructure, stockRisk, purchaseActions, generatedAt }`。`productStructure` 与 `classification-summary` 共用实时分类函数；`stockRisk` 复用 `calculateStockStatus()`，基于实时 `salesStats` 计算 `comprehensiveSales` 与 `referenceDailySales` 后归入 `OUT_OF_STOCK/LOW_STOCK/WARNING/SAFE/OVERSTOCK`；`purchaseActions` 复用后端采购建议 helper。全店计算使用批量查询本地库存、FBE 在途、采购在途和计划中数量，避免逐品 N+1。
 
+### 4.5.2.1 eMAG 店铺维度链接身份（自建/跟卖）
+
+平台产品列表返回 `linkType/linkTypeLabel/contentPermission/offerCompetitionType/linkActionTips`，用于展示“自建链接 / 跟卖链接 / 待确认”标签。该判断必须是店铺维度：同一个 `part_number_key` 在 A 店铺可能是 `SELF_BUILT`，在 C 店铺可能是 `RESELL`，后端只按当前 `shopId + pnk + ownership` 保存和返回，不做 PNK 级全局缓存。
+
+**禁止判断来源**：不能按品牌判断，`brand === SuooTci` 不代表当前店铺拥有资料维护权；不能按 PNK 是否存在判断，因为自建商品审核通过后也会拥有 PNK；不能用 `number_of_offers` 判断自建/跟卖，它只用于竞争状态。
+
+**字段来源与自动更新**：`product_offer/read` 中的 `ownership`、`number_of_offers`、`best_offer_sale_price`、`main_offer_price`、`buy_button_rank` 经 `emagProductNormalizer.ts` 解析后，在正常平台产品同步流程 `storeProductSync.ts` 中写入 `store_products` 的轻量派生字段。新增店铺首次同步产品、手动刷新平台产品、定时产品雷达同步都会自动重新计算 `linkType/contentPermission/offerCompetition/linkActionTips`；`backfill:emag-link-type` 只用于历史旧数据补齐，不是唯一入口。`emag_offer_meta` 只保存 compact meta，不保存完整 raw response，避免表膨胀。
+
+**ownership 兼容规则**：`true / "true" / 1 / "1"` 推断为 `SELF_BUILT`（自建链接、可维护资料）；`false / "false" / 2 / "2"` 推断为 `RESELL`（跟卖链接、仅报价）；缺失或无法识别时为 `UNKNOWN`。当前没有本地发布日志时，来源为 `OWNERSHIP`、可信度 `MEDIUM`；未来发布日志可作为 `PUBLISH_LOG`，可信度 `HIGH`；无法判断时为 `UNKNOWN/LOW`。
+
+**竞争状态**：`number_of_offers === 0` 返回 `NO_ACTIVE_COMPETITION`（暂无竞争）；`number_of_offers === 1` 返回 `EXCLUSIVE`（独家报价）；`number_of_offers > 1` 返回 `COMPETITIVE`（多卖家竞争）；缺失、空值或非数字返回 `UNKNOWN`（竞争未知）。`number_of_offers` 只用于竞争标签，不参与自建/跟卖判断。自建链接如果出现多卖家竞争，会返回 `['投诉卖家', '检查乱价', '维护品牌']`；跟卖链接多卖家竞争返回 `['关注购物车', '调整报价', '控制毛利']`；暂无竞争时按链接身份返回库存和资料维护类提醒。
+
+**历史回填脚本**：
+
+```bash
+npm run backfill:emag-link-type -- --shopId=12 --dryRun=true
+npm run backfill:emag-link-type -- --shopId=12 --dryRun=false
+npm run backfill:emag-link-type -- --fix
+```
+
+脚本按店铺分页调用 `product_offer/read`，逐条以当前 `shopId + pnk` 更新链接身份字段；dry-run 只输出样本和统计，不写库。历史旧店铺应先 dry-run 再按店铺回填，禁止未经确认直接全店铺大范围写入。
+
+### 4.5.2.2 eMAG 购物车状态（Buy Box）
+
+平台产品列表返回 `buyBoxStatus/buyBoxStatusLabel/buyBoxStatusSource/buyBoxStatusConfidence/buyBoxRank/buyBoxActionTips/buyBoxMeta`，用于展示“购物车已抢到 / 未抢购物车 / 无有效购物车 / 购物车未知 / 疑似抢到购物车 / 疑似未抢购物车”。该判断必须是店铺维度，只按当前 `shopId + product_offer/read` 返回的当前 offer 数据计算，不做 PNK、品牌或全局商品维度推断。
+
+**字段来源与自动更新**：`product_offer/read` 中的 `buy_button_rank`、`sale_price`、`best_offer_sale_price`、`main_offer_price`、`stock/general_stock`、`offer_validation_status`、`number_of_offers` 经 `emagProductNormalizer.ts` 解析后，在正常平台产品同步流程 `storeProductSync.ts` 中写入 `store_products` 的 Buy Box 轻量派生字段。新增店铺首次同步、手动刷新平台产品、定时产品雷达同步都会自动重新计算 Buy Box 状态；`backfill:buy-box` 只用于历史旧数据补齐。`buy_box_meta` 只保存 compact meta：`buyButtonRank/salePrice/bestOfferSalePrice/mainOfferPrice/stock/offerValidationStatus/numberOfOffers/checkedAt`，禁止保存完整 raw response。
+
+**高可信规则**：`stock <= 0`、商品状态不可售或 `offer_validation_status` 明确不可售时，返回 `NO_ACTIVE_BUYBOX`（无有效购物车）；`buy_button_rank === 1` 且 offer 可售、有库存时，返回 `WON`（购物车已抢到）；`buy_button_rank > 1` 且 offer 可售、有库存时，返回 `LOST`（未抢购物车）。这些状态来源为 `OFFER_STATE` 或 `BUY_BUTTON_RANK`，可信度为 `HIGH`。
+
+**低可信兜底**：当 `buy_button_rank` 缺失但 offer 可售且有库存时，`sale_price === best_offer_sale_price` 只可返回 `POSSIBLY_WON`（疑似抢到购物车）；`number_of_offers > 1` 且 `sale_price !== best_offer_sale_price` 只可返回 `POSSIBLY_LOST`（疑似未抢购物车）。价格兜底来源为 `PRICE_HEURISTIC`，可信度必须为 `LOW`，不能当作确定购物车归属。
+
+**禁止判断来源**：`number_of_offers` 不能判断是否抢到购物车，它只表示报价竞争数量；多卖家竞争不等于未抢购物车，独家报价也不等于一定抢到购物车；品牌、自建/跟卖身份、PNK 是否存在都不能判断购物车归属。缺少 `buy_button_rank` 且价格兜底不成立时返回 `UNKNOWN`（购物车未知），由运营人工核查或等待接口字段。
+
+**历史回填脚本**：
+
+```bash
+npm run backfill:buy-box -- --shopId=5 --dryRun=true
+npm run backfill:buy-box -- --shopId=5 --dryRun=false
+```
+
+脚本按店铺分页调用 `product_offer/read`，逐条以当前 `shopId + pnk` 更新 Buy Box 字段；dry-run 不写库，并输出 `WON/LOST/NO_ACTIVE_BUYBOX/POSSIBLY_WON/POSSIBLY_LOST/UNKNOWN` 统计。历史旧店铺应先 dry-run，再按店铺正式回填。
+
 **运营动作建议 operationAdvice（实时 DTO，不落库）**：`GET /api/store-products` 每行返回双命名 `operationAdvice/operation_advice`，用于回答“运营接下来做什么”，与 `purchaseSuggestion` 的供应链采购动作分离。规则引擎实时使用四类主分类与风险标签含义：主推款优先保供、补货和广告；成长款观察趋势并适度加广告；常规款正常维护；清理款降价、清仓或停止采购。动作集合：`REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/RAISE_PRICE/LOWER_PRICE/JOIN_CAMPAIGN/ADVERTISE/CLEARANCE/PAUSE_PURCHASE/WAIT_FOR_ARRIVAL/OBSERVE`；优先级：`P0/P1/P2/P3`。断货补货规则优先于普通调价、广告、活动和观察兜底：`stock=0 && replenishReferenceDailySales>0 && coverageStock<=0` 返回立即/紧急补货，`coverageStock<targetStock` 返回仍需补货，`coverageStock>=targetStock` 返回等待到货。其他规则按顺序短路：负毛利动销异常、清仓处理、暂停采购、等待到货、建议涨价、建议降价、加广告、参加活动、观察即可。阈值集中配置为 `lowProfitMarginPct=15`、`goodProfitMarginPct=25`、`lowStockDays=30`、`warningStockDays=60`、`overstockDays=120`、`clearanceStockThreshold=10`；`profitMarginPct` 单位是百分数（`15` 表示 15%）。因当前缺少竞品价格、价格历史、广告 ROI、曝光点击转化数据，涨价/降价/广告/活动文案必须表达为“可考虑/测试”，不能作为强结论。
 
 **补货参考日销**：`purchaseSuggestion` 与 `operationAdvice` 统一使用 `replenishReferenceDailySales = max(comprehensiveSales, sales30/30, sales90/90, sales180/180)`。该指标只用于采购建议和运营建议，不改变 `productClass` 分类；`targetStock = ceil(replenishReferenceDailySales * 60)`，`coverageStock = platformStock + platformInTransit + localStock + purchasingInTransit + planningStock`，`suggestAmount = max(0, targetStock - coverageStock)`。当平台库存为 0 且历史/近期有销量时，即使近 7/14/30 综合日销因断货归零，也能基于 90/180 天历史销量给出补货、仍需补货或等待到货建议。
@@ -447,6 +490,8 @@ OR: [{ shopId: currentShopId }, { shopId: null }]
 - `stockDays > 120` → `OVERSTOCK`。
 
 DTO 输出双命名：`stockStatus/stock_status`、`stockDays/stock_days`、`referenceDailySales/reference_daily_sales`。
+
+**平台产品列表库存分组筛选 stockGroup（查询参数，不落库）**：`GET /api/store-products` 支持 `stockGroup=ALL/STOCK_OK/REPLENISH_WARNING/OUT_OF_STOCK_REPLENISHED/OUT_OF_STOCK_NOT_REPLENISHED`，可与 `shopId/search/productClass/mappingStatus/buyBoxGroup/linkType/sort/page/pageSize` 组合。`ALL` 或非法值不筛选；`STOCK_OK` 匹配 `stockStatus in SAFE/OVERSTOCK`，前端统一显示为“库存充足”，不再突出“库存偏多”；`REPLENISH_WARNING` 匹配 `LOW_STOCK/WARNING`；`OUT_OF_STOCK_REPLENISHED` 匹配平台库存 `stock <= 0` 且当前店铺隔离后的 `inTransitQuantity > 0`；`OUT_OF_STOCK_NOT_REPLENISHED` 匹配平台库存 `stock <= 0` 且当前店铺在途量为空或 `<= 0`。该筛选复用实时库存状态和当前店铺 FBE 在途聚合，不用 `numberOfOffers`，不改变采购建议、四类产品分类或综合日销算法。
 
 ### 4.5.3 平台产品每日库存快照（2026-05-29，二阶段数据底座）
 

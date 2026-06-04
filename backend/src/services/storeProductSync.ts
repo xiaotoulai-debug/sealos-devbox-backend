@@ -14,6 +14,13 @@ import { readProductOffers, findDocumentationByEans, readProductsByPnk } from '.
 import { normalizeEmagProduct, slugifyProductName } from './emagProductNormalizer';
 import { getSalesForProduct, getSalesStatsByShop } from './salesStats';
 import { calculateComprehensiveSales, classifyStoreProduct } from './productClassification';
+import {
+  inferContentPermission,
+  inferEmagLinkType,
+  inferLinkActionTips,
+  inferOfferCompetition,
+} from './emagLinkType';
+import { inferBuyBoxStatus } from './emagBuyBox';
 
 // ★ 降级配置（2026-04-15）：eMAG RO product_offer/read 响应极慢（实测 156s），
 //   缩小单页大小 + 加大页间间隔，减轻单次请求的服务端处理压力。
@@ -175,6 +182,43 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
         if (eanImage && !np.mainImage) result.eanImagesRecovered!++;
 
         const skuForLog = np.sku ?? np.vendorSku ?? np.pnk;
+        const linkTypeResult = inferEmagLinkType({
+          shopId: creds.shopId,
+          pnk: np.pnk,
+          rawApiData: { ownership: np.ownership },
+          publishLog: null,
+        });
+        const contentPermission = inferContentPermission(linkTypeResult.linkType);
+        const offerCompetition = inferOfferCompetition({ numberOfOffers: np.numberOfOffers });
+        const linkActionTips = inferLinkActionTips(linkTypeResult.linkType, offerCompetition.offerCompetitionType);
+        const buyBoxResult = inferBuyBoxStatus({
+          buyButtonRank: np.buyButtonRank,
+          salePrice: np.salePrice,
+          bestOfferSalePrice: np.bestOfferSalePrice,
+          mainOfferPrice: np.mainOfferPrice,
+          stock: np.stock,
+          status: np.status,
+          offerValidationStatus: np.offerValidationStatus,
+          numberOfOffers: np.numberOfOffers,
+        });
+        const compactOfferMeta = {
+          ownership: np.ownership,
+          numberOfOffers: np.numberOfOffers,
+          bestOfferSalePrice: np.bestOfferSalePrice,
+          mainOfferPrice: np.mainOfferPrice,
+          buyButtonRank: np.buyButtonRank,
+          partNumberKey: np.pnk,
+        };
+        const buyBoxMeta = {
+          buyButtonRank: np.buyButtonRank,
+          salePrice: np.salePrice,
+          bestOfferSalePrice: np.bestOfferSalePrice,
+          mainOfferPrice: np.mainOfferPrice,
+          stock: np.stock,
+          offerValidationStatus: np.offerValidationStatus,
+          numberOfOffers: np.numberOfOffers,
+          checkedAt: new Date().toISOString(),
+        };
 
         if (firstFiveRaw.length < 5) {
           firstFiveRaw.push({
@@ -213,6 +257,24 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
           validationStatus: np.validationStatus,
           docErrors: np.docErrors ?? undefined,
           rejectionReason: np.rejectionReason,
+          emagLinkType: linkTypeResult.linkType,
+          emagLinkTypeSource: linkTypeResult.linkTypeSource,
+          emagLinkTypeConfidence: linkTypeResult.linkTypeConfidence,
+          emagOwnership: np.ownership === undefined ? Prisma.JsonNull : np.ownership as Prisma.InputJsonValue,
+          contentPermission: contentPermission.contentPermission,
+          numberOfOffers: offerCompetition.numberOfOffers,
+          offerCompetitionType: offerCompetition.offerCompetitionType,
+          buyButtonRank: np.buyButtonRank,
+          bestOfferSalePrice: np.bestOfferSalePrice,
+          mainOfferPrice: np.mainOfferPrice,
+          linkActionTips: linkActionTips as Prisma.InputJsonValue,
+          emagOfferMeta: compactOfferMeta as Prisma.InputJsonValue,
+          buyBoxStatus: buyBoxResult.buyBoxStatus,
+          buyBoxStatusSource: buyBoxResult.buyBoxStatusSource,
+          buyBoxStatusConfidence: buyBoxResult.buyBoxStatusConfidence,
+          buyBoxRank: buyBoxResult.buyBoxRank,
+          buyBoxActionTips: buyBoxResult.buyBoxActionTips as Prisma.InputJsonValue,
+          buyBoxMeta: buyBoxMeta as Prisma.InputJsonValue,
           isArchived: false,
         };
 

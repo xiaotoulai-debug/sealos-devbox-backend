@@ -310,6 +310,25 @@ model StoreProduct {
   classificationReason String?    @map("classification_reason")     // 分类原因说明，面向运营展示
   classificationMetrics Json?     @map("classification_metrics")    // 分类计算指标快照（不伪造 90 天有货数据）
   classifiedAt         DateTime?  @map("classified_at")             // 上次分类计算时间
+  // ── eMAG 店铺维度链接身份（shopId + PNK + ownership），不保存完整 raw response ──
+  emagLinkType           String?   @map("emag_link_type")            // SELF_BUILT / RESELL / UNKNOWN
+  emagLinkTypeSource     String?   @map("emag_link_type_source")     // PUBLISH_LOG / OWNERSHIP / MANUAL / UNKNOWN
+  emagLinkTypeConfidence String?   @map("emag_link_type_confidence") // HIGH / MEDIUM / LOW
+  emagOwnership          Json?     @map("emag_ownership")            // eMAG 原始 ownership，可能为 boolean/number/string/null
+  contentPermission      String?   @map("content_permission")        // EDITABLE / OFFER_ONLY / UNKNOWN
+  numberOfOffers         Int?      @map("number_of_offers")
+  offerCompetitionType   String?   @map("offer_competition_type")    // EXCLUSIVE / COMPETITIVE / UNKNOWN
+  buyButtonRank          Int?      @map("buy_button_rank")
+  bestOfferSalePrice     Decimal?  @map("best_offer_sale_price") @db.Decimal(10, 2)
+  mainOfferPrice         Decimal?  @map("main_offer_price") @db.Decimal(10, 2)
+  linkActionTips         Json?     @map("link_action_tips")          // 前端动作提醒数组
+  emagOfferMeta          Json?     @map("emag_offer_meta")           // compact meta: ownership/numberOfOffers/prices/rank/PNK
+  buyBoxStatus           String?   @map("buy_box_status")            // WON / LOST / UNKNOWN / NO_ACTIVE_BUYBOX / POSSIBLY_WON / POSSIBLY_LOST
+  buyBoxStatusSource     String?   @map("buy_box_status_source")     // BUY_BUTTON_RANK / PRICE_HEURISTIC / OFFER_STATE / UNKNOWN
+  buyBoxStatusConfidence String?   @map("buy_box_status_confidence") // HIGH / MEDIUM / LOW
+  buyBoxRank             Int?      @map("buy_box_rank")
+  buyBoxActionTips       Json?     @map("buy_box_action_tips")       // 购物车状态动作提醒数组
+  buyBoxMeta             Json?     @map("buy_box_meta")              // compact meta，不保存完整 raw response
   isArchived      Boolean  @default(false) @map("is_archived") // eMAG 变更 PNK/SKU 后保留审计用的归档标记；列表默认过滤
   syncedAt         DateTime @default(now()) @map("synced_at")
   shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)

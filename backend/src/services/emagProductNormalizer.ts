@@ -159,6 +159,12 @@ export interface NormalizedProduct {
   docErrors: string | null;
   rejectionReason: string | null;
   isRejected: boolean;
+  ownership: unknown | null;
+  numberOfOffers: number | null;
+  bestOfferSalePrice: number | null;
+  mainOfferPrice: number | null;
+  buyButtonRank: number | null;
+  offerValidationStatus: unknown | null;
 }
 
 // ─── 统一解析器 ───────────────────────────────────────────────────
@@ -294,6 +300,20 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
   const transVsArr = Array.isArray(transVsRaw) ? transVsRaw : transVsRaw ? [transVsRaw] : [];
   const offerVs = raw?.offer_validation_status;
   const offerVsArr = Array.isArray(offerVs) ? offerVs : offerVs ? [offerVs] : [];
+  const compactValidationStatus = (value: unknown): unknown | null => {
+    if (value == null || value === '') return null;
+    if (Array.isArray(value)) return value.map(compactValidationStatus).filter((item) => item != null);
+    if (typeof value === 'object') {
+      const obj = value as Record<string, unknown>;
+      return {
+        value: obj.value ?? null,
+        description: obj.description ?? null,
+        errors: Array.isArray(obj.errors) ? obj.errors : obj.errors ?? null,
+      };
+    }
+    return value;
+  };
+  const compactOfferValidationStatus = compactValidationStatus(offerVs);
 
   const extractMsg = (e: any): string => {
     if (typeof e === 'string') return e;
@@ -371,6 +391,19 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
   const name = rawName || fallbackText;
 
   const salePrice = Number(raw?.sale_price ?? raw?.salePrice ?? raw?.main_offer_price ?? 0);
+  const toNullableNumber = (...values: unknown[]): number | null => {
+    for (const value of values) {
+      if (value == null || value === '') continue;
+      const n = Number(value);
+      if (Number.isFinite(n)) return n;
+    }
+    return null;
+  };
+  const ownership = raw?.ownership ?? null;
+  const numberOfOffers = toNullableNumber(raw?.number_of_offers, raw?.numberOfOffers);
+  const bestOfferSalePrice = toNullableNumber(raw?.best_offer_sale_price, raw?.bestOfferSalePrice);
+  const mainOfferPrice = toNullableNumber(raw?.main_offer_price, raw?.mainOfferPrice);
+  const buyButtonRank = toNullableNumber(raw?.buy_button_rank, raw?.buyButtonRank);
   const skuDisplay = sku ?? vendorSku ?? pnk;
 
   if (options?.logOutput !== false) {
@@ -395,5 +428,11 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
     docErrors: isRejected ? mergedRejectionReason : null,
     rejectionReason: isRejected ? (mergedRejectionReason || vsDesc || '已驳回') : null,
     isRejected,
+    ownership,
+    numberOfOffers,
+    bestOfferSalePrice,
+    mainOfferPrice,
+    buyButtonRank,
+    offerValidationStatus: compactOfferValidationStatus,
   };
 }

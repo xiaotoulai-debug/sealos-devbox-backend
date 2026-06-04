@@ -24,10 +24,13 @@ import {
   getProductStructureSummary,
   getStoreProductOverview,
   isPurchaseActionFilter,
+  isStockGroupFilter,
   isStockStatusFilter,
   type PurchaseActionKey,
   PURCHASE_ACTION_FILTERS,
+  STOCK_GROUP_FILTERS,
   STOCK_STATUS_FILTERS,
+  type StockGroupKey,
 } from '../services/storeProductOverview';
 import {
   calculateComprehensiveSales,
@@ -39,6 +42,22 @@ import {
   recalcProductClassForShop,
   type StockStatus,
 } from '../services/productClassification';
+import {
+  inferContentPermission,
+  inferLinkActionTips,
+  inferOfferCompetition,
+  LINK_TYPE_LABELS,
+  OFFER_COMPETITION_LABELS,
+  type EmagLinkType,
+  type OfferCompetitionType,
+} from '../services/emagLinkType';
+import {
+  BUY_BOX_STATUS_LABELS,
+  inferBuyBoxStatus,
+  type BuyBoxStatus,
+  type BuyBoxStatusConfidence,
+  type BuyBoxStatusSource,
+} from '../services/emagBuyBox';
 
 const router = Router();
 router.use(authenticate);
@@ -49,6 +68,81 @@ function normalizeNullableDate(value: Date | string | null | undefined): Date | 
   if (!value) return null;
   const date = value instanceof Date ? value : new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function normalizeStoredLinkType(value: string | null | undefined): EmagLinkType {
+  return value === 'SELF_BUILT' || value === 'RESELL' || value === 'UNKNOWN' ? value : 'UNKNOWN';
+}
+
+function normalizeStoredCompetitionType(value: string | null | undefined): OfferCompetitionType {
+  return value === 'NO_ACTIVE_COMPETITION' || value === 'EXCLUSIVE' || value === 'COMPETITIVE' || value === 'UNKNOWN' ? value : 'UNKNOWN';
+}
+
+function normalizeStoredBuyBoxStatus(value: string | null | undefined): BuyBoxStatus {
+  return value === 'WON' ||
+    value === 'LOST' ||
+    value === 'UNKNOWN' ||
+    value === 'NO_ACTIVE_BUYBOX' ||
+    value === 'POSSIBLY_WON' ||
+    value === 'POSSIBLY_LOST'
+    ? value
+    : 'UNKNOWN';
+}
+
+function normalizeStoredBuyBoxSource(value: string | null | undefined): BuyBoxStatusSource {
+  return value === 'BUY_BUTTON_RANK' || value === 'PRICE_HEURISTIC' || value === 'OFFER_STATE' || value === 'UNKNOWN'
+    ? value
+    : 'UNKNOWN';
+}
+
+function normalizeStoredBuyBoxConfidence(value: string | null | undefined): BuyBoxStatusConfidence {
+  return value === 'HIGH' || value === 'MEDIUM' || value === 'LOW' ? value : 'LOW';
+}
+
+type BuyBoxGroupFilter = 'ALL' | 'WON' | 'NOT_WON' | 'UNKNOWN';
+type LinkTypeFilter = 'ALL' | 'SELF_BUILT' | 'RESELL' | 'UNKNOWN';
+
+function normalizeBuyBoxGroupFilter(value: unknown): BuyBoxGroupFilter {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const normalized = String(raw ?? 'ALL').trim().toUpperCase();
+  return normalized === 'WON' || normalized === 'NOT_WON' || normalized === 'UNKNOWN' || normalized === 'ALL'
+    ? normalized
+    : 'ALL';
+}
+
+function normalizeLinkTypeFilter(value: unknown): LinkTypeFilter {
+  const raw = Array.isArray(value) ? value[0] : value;
+  const normalized = String(raw ?? 'ALL').trim().toUpperCase();
+  return normalized === 'SELF_BUILT' || normalized === 'RESELL' || normalized === 'UNKNOWN' || normalized === 'ALL'
+    ? normalized
+    : 'ALL';
+}
+
+function appendStoreProductAnd(
+  where: Prisma.StoreProductWhereInput,
+  condition: Prisma.StoreProductWhereInput,
+): void {
+  const andClauses = where.AND
+    ? Array.isArray(where.AND) ? where.AND : [where.AND]
+    : [];
+  andClauses.push(condition);
+  where.AND = andClauses;
+}
+
+function normalizeActionTips(value: unknown, linkType: EmagLinkType, offerCompetitionType: OfferCompetitionType): string[] {
+  if (Array.isArray(value)) {
+    const tips = value.map((item) => String(item ?? '').trim()).filter(Boolean);
+    if (tips.length > 0) return tips;
+  }
+  return inferLinkActionTips(linkType, offerCompetitionType);
+}
+
+function normalizeStoredTips(value: unknown, fallback: string[]): string[] {
+  if (Array.isArray(value)) {
+    const tips = value.map((item) => String(item ?? '').trim()).filter(Boolean);
+    if (tips.length > 0) return tips;
+  }
+  return fallback;
 }
 
 function buildStoreProductListWhere(shopId: number, mappingStatus: string, search: string): Prisma.StoreProductWhereInput {
@@ -590,6 +684,19 @@ router.get('/', async (req: Request, res: Response) => {
     const purchaseActionFilter: PurchaseActionKey | undefined = normalizedPurchaseAction && isPurchaseActionFilter(normalizedPurchaseAction)
       ? normalizedPurchaseAction
       : undefined;
+    const rawStockGroup = req.query.stockGroup ?? req.query.stock_group;
+    const normalizedStockGroup = rawStockGroup == null
+      ? undefined
+      : String(Array.isArray(rawStockGroup) ? rawStockGroup[0] : rawStockGroup).trim().toUpperCase();
+    const stockGroupFilter: StockGroupKey | undefined =
+      normalizedStockGroup && normalizedStockGroup !== 'ALL' && isStockGroupFilter(normalizedStockGroup)
+        ? normalizedStockGroup
+        : undefined;
+    if (normalizedStockGroup && normalizedStockGroup !== 'ALL' && !isStockGroupFilter(normalizedStockGroup)) {
+      console.warn(`[GET /api/store-products] 忽略非法 stockGroup=${normalizedStockGroup}，合法值：ALL/${STOCK_GROUP_FILTERS.join('/')}`);
+    }
+    const buyBoxGroupFilter = normalizeBuyBoxGroupFilter(req.query.buyBoxGroup ?? req.query.buy_box_group);
+    const linkTypeFilter = normalizeLinkTypeFilter(req.query.linkType ?? req.query.link_type);
 
     // Prisma 无法在一条 where 里同时表达「IS NULL OR = ''」，使用 OR 组合处理空字符串边界
     const where: Prisma.StoreProductWhereInput = { shopId, isArchived: false };
@@ -654,14 +761,41 @@ router.get('/', async (req: Request, res: Response) => {
       }
     }
 
+    if (buyBoxGroupFilter === 'WON') {
+      appendStoreProductAnd(where, { buyBoxStatus: 'WON' });
+    } else if (buyBoxGroupFilter === 'NOT_WON') {
+      appendStoreProductAnd(where, { buyBoxStatus: { in: ['LOST', 'NO_ACTIVE_BUYBOX', 'POSSIBLY_LOST'] } });
+    } else if (buyBoxGroupFilter === 'UNKNOWN') {
+      appendStoreProductAnd(where, {
+        OR: [
+          { buyBoxStatus: { in: ['UNKNOWN', 'POSSIBLY_WON'] } },
+          { buyBoxStatus: null },
+        ],
+      });
+    }
+
+    if (linkTypeFilter === 'SELF_BUILT') {
+      appendStoreProductAnd(where, { emagLinkType: 'SELF_BUILT' });
+    } else if (linkTypeFilter === 'RESELL') {
+      appendStoreProductAnd(where, { emagLinkType: 'RESELL' });
+    } else if (linkTypeFilter === 'UNKNOWN') {
+      appendStoreProductAnd(where, {
+        OR: [
+          { emagLinkType: 'UNKNOWN' },
+          { emagLinkType: null },
+        ],
+      });
+    }
+
     const realtimeFilterIdSets: number[][] = [];
     if (productClassFilter && productClassFilter !== 'all') {
       realtimeFilterIdSets.push(await getMatchedStoreProductIdsByProductClass(shopId, productClassFilter, where));
     }
 
-    if (stockStatusFilter || purchaseActionFilter) {
+    if (stockStatusFilter || stockGroupFilter || purchaseActionFilter) {
       const matchedIds = await getMatchedStoreProductIdsByOverviewFilters(shopId, {
         ...(stockStatusFilter ? { stockStatus: stockStatusFilter } : {}),
+        ...(stockGroupFilter ? { stockGroup: stockGroupFilter } : {}),
         ...(purchaseActionFilter ? { purchaseAction: purchaseActionFilter } : {}),
       }, where);
       realtimeFilterIdSets.push(matchedIds);
@@ -1062,6 +1196,47 @@ router.get('/', async (req: Request, res: Response) => {
           : 'product';
         return `https://www.${domain}/${slug}/pd/${p.pnk}/`;
       })();
+      const linkType = normalizeStoredLinkType(p.emagLinkType);
+      const competition = inferOfferCompetition({ numberOfOffers: p.numberOfOffers });
+      const offerCompetitionType = p.offerCompetitionType
+        ? normalizeStoredCompetitionType(p.offerCompetitionType)
+        : competition.offerCompetitionType;
+      const contentPermissionResult = inferContentPermission(linkType);
+      const linkActionTips = normalizeActionTips(p.linkActionTips, linkType, offerCompetitionType);
+      const storedBuyBoxMeta = p.buyBoxMeta && typeof p.buyBoxMeta === 'object' && !Array.isArray(p.buyBoxMeta)
+        ? p.buyBoxMeta as Record<string, unknown>
+        : null;
+      const inferredBuyBox = inferBuyBoxStatus({
+        buyButtonRank: p.buyBoxRank ?? p.buyButtonRank,
+        salePrice: salePriceNum,
+        bestOfferSalePrice: p.bestOfferSalePrice != null ? Number(p.bestOfferSalePrice) : null,
+        mainOfferPrice: p.mainOfferPrice != null ? Number(p.mainOfferPrice) : null,
+        stock: stockNum,
+        status: p.status,
+        offerValidationStatus: storedBuyBoxMeta?.offerValidationStatus ?? p.validationStatus,
+        numberOfOffers: p.numberOfOffers,
+      });
+      const buyBoxStatus = p.buyBoxStatus
+        ? normalizeStoredBuyBoxStatus(p.buyBoxStatus)
+        : inferredBuyBox.buyBoxStatus;
+      const buyBoxStatusSource = p.buyBoxStatusSource
+        ? normalizeStoredBuyBoxSource(p.buyBoxStatusSource)
+        : inferredBuyBox.buyBoxStatusSource;
+      const buyBoxStatusConfidence = p.buyBoxStatusConfidence
+        ? normalizeStoredBuyBoxConfidence(p.buyBoxStatusConfidence)
+        : inferredBuyBox.buyBoxStatusConfidence;
+      const buyBoxRank = p.buyBoxRank ?? inferredBuyBox.buyBoxRank;
+      const buyBoxActionTips = normalizeStoredTips(p.buyBoxActionTips, inferredBuyBox.buyBoxActionTips);
+      const buyBoxMeta = storedBuyBoxMeta ?? {
+        buyButtonRank: p.buyButtonRank ?? null,
+        salePrice: salePriceNum,
+        bestOfferSalePrice: p.bestOfferSalePrice != null ? Number(p.bestOfferSalePrice) : null,
+        mainOfferPrice: p.mainOfferPrice != null ? Number(p.mainOfferPrice) : null,
+        stock: stockNum,
+        offerValidationStatus: p.validationStatus ?? null,
+        numberOfOffers: p.numberOfOffers ?? null,
+        checkedAt: p.syncedAt.toISOString(),
+      };
       return {
         id: p.id,
         pnk: p.pnk,
@@ -1125,6 +1300,33 @@ router.get('/', async (req: Request, res: Response) => {
         classificationMetrics,
         risk_tags: riskTags,
         riskTags,
+        linkType,
+        linkTypeLabel: LINK_TYPE_LABELS[linkType],
+        linkTypeSource: p.emagLinkTypeSource ?? (linkType === 'UNKNOWN' ? 'UNKNOWN' : 'OWNERSHIP'),
+        linkTypeConfidence: p.emagLinkTypeConfidence ?? (linkType === 'UNKNOWN' ? 'LOW' : 'MEDIUM'),
+        contentPermission: p.contentPermission ?? contentPermissionResult.contentPermission,
+        contentPermissionLabel: contentPermissionResult.contentPermissionLabel,
+        numberOfOffers: p.numberOfOffers ?? competition.numberOfOffers,
+        offerCompetitionType,
+        offerCompetitionLabel: OFFER_COMPETITION_LABELS[offerCompetitionType],
+        buyButtonRank: p.buyButtonRank ?? null,
+        bestOfferSalePrice: p.bestOfferSalePrice != null ? Number(p.bestOfferSalePrice) : null,
+        mainOfferPrice: p.mainOfferPrice != null ? Number(p.mainOfferPrice) : null,
+        linkActionTips,
+        buyBoxStatus,
+        buy_box_status: buyBoxStatus,
+        buyBoxStatusLabel: BUY_BOX_STATUS_LABELS[buyBoxStatus],
+        buy_box_status_label: BUY_BOX_STATUS_LABELS[buyBoxStatus],
+        buyBoxStatusSource,
+        buy_box_status_source: buyBoxStatusSource,
+        buyBoxStatusConfidence,
+        buy_box_status_confidence: buyBoxStatusConfidence,
+        buyBoxRank,
+        buy_box_rank: buyBoxRank,
+        buyBoxActionTips,
+        buy_box_action_tips: buyBoxActionTips,
+        buyBoxMeta,
+        buy_box_meta: buyBoxMeta,
         stock_status: stockStatusResult.stockStatus,
         stockStatus: stockStatusResult.stockStatus,
         stock_days: stockStatusResult.stockDays,

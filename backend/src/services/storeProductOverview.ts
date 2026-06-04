@@ -23,6 +23,12 @@ export type PurchaseActionKey =
   | 'SAFE'
   | 'UNKNOWN';
 
+export type StockGroupKey =
+  | 'STOCK_OK'
+  | 'REPLENISH_WARNING'
+  | 'OUT_OF_STOCK_REPLENISHED'
+  | 'OUT_OF_STOCK_NOT_REPLENISHED';
+
 export type PurchaseSuggestion = {
   targetStock: number;
   platformStock: number;
@@ -66,6 +72,12 @@ export type StoreProductOverview = {
 const PRODUCT_STRUCTURE_KEYS = PRODUCT_CLASSES;
 const STOCK_RISK_KEYS = STOCK_STATUSES;
 export const STOCK_STATUS_FILTERS = STOCK_STATUSES;
+export const STOCK_GROUP_FILTERS = [
+  'STOCK_OK',
+  'REPLENISH_WARNING',
+  'OUT_OF_STOCK_REPLENISHED',
+  'OUT_OF_STOCK_NOT_REPLENISHED',
+] as const;
 export const PURCHASE_ACTION_FILTERS = [
   'REPLENISH_NOW',
   'URGENT_REPLENISH',
@@ -154,6 +166,10 @@ export async function buildRealtimeClassificationMap(
 
 export function isStockStatusFilter(value: string): value is StockStatus {
   return (STOCK_STATUS_FILTERS as readonly string[]).includes(value);
+}
+
+export function isStockGroupFilter(value: string): value is StockGroupKey {
+  return (STOCK_GROUP_FILTERS as readonly string[]).includes(value);
 }
 
 export function isPurchaseActionFilter(value: string): value is PurchaseActionKey {
@@ -521,10 +537,10 @@ export async function getMatchedStoreProductIdsByProductClass(
 
 export async function getMatchedStoreProductIdsByOverviewFilters(
   shopId: number,
-  filters: { stockStatus?: StockStatus; purchaseAction?: PurchaseActionKey },
+  filters: { stockStatus?: StockStatus; stockGroup?: StockGroupKey; purchaseAction?: PurchaseActionKey },
   where: StoreProductWhereInput = { shopId, isArchived: false },
 ): Promise<number[]> {
-  if (!filters.stockStatus && !filters.purchaseAction) {
+  if (!filters.stockStatus && !filters.stockGroup && !filters.purchaseAction) {
     return [];
   }
 
@@ -547,7 +563,10 @@ export async function getMatchedStoreProductIdsByOverviewFilters(
     }),
   ]);
 
-  const assets = filters.purchaseAction ? await buildLocalProductAssets(shopId, products) : null;
+  const needsStockGroupTransit =
+    filters.stockGroup === 'OUT_OF_STOCK_REPLENISHED' ||
+    filters.stockGroup === 'OUT_OF_STOCK_NOT_REPLENISHED';
+  const assets = filters.purchaseAction || needsStockGroupTransit ? await buildLocalProductAssets(shopId, products) : null;
   const nowMs = Date.now();
   const dayMs = 24 * 60 * 60 * 1000;
   const matchedIds: number[] = [];
@@ -558,6 +577,26 @@ export async function getMatchedStoreProductIdsByOverviewFilters(
     const stockStatusResult = calculateStockStatus(product.stock, comprehensiveSales, sales.d30);
     if (filters.stockStatus && stockStatusResult.stockStatus !== filters.stockStatus) {
       continue;
+    }
+
+    if (filters.stockGroup === 'STOCK_OK' && stockStatusResult.stockStatus !== 'SAFE' && stockStatusResult.stockStatus !== 'OVERSTOCK') {
+      continue;
+    }
+
+    if (filters.stockGroup === 'REPLENISH_WARNING' && stockStatusResult.stockStatus !== 'LOW_STOCK' && stockStatusResult.stockStatus !== 'WARNING') {
+      continue;
+    }
+
+    if (filters.stockGroup === 'OUT_OF_STOCK_REPLENISHED' || filters.stockGroup === 'OUT_OF_STOCK_NOT_REPLENISHED') {
+      if (!assets || product.stock > 0) continue;
+      const localProductId = assets.storeProductToProductId.get(product.id);
+      const platformInTransit = localProductId ? assets.platformInTransitByProductId.get(localProductId) ?? 0 : 0;
+      if (filters.stockGroup === 'OUT_OF_STOCK_REPLENISHED' && platformInTransit <= 0) {
+        continue;
+      }
+      if (filters.stockGroup === 'OUT_OF_STOCK_NOT_REPLENISHED' && platformInTransit > 0) {
+        continue;
+      }
     }
 
     if (filters.purchaseAction) {
