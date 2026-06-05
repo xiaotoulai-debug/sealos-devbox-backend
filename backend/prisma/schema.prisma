@@ -25,10 +25,12 @@ model User {
   createdEmployeeTasks EmployeeTask[] @relation("EmployeeTaskCreator")
   assignedEmployeeTasks EmployeeTask[] @relation("EmployeeTaskAssignee")
   employeeTaskLogs EmployeeTaskLog[]
+  employeeTaskComments EmployeeTaskComment[]
   createdDailyReminderTemplates DailyReminderTemplate[] @relation("DailyReminderTemplateCreatedBy")
   updatedDailyReminderTemplates DailyReminderTemplate[] @relation("DailyReminderTemplateUpdatedBy")
   dailyReminderAssignments DailyReminderTemplateAssignment[]
   dailyReminderChecks DailyReminderCheck[]
+  updatedWorkdayCalendars WorkdayCalendar[] @relation("WorkdayCalendarUpdatedBy")
   role           Role       @relation(fields: [roleId], references: [id])
 
   @@map("users")
@@ -495,6 +497,7 @@ model EmployeeTask {
   assignee User               @relation("EmployeeTaskAssignee", fields: [assigneeId], references: [id])
   shop     ShopAuthorization? @relation(fields: [shopId], references: [id], onDelete: SetNull)
   logs     EmployeeTaskLog[]
+  comments EmployeeTaskComment[]
 
   @@index([assigneeId, status, dueDate])
   @@index([creatorId, status, dueDate])
@@ -524,6 +527,40 @@ model EmployeeTaskLog {
   @@index([operatorId])
   @@index([createdAt])
   @@map("employee_task_logs")
+}
+
+/// 员工任务沟通评论：支持 @ 提及任意用户
+model EmployeeTaskComment {
+  id               Int      @id @default(autoincrement())
+  taskId           Int      @map("task_id")
+  authorId         Int      @map("author_id")
+  content          String   @db.Text
+  mentionedUserIds Json?    @map("mentioned_user_ids")
+  createdAt        DateTime @default(now()) @map("created_at")
+  updatedAt        DateTime @updatedAt @map("updated_at")
+
+  task   EmployeeTask @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  author User         @relation(fields: [authorId], references: [id])
+
+  @@index([taskId])
+  @@index([authorId])
+  @@map("employee_task_comments")
+}
+
+/// 全年工作日日历：管理员维护工作日/休息日/待定，用于日报缺失统计
+model WorkdayCalendar {
+  id          Int           @id @default(autoincrement())
+  date        DateTime      @unique @db.Date
+  status      WorkdayStatus @default(PENDING)
+  remark      String?       @db.Text
+  updatedById Int?          @map("updated_by_id")
+  createdAt   DateTime      @default(now()) @map("created_at")
+  updatedAt   DateTime      @updatedAt @map("updated_at")
+
+  updatedBy User? @relation("WorkdayCalendarUpdatedBy", fields: [updatedById], references: [id])
+
+  @@index([date])
+  @@map("workday_calendars")
 }
 
 /// 运营每日提醒模板：员工每日 SOP 检查项，不与 EmployeeTask 混用
@@ -758,6 +795,15 @@ enum EmployeeTaskLogAction {
   STATUS_CHANGED
   UPDATED
   CANCELLED
+  DUE_DATE_UPDATED
+  COMMENTED
+}
+
+/// 工作日日历状态
+enum WorkdayStatus {
+  WORKDAY
+  REST
+  PENDING
 }
 
 /// 运营每日提醒分类

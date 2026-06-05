@@ -2,13 +2,18 @@ import { Router, Request, Response } from 'express';
 import { authenticate } from '../middleware/auth';
 import {
   createEmployeeTask,
+  createEmployeeTaskComment,
   getAssignableUsers,
   getEmployeeTaskDetail,
   getEmployeeTaskWeeklySummary,
+  getMentionUsers,
   getMyEmployeeTaskDashboard,
   listCreatedEmployeeTasks,
+  listEmployeeTaskComments,
   listReceivedEmployeeTasks,
+  startEmployeeTask,
   updateEmployeeTask,
+  updateEmployeeTaskDueDate,
   updateEmployeeTaskStatus,
 } from '../services/employeeTaskService';
 
@@ -25,7 +30,7 @@ function errorStatus(err: unknown): number {
   if (statusCode === 404) return 404;
   if (statusCode === 403) return 403;
   const message = err instanceof Error ? err.message : '';
-  return /无效|必须|必填|只能|合法值|格式|不存在|不能|不允许|长度|状态流转/.test(message) ? 400 : 500;
+  return /无效|必须|必填|只能|合法值|格式|不存在|不能|不允许|长度|状态流转|截止日期|content|mentionedUserIds/.test(message) ? 400 : 500;
 }
 
 function sendError(res: Response, err: unknown, fallback = '服务器内部错误'): void {
@@ -109,6 +114,60 @@ router.get('/assignable-users', async (_req: Request, res: Response) => {
   } catch (err) {
     console.error('[GET /api/employee-tasks/assignable-users]', err);
     sendError(res, err, '查询可指派用户失败');
+  }
+});
+
+router.get('/mention-users', async (_req: Request, res: Response) => {
+  try {
+    const data = await getMentionUsers();
+    res.json({ code: 200, data, message: 'success' });
+  } catch (err) {
+    console.error('[GET /api/employee-tasks/mention-users]', err);
+    sendError(res, err, '查询可 @ 用户失败');
+  }
+});
+
+router.get('/:id/comments', async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const data = await listEmployeeTaskComments(req.user!, id);
+    res.json({ code: 200, data, message: 'success' });
+  } catch (err) {
+    console.error('[GET /api/employee-tasks/:id/comments]', err);
+    sendError(res, err, '查询任务评论失败');
+  }
+});
+
+router.post('/:id/comments', async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const data = await createEmployeeTaskComment(req.user!, id, req.body ?? {});
+    res.json({ code: 200, data, message: 'success' });
+  } catch (err) {
+    console.error('[POST /api/employee-tasks/:id/comments]', err);
+    sendError(res, err, '发表评论失败');
+  }
+});
+
+router.patch('/:id/due-date', async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const data = await updateEmployeeTaskDueDate(req.user!, id, req.body ?? {});
+    res.json({ code: 200, data, message: 'success' });
+  } catch (err) {
+    console.error('[PATCH /api/employee-tasks/:id/due-date]', err);
+    sendError(res, err, '更新任务截止日期失败');
+  }
+});
+
+router.post('/:id/start', async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    const data = await startEmployeeTask(req.user!, id);
+    res.json({ code: 200, data, message: 'success' });
+  } catch (err) {
+    console.error('[POST /api/employee-tasks/:id/start]', err);
+    sendError(res, err, '开始处理任务失败');
   }
 });
 

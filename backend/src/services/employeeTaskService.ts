@@ -351,7 +351,7 @@ function currentUserWhere(userId: number): Prisma.EmployeeTaskWhereInput {
 function historyTasksWhere(userId: number): Prisma.EmployeeTaskWhereInput {
   return {
     assigneeId: userId,
-    status: { not: EmployeeTaskStatus.CANCELLED },
+    status: { in: [EmployeeTaskStatus.DONE, EmployeeTaskStatus.CANCELLED] },
   };
 }
 
@@ -359,7 +359,9 @@ function createdTasksWhere(userId: number): Prisma.EmployeeTaskWhereInput {
   return {
     creatorId: userId,
     assigneeId: { not: userId },
-    status: { not: EmployeeTaskStatus.CANCELLED },
+    status: {
+      notIn: [EmployeeTaskStatus.DONE, EmployeeTaskStatus.CANCELLED],
+    },
   };
 }
 
@@ -427,6 +429,51 @@ function isOverdue(task: { status: EmployeeTaskStatus; dueDate: Date }): boolean
   );
 }
 
+function isDueToday(task: { dueDate: Date }): boolean {
+  return dueDateToDateString(task.dueDate) === todayString();
+}
+
+function priorityRank(priority: EmployeeTaskPriority): number {
+  if (priority === EmployeeTaskPriority.HIGH) return 3;
+  if (priority === EmployeeTaskPriority.MEDIUM) return 2;
+  return 1;
+}
+
+function sortTodoTasks(tasks: EmployeeTaskWithRelations[]): EmployeeTaskWithRelations[] {
+  const now = Date.now();
+
+  return [...tasks].sort((a, b) => {
+    const aDue = a.dueDate.getTime();
+    const bDue = b.dueDate.getTime();
+
+    const aOverdue = aDue < now;
+    const bOverdue = bDue < now;
+
+    if (aOverdue !== bOverdue) {
+      return aOverdue ? -1 : 1;
+    }
+
+    if (aDue !== bDue) {
+      return aDue - bDue;
+    }
+
+    const priorityDiff = priorityRank(b.priority) - priorityRank(a.priority);
+    if (priorityDiff !== 0) return priorityDiff;
+
+    return b.updatedAt.getTime() - a.updatedAt.getTime();
+  });
+}
+
+function getTaskClosedAt(task: Pick<EmployeeTaskWithRelations, 'completedAt' | 'cancelledAt' | 'updatedAt'>): Date {
+  return task.completedAt ?? task.cancelledAt ?? task.updatedAt;
+}
+
+function sortHistoryTasks(tasks: EmployeeTaskWithRelations[]): EmployeeTaskWithRelations[] {
+  return [...tasks].sort(
+    (a, b) => getTaskClosedAt(b).getTime() - getTaskClosedAt(a).getTime(),
+  );
+}
+
 function taskInclude() {
   return {
     creator: { select: { id: true, name: true } },
@@ -464,6 +511,7 @@ function formatTask(task: EmployeeTaskWithRelations) {
     dueDate: task.dueDate,
     completedAt: task.completedAt,
     cancelledAt: task.cancelledAt,
+    closedAt: getTaskClosedAt(task),
     creatorId: task.creatorId,
     creatorName: task.creator.name,
     assigneeId: task.assigneeId,
@@ -744,7 +792,11 @@ async function listEmployeeTasks(params: {
 }
 
 export async function getMyEmployeeTaskDashboard(user: JwtPayload, params: { weekStart?: unknown }) {
-  const { start: weekStart, end: weekEnd } = weekRange(params.weekStart);
+  const { start: weekStartDate, end: weekEndDate } = weekRange(params.weekStart);
+  const weekStart = weekStartDate.toISOString().slice(0, 10);
+  const weekEnd = dueDateToDateString(weekEndDate);
+  const lastWeekStart = addDays(weekStart, -7);
+  const lastWeekEnd = addDays(weekStart, -1);
   const { start: monthStart, end: monthEnd } = monthRangeFor();
   const relatedWhere = currentUserWhere(user.userId);
   const participatedTaskIds = await getCollaborationParticipationTaskIds(user.userId);
@@ -762,7 +814,7 @@ export async function getMyEmployeeTaskDashboard(user: JwtPayload, params: { wee
     monthTotalCount,
     monthDoneCount,
     receivedTaskCount,
-    weeklyTasks,
+    todoTasksRaw,
     historyTasks,
     receivedTasks,
     createdTasks,
@@ -772,7 +824,7 @@ export async function getMyEmployeeTaskDashboard(user: JwtPayload, params: { wee
       where: {
         AND: [
           relatedWhere,
-          { dueDate: { gte: weekStart, lte: weekEnd } },
+          { dueDate: { gte: weekStartDate, lte: weekEndDate } },
           { status: { notIn: [EmployeeTaskStatus.DONE, EmployeeTaskStatus.CANCELLED] } },
         ],
       },
@@ -781,7 +833,7 @@ export async function getMyEmployeeTaskDashboard(user: JwtPayload, params: { wee
       where: {
         AND: [
           relatedWhere,
-          { completedAt: { gte: weekStart, lte: weekEnd } },
+          { completedAt: { gte: weekStartDate, lte: weekEndDate } },
           { status: EmployeeTaskStatus.DONE },
         ],
       },
@@ -801,20 +853,23 @@ export async function getMyEmployeeTaskDashboard(user: JwtPayload, params: { wee
     }),
     prisma.employeeTask.findMany({
       where: {
-        AND: [
-          relatedWhere,
-          { dueDate: { gte: weekStart, lte: weekEnd } },
-        ],
+        assigneeId: user.userId,
+        status: {
+          notIn: [EmployeeTaskStatus.DONE, EmployeeTaskStatus.CANCELLED],
+        },
       },
       include: taskInclude(),
-      orderBy: [{ dueDate: 'asc' }, { updatedAt: 'desc' }],
-      take: 50,
+      take: 100,
     }),
     prisma.employeeTask.findMany({
       where: historyTasksWhere(user.userId),
       include: taskInclude(),
-      orderBy: [{ updatedAt: 'desc' }],
-      take: 20,
+      orderBy: [
+        { completedAt: 'desc' },
+        { cancelledAt: 'desc' },
+        { updatedAt: 'desc' },
+      ],
+      take: 200,
     }),
     prisma.employeeTask.findMany({
       where: { assigneeId: user.userId, status: { not: EmployeeTaskStatus.CANCELLED } },
@@ -826,7 +881,7 @@ export async function getMyEmployeeTaskDashboard(user: JwtPayload, params: { wee
       where: createdTasksWhere(user.userId),
       include: taskInclude(),
       orderBy: [{ dueDate: 'asc' }, { updatedAt: 'desc' }],
-      take: 20,
+      take: 50,
     }),
     prisma.employeeTask.findMany({
       where: collaborationTasksWhere(user.userId, participatedTaskIds),
@@ -836,15 +891,27 @@ export async function getMyEmployeeTaskDashboard(user: JwtPayload, params: { wee
     }),
   ]);
 
+  const todoTasks = sortTodoTasks(todoTasksRaw);
+  const formattedTodoTasks = todoTasks.map(formatTask);
+  const sortedHistoryTasks = sortHistoryTasks(historyTasks);
+
   return {
     summaryCards: {
       weeklyPendingCount,
       weeklyDoneCount,
       monthlyCompletionRate: monthTotalCount === 0 ? 0 : Number((monthDoneCount / monthTotalCount).toFixed(4)),
       receivedTaskCount,
+      todoTaskCount: todoTasks.length,
+      overdueTodoTaskCount: todoTasks.filter(isOverdue).length,
+      todayDueTaskCount: todoTasks.filter(isDueToday).length,
     },
-    weeklyTasks: weeklyTasks.map(formatTask),
-    historyTasks: historyTasks.map(formatTask),
+    weekStart,
+    weekEnd,
+    lastWeekStart,
+    lastWeekEnd,
+    todoTasks: formattedTodoTasks,
+    weeklyTasks: formattedTodoTasks,
+    historyTasks: sortedHistoryTasks.map(formatTask),
     receivedTasks: receivedTasks.map(formatTask),
     createdTasks: createdTasks.map(formatTask),
     collaborationTasks: collaborationTasks.map(formatTask),
