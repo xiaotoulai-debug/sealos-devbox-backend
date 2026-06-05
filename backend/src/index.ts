@@ -29,6 +29,7 @@ import purchaseRouter from './routes/purchase';
 import operationDailyRouter from './routes/operationDaily';
 import employeeTasksRouter from './routes/employeeTasks';
 import dailyRemindersRouter from './routes/dailyReminders';
+import workdayCalendarRouter from './routes/workdayCalendar';
 import { startSyncCrons } from './services/syncCron';
 import { backfillProductImages } from './services/storeProductSync';
 
@@ -78,6 +79,7 @@ app.use('/api/purchases',   purchaseRouter);     // 采购管理（重构版）�
 app.use('/api/operation-daily', operationDailyRouter); // 运营每日事务登记 + 首页运营作战看板
 app.use('/api/employee-tasks', employeeTasksRouter); // 员工个人任务中心（仅本人相关任务）
 app.use('/api/daily-reminders', dailyRemindersRouter); // 运营每日提醒 / 今日必做清单
+app.use('/api/workday-calendar', workdayCalendarRouter); // 全年运营日历
 
 // ── 启动时打印关键路由（确认 sync-urls 已注册）────────────────────
 function printRegisteredRoutes() {

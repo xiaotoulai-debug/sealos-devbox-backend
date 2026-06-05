@@ -4,9 +4,11 @@ import {
   OperationTaskType,
   Prisma,
   UserStatus,
+  WorkdayStatus,
 } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { JwtPayload } from '../middleware/auth';
+import { getWorkdayStatusForDate, getWorkdayStatusMap } from './workdayCalendarService';
 
 const TASK_TYPES = Object.values(OperationTaskType);
 const PLATFORMS = Object.values(OperationPlatform);
@@ -853,7 +855,7 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
   const monthEnd = dateStringToDbDate(endDate);
   const yesterdayDate = dateStringToDbDate(yesterday);
 
-  const [activeUsers, monthReports, monthLogs, yesterdayReports] = await Promise.all([
+  const [activeUsers, monthReports, monthLogs, yesterdayReports, workdayStatusMap, yesterdayWorkdayStatus] = await Promise.all([
     prisma.user.findMany({
       where: { status: UserStatus.ACTIVE },
       select: { id: true, name: true, role: { select: { name: true } } },
@@ -890,6 +892,8 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
       where: { workDate: yesterdayDate },
       select: { userId: true },
     }),
+    getWorkdayStatusMap(startDate, endDate),
+    getWorkdayStatusForDate(yesterday),
   ]);
 
   const operationUsers = activeUsers.filter(isOperationUser);
@@ -930,16 +934,31 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
       .filter((report) => operationUserIds.has(report.userId))
       .map((report) => report.userId),
   );
-  summaryCards.yesterdayRegisteredCount = yesterdayRegisteredUserIds.size;
-  summaryCards.yesterdayMissingCount = Math.max(0, operationUsers.length - yesterdayRegisteredUserIds.size);
 
-  const yesterdayMissingUsers = operationUsers
-    .filter((user) => !yesterdayRegisteredUserIds.has(user.id))
-    .map((user) => ({
-      userId: user.id,
-      name: user.name,
-      roleName: user.role.name,
-    }));
+  let yesterdayMissingUsers: Array<{ userId: number; name: string; roleName: string }> = [];
+  let yesterdayRequired = false;
+  let yesterdayMessage: string | null = null;
+
+  if (yesterdayWorkdayStatus === WorkdayStatus.WORKDAY) {
+    yesterdayRequired = true;
+    summaryCards.yesterdayRegisteredCount = yesterdayRegisteredUserIds.size;
+    summaryCards.yesterdayMissingCount = Math.max(0, operationUsers.length - yesterdayRegisteredUserIds.size);
+    yesterdayMissingUsers = operationUsers
+      .filter((user) => !yesterdayRegisteredUserIds.has(user.id))
+      .map((user) => ({
+        userId: user.id,
+        name: user.name,
+        roleName: user.role.name,
+      }));
+  } else if (yesterdayWorkdayStatus === WorkdayStatus.REST) {
+    summaryCards.yesterdayRegisteredCount = 0;
+    summaryCards.yesterdayMissingCount = 0;
+    yesterdayMessage = '昨日为休息日，无需登记';
+  } else {
+    summaryCards.yesterdayRegisteredCount = 0;
+    summaryCards.yesterdayMissingCount = 0;
+    yesterdayMessage = '昨日运营日历待定，暂不统计未登记';
+  }
 
   const monthlyScores = operationUsers.map((user) => {
     const counts = taskCounts();
@@ -990,9 +1009,18 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
       let total = 0;
       const dailyValues = days.map((date) => {
         const isFuture = date > today;
+        const workdayStatus = workdayStatusMap.get(date) ?? WorkdayStatus.PENDING;
+        const registrationRequired = workdayStatus === WorkdayStatus.WORKDAY;
+        const report = reportMap.get(`${user.id}:${date}`);
+        const log = logMap.get(`${user.id}:${date}:${metric.taskType}`);
+
         if (isFuture) {
           return {
             date,
+            workdayStatus,
+            registrationRequired,
+            displayStatus: 'FUTURE' as const,
+            missingRequired: false,
             value: null as number | null,
             text: null as string | null,
             submitted: false,
@@ -1001,10 +1029,43 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
           };
         }
 
-        const report = reportMap.get(`${user.id}:${date}`);
+        if (workdayStatus === WorkdayStatus.REST) {
+          return {
+            date,
+            workdayStatus,
+            registrationRequired: false,
+            displayStatus: 'REST' as const,
+            missingRequired: false,
+            value: report && log ? (metric.valueType === 'text' ? log.quantity : log.quantity) : null,
+            text: report && metric.valueType === 'text' ? textSummary(log?.detail) : null,
+            submitted: Boolean(report),
+            isFuture,
+            reportId: report?.id ?? null,
+          };
+        }
+
+        if (workdayStatus === WorkdayStatus.PENDING) {
+          return {
+            date,
+            workdayStatus,
+            registrationRequired: false,
+            displayStatus: 'PENDING' as const,
+            missingRequired: false,
+            value: report && log ? log.quantity : null,
+            text: report && metric.valueType === 'text' ? textSummary(log?.detail) : null,
+            submitted: Boolean(report),
+            isFuture,
+            reportId: report?.id ?? null,
+          };
+        }
+
         if (!report) {
           return {
             date,
+            workdayStatus,
+            registrationRequired: true,
+            displayStatus: 'MISSING' as const,
+            missingRequired: true,
             value: null as number | null,
             text: null as string | null,
             submitted: false,
@@ -1013,10 +1074,13 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
           };
         }
 
-        const log = logMap.get(`${user.id}:${date}:${metric.taskType}`);
         if (metric.valueType === 'text') {
           return {
             date,
+            workdayStatus,
+            registrationRequired: true,
+            displayStatus: 'SUBMITTED' as const,
+            missingRequired: false,
             value: log?.quantity ?? null,
             text: textSummary(log?.detail),
             submitted: true,
@@ -1029,6 +1093,10 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
         total += value;
         return {
           date,
+          workdayStatus,
+          registrationRequired: true,
+          displayStatus: 'SUBMITTED' as const,
+          missingRequired: false,
           value,
           text: null as string | null,
           submitted: true,
@@ -1049,6 +1117,9 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
   return {
     summaryCards,
     yesterdayMissingUsers,
+    yesterdayWorkdayStatus,
+    yesterdayRequired,
+    yesterdayMessage,
     monthlyScoreTop,
     heatmap: {
       month,

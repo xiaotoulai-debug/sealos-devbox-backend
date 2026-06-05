@@ -10,6 +10,7 @@ import {
 } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { JwtPayload } from '../middleware/auth';
+import { resolveWeekWorkdayReportStats } from './workdayCalendarService';
 
 const TASK_TYPES = Object.values(EmployeeTaskType);
 const PLATFORMS = Object.values(OperationPlatform);
@@ -30,7 +31,7 @@ const TASK_TYPE_NAMES: Record<EmployeeTaskType, string> = {
 };
 
 const STATUS_NAMES: Record<EmployeeTaskStatus, string> = {
-  TODO: '待开始',
+  TODO: '待完成',
   IN_PROGRESS: '进行中',
   DONE: '已完成',
   CANCELLED: '已取消',
@@ -41,6 +42,61 @@ const PRIORITY_NAMES: Record<EmployeeTaskPriority, string> = {
   MEDIUM: '中',
   LOW: '低',
 };
+
+const MAX_COMMENT_LENGTH = 1000;
+
+function isEmployeeTaskAdmin(user: JwtPayload): boolean {
+  const roleNameLower = (user.roleName ?? '').toLowerCase();
+  const permissions = user.permissions ?? [];
+  return (
+    roleNameLower.includes('admin') ||
+    roleNameLower.includes('超级管理员') ||
+    permissions.includes('*') ||
+    permissions.includes('ALL') ||
+    permissions.includes('ADMIN_FULL')
+  );
+}
+
+function parseDueDateOnly(value: unknown): Date {
+  const raw = String(value ?? '').trim();
+  if (!raw) throw new Error('dueDate 为必填');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(raw)) {
+    throw new Error('截止日期格式必须为 YYYY-MM-DD');
+  }
+  const date = new Date(`${raw}T00:00:00.000Z`);
+  if (Number.isNaN(date.getTime()) || date.toISOString().slice(0, 10) !== raw) {
+    throw new Error('截止日期格式必须为 YYYY-MM-DD');
+  }
+  if (raw < todayString()) {
+    throw new Error('截止日期不能早于今天');
+  }
+  return new Date(`${raw}T23:59:59.000Z`);
+}
+
+function dueDateToDateString(value: Date): string {
+  return value.toISOString().slice(0, 10);
+}
+
+function parseMentionedUserIds(value: unknown): number[] {
+  if (value == null || value === '') return [];
+  if (!Array.isArray(value)) throw new Error('mentionedUserIds 必须是数组');
+  const ids = value.map((item) => parsePositiveInt(item, 'mentionedUserIds'));
+  return [...new Set(ids)];
+}
+
+function parseCommentContent(value: unknown): string {
+  const text = String(value ?? '').trim();
+  if (!text) throw new Error('content 为必填');
+  if (text.length > MAX_COMMENT_LENGTH) {
+    throw new Error(`content 长度不能超过 ${MAX_COMMENT_LENGTH}`);
+  }
+  return text;
+}
+
+function parseMentionedUserIdsFromJson(value: Prisma.JsonValue | null): number[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((item): item is number => typeof item === 'number' && Number.isInteger(item) && item > 0);
+}
 
 const PLATFORM_NAMES: Record<OperationPlatform, string> = {
   SHEIN: 'SHEIN',
@@ -135,6 +191,17 @@ function parseTaskType(value: unknown): EmployeeTaskType {
 function parsePlatform(value: unknown): OperationPlatform | undefined {
   if (value == null || value === '') return undefined;
   const raw = String(value).trim();
+  if (!PLATFORMS.includes(raw as OperationPlatform)) {
+    throw new Error(`platform 无效，合法值：${PLATFORMS.join('/')}`);
+  }
+  return raw as OperationPlatform;
+}
+
+function parseRequiredPlatform(value: unknown): OperationPlatform {
+  const raw = String(value ?? '').trim();
+  if (!raw) {
+    throw new Error('platform 为必填');
+  }
   if (!PLATFORMS.includes(raw as OperationPlatform)) {
     throw new Error(`platform 无效，合法值：${PLATFORMS.join('/')}`);
   }
@@ -281,6 +348,77 @@ function currentUserWhere(userId: number): Prisma.EmployeeTaskWhereInput {
   return { OR: [{ creatorId: userId }, { assigneeId: userId }] };
 }
 
+function historyTasksWhere(userId: number): Prisma.EmployeeTaskWhereInput {
+  return {
+    assigneeId: userId,
+    status: { not: EmployeeTaskStatus.CANCELLED },
+  };
+}
+
+function createdTasksWhere(userId: number): Prisma.EmployeeTaskWhereInput {
+  return {
+    creatorId: userId,
+    assigneeId: { not: userId },
+    status: { not: EmployeeTaskStatus.CANCELLED },
+  };
+}
+
+async function getCollaborationParticipationTaskIds(userId: number): Promise<number[]> {
+  const [authoredComments, recentComments] = await Promise.all([
+    prisma.employeeTaskComment.findMany({
+      where: { authorId: userId },
+      select: { taskId: true },
+      distinct: ['taskId'],
+    }),
+    prisma.employeeTaskComment.findMany({
+      where: { mentionedUserIds: { not: Prisma.DbNull } },
+      select: { taskId: true, mentionedUserIds: true },
+      orderBy: { createdAt: 'desc' },
+      take: 500,
+    }),
+  ]);
+
+  const taskIds = new Set<number>();
+  for (const comment of authoredComments) {
+    taskIds.add(comment.taskId);
+  }
+  for (const comment of recentComments) {
+    if (parseMentionedUserIdsFromJson(comment.mentionedUserIds).includes(userId)) {
+      taskIds.add(comment.taskId);
+    }
+  }
+  return [...taskIds];
+}
+
+function collaborationTasksWhere(userId: number, participatedTaskIds: number[]): Prisma.EmployeeTaskWhereInput {
+  const participationOr: Prisma.EmployeeTaskWhereInput[] = [{ creatorId: userId }];
+  if (participatedTaskIds.length > 0) {
+    participationOr.push({ id: { in: participatedTaskIds } });
+  }
+  return {
+    AND: [
+      { status: { not: EmployeeTaskStatus.CANCELLED } },
+      { assigneeId: { not: userId } },
+      { OR: participationOr },
+    ],
+  };
+}
+
+async function userHasTaskParticipation(taskId: number, userId: number): Promise<boolean> {
+  const [authoredComment, comments] = await Promise.all([
+    prisma.employeeTaskComment.findFirst({
+      where: { taskId, authorId: userId },
+      select: { id: true },
+    }),
+    prisma.employeeTaskComment.findMany({
+      where: { taskId },
+      select: { mentionedUserIds: true },
+    }),
+  ]);
+  if (authoredComment) return true;
+  return comments.some((comment) => parseMentionedUserIdsFromJson(comment.mentionedUserIds).includes(userId));
+}
+
 function isOverdue(task: { status: EmployeeTaskStatus; dueDate: Date }): boolean {
   return (
     task.status !== EmployeeTaskStatus.DONE &&
@@ -377,7 +515,7 @@ async function assertShopExists(shopId?: number) {
   }
 }
 
-async function getVisibleTaskOrThrow(taskId: number, userId: number) {
+async function getVisibleTaskOrThrow(taskId: number, user: JwtPayload) {
   const task = await prisma.employeeTask.findUnique({
     where: { id: taskId },
     include: taskDetailInclude(),
@@ -385,17 +523,102 @@ async function getVisibleTaskOrThrow(taskId: number, userId: number) {
   if (!task) {
     throw Object.assign(new Error('任务不存在'), { statusCode: 404 });
   }
-  if (task.creatorId !== userId && task.assigneeId !== userId) {
-    throw Object.assign(new Error('无权限查看该任务'), { statusCode: 403 });
+  if (
+    task.creatorId !== user.userId &&
+    task.assigneeId !== user.userId &&
+    !isEmployeeTaskAdmin(user)
+  ) {
+    const participated = await userHasTaskParticipation(taskId, user.userId);
+    if (!participated) {
+      throw Object.assign(new Error('无权限查看该任务'), { statusCode: 403 });
+    }
   }
   return task;
+}
+
+async function assertCanViewTaskComments(taskId: number, user: JwtPayload) {
+  const task = await prisma.employeeTask.findUnique({
+    where: { id: taskId },
+    select: { id: true, creatorId: true, assigneeId: true },
+  });
+  if (!task) {
+    throw Object.assign(new Error('任务不存在'), { statusCode: 404 });
+  }
+  if (
+    task.creatorId === user.userId ||
+    task.assigneeId === user.userId ||
+    isEmployeeTaskAdmin(user)
+  ) {
+    return task;
+  }
+
+  if (await userHasTaskParticipation(taskId, user.userId)) {
+    return task;
+  }
+
+  throw Object.assign(new Error('无权限查看该任务评论'), { statusCode: 403 });
+}
+
+function canCommentOnTask(task: { creatorId: number; assigneeId: number }, user: JwtPayload): boolean {
+  return (
+    task.creatorId === user.userId ||
+    task.assigneeId === user.userId ||
+    isEmployeeTaskAdmin(user)
+  );
+}
+
+function canUpdateDueDate(task: { creatorId: number; assigneeId: number }, user: JwtPayload): boolean {
+  return canCommentOnTask(task, user);
+}
+
+async function assertActiveMentionedUsers(userIds: number[]) {
+  if (userIds.length === 0) return;
+  const users = await prisma.user.findMany({
+    where: { id: { in: userIds }, status: UserStatus.ACTIVE },
+    select: { id: true },
+  });
+  const found = new Set(users.map((user) => user.id));
+  for (const userId of userIds) {
+    if (!found.has(userId)) {
+      throw new Error(`mentionedUserIds 包含无效用户 ID：${userId}`);
+    }
+  }
+}
+
+async function formatTaskComment(comment: {
+  id: number;
+  taskId: number;
+  content: string;
+  authorId: number;
+  mentionedUserIds: Prisma.JsonValue | null;
+  createdAt: Date;
+  author: { id: number; name: string };
+}) {
+  const mentionedUserIds = parseMentionedUserIdsFromJson(comment.mentionedUserIds);
+  const mentionedUsers = mentionedUserIds.length
+    ? await prisma.user.findMany({
+      where: { id: { in: mentionedUserIds } },
+      select: { id: true, name: true },
+      orderBy: { id: 'asc' },
+    })
+    : [];
+  return {
+    id: comment.id,
+    taskId: comment.taskId,
+    content: comment.content,
+    authorId: comment.authorId,
+    authorName: comment.author.name,
+    mentionedUserIds,
+    mentionedUsers,
+    createdAt: comment.createdAt.toISOString(),
+  };
 }
 
 export async function createEmployeeTask(user: JwtPayload, input: CreateEmployeeTaskInput) {
   const title = parseRequiredString(input.title, 'title');
   const description = parseOptionalString(input.description);
   const taskType = parseTaskType(input.taskType);
-  const platform = parsePlatform(input.platform);
+  const platform = parseRequiredPlatform(input.platform);
   const shopId = parseOptionalPositiveInt(input.shopId, 'shopId');
   const assigneeId = parsePositiveInt(input.assigneeId, 'assigneeId');
   const dueDate = parseDueDate(input.dueDate);
@@ -456,7 +679,7 @@ export async function getEmployeeTaskDetail(user: JwtPayload, taskId: number) {
   if (!Number.isInteger(taskId) || taskId <= 0) {
     throw new Error('id 必须是正整数');
   }
-  const task = await getVisibleTaskOrThrow(taskId, user.userId);
+  const task = await getVisibleTaskOrThrow(taskId, user);
   return formatTaskDetail(task);
 }
 
@@ -524,6 +747,7 @@ export async function getMyEmployeeTaskDashboard(user: JwtPayload, params: { wee
   const { start: weekStart, end: weekEnd } = weekRange(params.weekStart);
   const { start: monthStart, end: monthEnd } = monthRangeFor();
   const relatedWhere = currentUserWhere(user.userId);
+  const participatedTaskIds = await getCollaborationParticipationTaskIds(user.userId);
   const nonCancelledMonthWhere: Prisma.EmployeeTaskWhereInput = {
     AND: [
       relatedWhere,
@@ -542,6 +766,7 @@ export async function getMyEmployeeTaskDashboard(user: JwtPayload, params: { wee
     historyTasks,
     receivedTasks,
     createdTasks,
+    collaborationTasks,
   ] = await Promise.all([
     prisma.employeeTask.count({
       where: {
@@ -586,7 +811,7 @@ export async function getMyEmployeeTaskDashboard(user: JwtPayload, params: { wee
       take: 50,
     }),
     prisma.employeeTask.findMany({
-      where: relatedWhere,
+      where: historyTasksWhere(user.userId),
       include: taskInclude(),
       orderBy: [{ updatedAt: 'desc' }],
       take: 20,
@@ -598,10 +823,16 @@ export async function getMyEmployeeTaskDashboard(user: JwtPayload, params: { wee
       take: 20,
     }),
     prisma.employeeTask.findMany({
-      where: { creatorId: user.userId, status: { not: EmployeeTaskStatus.CANCELLED } },
+      where: createdTasksWhere(user.userId),
       include: taskInclude(),
       orderBy: [{ dueDate: 'asc' }, { updatedAt: 'desc' }],
       take: 20,
+    }),
+    prisma.employeeTask.findMany({
+      where: collaborationTasksWhere(user.userId, participatedTaskIds),
+      include: taskInclude(),
+      orderBy: [{ dueDate: 'asc' }, { updatedAt: 'desc' }],
+      take: 30,
     }),
   ]);
 
@@ -616,6 +847,7 @@ export async function getMyEmployeeTaskDashboard(user: JwtPayload, params: { wee
     historyTasks: historyTasks.map(formatTask),
     receivedTasks: receivedTasks.map(formatTask),
     createdTasks: createdTasks.map(formatTask),
+    collaborationTasks: collaborationTasks.map(formatTask),
   };
 }
 
@@ -638,7 +870,12 @@ function aggregateTaskSummary(tasks: EmployeeTaskWithRelations[], includeInProgr
 }
 
 function buildPlanSuggestions(params: {
-  dailyReportSummary: { missingDays: number; blockedItems: unknown[] };
+  dailyReportSummary: {
+    missingDays: number;
+    requiredDays: number;
+    calendarStatus: 'CONFIGURED' | 'NOT_CONFIGURED';
+    blockedItems: unknown[];
+  };
   receivedTaskSummary: { overdueCount: number };
   createdTaskSummary: { overdueCount: number };
 }) {
@@ -649,8 +886,11 @@ function buildPlanSuggestions(params: {
   if (params.dailyReportSummary.blockedItems.length > 0) {
     suggestions.push('建议优先解决阻塞事项。');
   }
-  if (params.dailyReportSummary.missingDays > 0) {
+  if (params.dailyReportSummary.calendarStatus === 'CONFIGURED' && params.dailyReportSummary.missingDays > 0) {
     suggestions.push('建议本周保持每日登记。');
+  }
+  if (params.dailyReportSummary.requiredDays === 0) {
+    suggestions.push('建议管理员先配置上周运营日历。');
   }
   if (suggestions.length === 0) {
     suggestions.push('建议延续当前节奏，继续提升任务完成率。');
@@ -712,10 +952,25 @@ export async function getEmployeeTaskWeeklySummary(user: JwtPayload, params: { w
     }),
   ]);
 
-  const submittedDates = new Set(reports.map((report) => report.workDate.toISOString().slice(0, 10)));
+  const allSubmittedDates = new Set(reports.map((report) => report.workDate.toISOString().slice(0, 10)));
+  const workdayStats = await resolveWeekWorkdayReportStats(range.weekStart, range.weekEnd, allSubmittedDates);
+  const workdayDateSet = new Set(workdayStats.workdayDates);
+
+  const submittedDatesOnWorkdays = new Set(
+    reports
+      .map((report) => report.workDate.toISOString().slice(0, 10))
+      .filter((date) => workdayDateSet.has(date)),
+  );
+
   const dailyReportSummary = {
-    submittedDays: submittedDates.size,
-    missingDays: Math.max(0, 7 - submittedDates.size),
+    submittedDays: submittedDatesOnWorkdays.size,
+    missingDays: workdayStats.missingDays,
+    requiredDays: workdayStats.requiredDays,
+    workdayDates: workdayStats.workdayDates,
+    missingDates: workdayStats.missingDates,
+    restDates: workdayStats.restDates,
+    pendingDates: workdayStats.pendingDates,
+    calendarStatus: workdayStats.calendarStatus,
     productSelectionCount: 0,
     productListingCount: 0,
     approvedCount: 0,
@@ -726,6 +981,7 @@ export async function getEmployeeTaskWeeklySummary(user: JwtPayload, params: { w
 
   for (const log of logs) {
     const date = log.workDate.toISOString().slice(0, 10);
+    if (!workdayDateSet.has(date)) continue;
     if (log.taskType === OperationTaskType.PRODUCT_SELECTION) dailyReportSummary.productSelectionCount += log.quantity;
     if (log.taskType === OperationTaskType.PRODUCT_LISTING) dailyReportSummary.productListingCount += log.quantity;
     if (log.taskType === OperationTaskType.APPROVED_COUNT) dailyReportSummary.approvedCount += log.quantity;
@@ -752,7 +1008,9 @@ export async function getEmployeeTaskWeeklySummary(user: JwtPayload, params: { w
     createdTaskSummary,
   });
   const summaryText = {
-    dailyReport: `上周共提交日报 ${dailyReportSummary.submittedDays} 天，缺失 ${dailyReportSummary.missingDays} 天；累计选品 ${dailyReportSummary.productSelectionCount} 个，上新 ${dailyReportSummary.productListingCount} 个，合规 ${dailyReportSummary.approvedCount} 个，发货 ${dailyReportSummary.shipmentCount} 个。`,
+    dailyReport: workdayStats.requiredDays > 0
+      ? `上周应登记日报 ${dailyReportSummary.requiredDays} 天，已登记 ${dailyReportSummary.submittedDays} 天，缺失 ${dailyReportSummary.missingDays} 天；累计选品 ${dailyReportSummary.productSelectionCount} 个，上新 ${dailyReportSummary.productListingCount} 个，合规 ${dailyReportSummary.approvedCount} 个，发货 ${dailyReportSummary.shipmentCount} 个。`
+      : `上周运营日历未配置运营日，暂不计算日报缺失；累计选品 ${dailyReportSummary.productSelectionCount} 个，上新 ${dailyReportSummary.productListingCount} 个，合规 ${dailyReportSummary.approvedCount} 个，发货 ${dailyReportSummary.shipmentCount} 个。`,
     receivedTasks: `上周收到任务 ${receivedTaskSummary.totalCount} 个，完成 ${receivedTaskSummary.doneCount} 个，未完成 ${receivedTaskSummary.pendingCount} 个，逾期 ${receivedTaskSummary.overdueCount} 个。`,
     createdTasks: `上周发起任务 ${createdTaskSummary.totalCount} 个，已完成 ${createdTaskSummary.doneCount} 个，待跟进 ${createdTaskSummary.pendingCount} 个，逾期 ${createdTaskSummary.overdueCount} 个。`,
     nextWeekPlan: planSuggestions.join(' '),
@@ -767,6 +1025,12 @@ export async function getEmployeeTaskWeeklySummary(user: JwtPayload, params: { w
     planSuggestions,
     summaryText,
     aiStatus: 'NOT_ENABLED',
+    workdayCalendarStatus: workdayStats.calendarStatus,
+    workdayDates: workdayStats.workdayDates,
+    pendingDates: workdayStats.pendingDates,
+    requiredReportDays: workdayStats.requiredDays,
+    submittedReportDays: dailyReportSummary.submittedDays,
+    missingReportDays: workdayStats.missingDays,
   };
 }
 
@@ -776,7 +1040,7 @@ export async function updateEmployeeTaskStatus(user: JwtPayload, taskId: number,
   }
   const nextStatus = parseStatus(input.status);
   const remark = parseOptionalString(input.remark);
-  const existing = await getVisibleTaskOrThrow(taskId, user.userId);
+  const existing = await getVisibleTaskOrThrow(taskId, user);
 
   if (existing.status === EmployeeTaskStatus.DONE || existing.status === EmployeeTaskStatus.CANCELLED) {
     throw new Error('任务已完成或已取消，不能再修改状态');
@@ -787,16 +1051,22 @@ export async function updateEmployeeTaskStatus(user: JwtPayload, taskId: number,
 
   const isAssignee = existing.assigneeId === user.userId;
   const isCreator = existing.creatorId === user.userId;
-  const assigneeAllowedStatuses: EmployeeTaskStatus[] = [
-    EmployeeTaskStatus.TODO,
-    EmployeeTaskStatus.IN_PROGRESS,
-    EmployeeTaskStatus.DONE,
-  ];
-  const assigneeAllowed = isAssignee && assigneeAllowedStatuses.includes(nextStatus);
-  const creatorAllowed = isCreator && nextStatus === EmployeeTaskStatus.CANCELLED;
 
-  if (!assigneeAllowed && !creatorAllowed) {
-    throw Object.assign(new Error('无权限执行该状态流转'), { statusCode: 403 });
+  if (nextStatus === EmployeeTaskStatus.CANCELLED) {
+    const canCancel = isCreator || isEmployeeTaskAdmin(user);
+    if (!canCancel) {
+      throw Object.assign(new Error('只有派发任务的人可以取消任务'), { statusCode: 403 });
+    }
+  } else {
+    const assigneeAllowedStatuses: EmployeeTaskStatus[] = [
+      EmployeeTaskStatus.TODO,
+      EmployeeTaskStatus.IN_PROGRESS,
+      EmployeeTaskStatus.DONE,
+    ];
+    const assigneeAllowed = isAssignee && assigneeAllowedStatuses.includes(nextStatus);
+    if (!assigneeAllowed) {
+      throw Object.assign(new Error('无权限执行该状态流转'), { statusCode: 403 });
+    }
   }
 
   const now = new Date();
@@ -832,7 +1102,7 @@ export async function updateEmployeeTask(user: JwtPayload, taskId: number, input
   if (!Number.isInteger(taskId) || taskId <= 0) {
     throw new Error('id 必须是正整数');
   }
-  const existing = await getVisibleTaskOrThrow(taskId, user.userId);
+  const existing = await getVisibleTaskOrThrow(taskId, user);
   if (existing.creatorId !== user.userId) {
     throw Object.assign(new Error('只有创建人可以修改任务内容'), { statusCode: 403 });
   }
@@ -843,7 +1113,7 @@ export async function updateEmployeeTask(user: JwtPayload, taskId: number, input
   const data: Prisma.EmployeeTaskUpdateInput = {};
   if (input.title !== undefined) data.title = parseRequiredString(input.title, 'title');
   if (input.description !== undefined) data.description = parseOptionalString(input.description) ?? null;
-  if (input.platform !== undefined) data.platform = parsePlatform(input.platform) ?? null;
+  if (input.platform !== undefined) data.platform = parseRequiredPlatform(input.platform);
   if (input.shopId !== undefined) data.shop = parseOptionalPositiveInt(input.shopId, 'shopId')
     ? { connect: { id: parseOptionalPositiveInt(input.shopId, 'shopId') } }
     : { disconnect: true };
@@ -877,4 +1147,135 @@ export async function updateEmployeeTask(user: JwtPayload, taskId: number, input
   });
 
   return formatTaskDetail(updated);
+}
+
+export async function startEmployeeTask(user: JwtPayload, taskId: number) {
+  if (!Number.isInteger(taskId) || taskId <= 0) {
+    throw new Error('id 必须是正整数');
+  }
+  const existing = await getVisibleTaskOrThrow(taskId, user);
+  if (existing.assigneeId !== user.userId) {
+    throw Object.assign(new Error('只有被指派人可以开始处理任务'), { statusCode: 403 });
+  }
+  if (existing.status === EmployeeTaskStatus.DONE || existing.status === EmployeeTaskStatus.CANCELLED) {
+    throw new Error('任务已完成或已取消，不能再修改状态');
+  }
+  if (existing.status === EmployeeTaskStatus.IN_PROGRESS) {
+    return formatTaskDetail(existing);
+  }
+  return updateEmployeeTaskStatus(user, taskId, { status: EmployeeTaskStatus.IN_PROGRESS });
+}
+
+export async function updateEmployeeTaskDueDate(user: JwtPayload, taskId: number, input: { dueDate?: unknown }) {
+  if (!Number.isInteger(taskId) || taskId <= 0) {
+    throw new Error('id 必须是正整数');
+  }
+  const existing = await getVisibleTaskOrThrow(taskId, user);
+  if (!canUpdateDueDate(existing, user)) {
+    throw Object.assign(new Error('无权限调整该任务截止日期'), { statusCode: 403 });
+  }
+  if (existing.status === EmployeeTaskStatus.DONE || existing.status === EmployeeTaskStatus.CANCELLED) {
+    throw new Error('任务已完成或已取消，不能修改截止日期');
+  }
+
+  const dueDate = parseDueDateOnly(input.dueDate);
+  const dueDateText = dueDateToDateString(dueDate);
+  const operator = await prisma.user.findUnique({
+    where: { id: user.userId },
+    select: { name: true },
+  });
+  const operatorName = operator?.name ?? user.username;
+
+  const updated = await prisma.$transaction(async (tx) => {
+    await tx.employeeTask.update({
+      where: { id: existing.id },
+      data: { dueDate },
+    });
+    await tx.employeeTaskLog.create({
+      data: {
+        taskId: existing.id,
+        operatorId: user.userId,
+        action: EmployeeTaskLogAction.DUE_DATE_UPDATED,
+        fromStatus: existing.status,
+        toStatus: existing.status,
+        remark: `${operatorName}将截止日期调整为 ${dueDateText}`,
+      },
+    });
+    return tx.employeeTask.findUniqueOrThrow({
+      where: { id: existing.id },
+      include: taskDetailInclude(),
+    });
+  });
+
+  return formatTaskDetail(updated);
+}
+
+export async function listEmployeeTaskComments(user: JwtPayload, taskId: number) {
+  if (!Number.isInteger(taskId) || taskId <= 0) {
+    throw new Error('id 必须是正整数');
+  }
+  await assertCanViewTaskComments(taskId, user);
+  const comments = await prisma.employeeTaskComment.findMany({
+    where: { taskId },
+    include: { author: { select: { id: true, name: true } } },
+    orderBy: { createdAt: 'asc' },
+  });
+  return Promise.all(comments.map(formatTaskComment));
+}
+
+export async function createEmployeeTaskComment(
+  user: JwtPayload,
+  taskId: number,
+  input: { content?: unknown; mentionedUserIds?: unknown },
+) {
+  if (!Number.isInteger(taskId) || taskId <= 0) {
+    throw new Error('id 必须是正整数');
+  }
+  const task = await prisma.employeeTask.findUnique({
+    where: { id: taskId },
+    select: { id: true, creatorId: true, assigneeId: true, status: true },
+  });
+  if (!task) {
+    throw Object.assign(new Error('任务不存在'), { statusCode: 404 });
+  }
+  if (!canCommentOnTask(task, user)) {
+    throw Object.assign(new Error('无权限在该任务下发表评论'), { statusCode: 403 });
+  }
+
+  const content = parseCommentContent(input.content);
+  const mentionedUserIds = parseMentionedUserIds(input.mentionedUserIds);
+  await assertActiveMentionedUsers(mentionedUserIds);
+
+  const operator = await prisma.user.findUnique({
+    where: { id: user.userId },
+    select: { name: true },
+  });
+  const operatorName = operator?.name ?? user.username;
+
+  const created = await prisma.$transaction(async (tx) => {
+    const comment = await tx.employeeTaskComment.create({
+      data: {
+        taskId,
+        authorId: user.userId,
+        content,
+        mentionedUserIds: mentionedUserIds.length > 0 ? mentionedUserIds : undefined,
+      },
+      include: { author: { select: { id: true, name: true } } },
+    });
+    await tx.employeeTaskLog.create({
+      data: {
+        taskId,
+        operatorId: user.userId,
+        action: EmployeeTaskLogAction.COMMENTED,
+        remark: `${operatorName}发表了任务沟通`,
+      },
+    });
+    return comment;
+  });
+
+  return formatTaskComment(created);
+}
+
+export async function getMentionUsers() {
+  return getAssignableUsers();
 }

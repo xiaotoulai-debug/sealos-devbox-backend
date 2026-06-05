@@ -440,7 +440,19 @@ OR: [{ shopId: currentShopId }, { shopId: null }]
 
 **字段来源与自动更新**：`product_offer/read` 中的 `ownership`、`number_of_offers`、`best_offer_sale_price`、`main_offer_price`、`buy_button_rank` 经 `emagProductNormalizer.ts` 解析后，在正常平台产品同步流程 `storeProductSync.ts` 中写入 `store_products` 的轻量派生字段。新增店铺首次同步产品、手动刷新平台产品、定时产品雷达同步都会自动重新计算 `linkType/contentPermission/offerCompetition/linkActionTips`；`backfill:emag-link-type` 只用于历史旧数据补齐，不是唯一入口。`emag_offer_meta` 只保存 compact meta，不保存完整 raw response，避免表膨胀。
 
-**ownership 兼容规则**：`true / "true" / 1 / "1"` 推断为 `SELF_BUILT`（自建链接、可维护资料）；`false / "false" / 2 / "2"` 推断为 `RESELL`（跟卖链接、仅报价）；缺失或无法识别时为 `UNKNOWN`。当前没有本地发布日志时，来源为 `OWNERSHIP`、可信度 `MEDIUM`；未来发布日志可作为 `PUBLISH_LOG`，可信度 `HIGH`；无法判断时为 `UNKNOWN/LOW`。
+**运营口径（2026-06-04，最终确认）**：平台产品中的「自建链接 / 跟卖链接 / 待确认」按**当前店铺资料维护权限**判断，**不等同于**历史创建归属。`ownership=1 / true / "1"` => `SELF_BUILT`（可维护标题、图片、描述、属性，来源 `OWNERSHIP_CONTENT_PERMISSION`、可信度 `HIGH`）；`ownership=2 / false / "2"` => `RESELL`（仅报价/价格/库存，来源 `OWNERSHIP_CONTENT_PERMISSION`、可信度 `HIGH`）；`ownership` 缺失或无法识别 => `UNKNOWN`（来源 `OWNERSHIP_UNKNOWN`、可信度 `LOW`）。`contentPermission` 由 `linkType` 派生：`SELF_BUILT=>EDITABLE`，`RESELL=>OFFER_ONLY`，`UNKNOWN=>UNKNOWN`。
+
+**禁止判断来源**：不能用品牌、PNK 是否存在、图片/标题、购物车状态、`buy_button_rank`、`number_of_offers`、多卖家竞争、同公司其他店铺是否创建过来判断自建/跟卖。
+
+**ownership 本地回填脚本**（按库内 `emag_ownership` 批量重算，无需调 eMAG API）：
+
+```bash
+npm run backfill:emag-link-type-ownership -- --dryRun=true
+npm run backfill:emag-link-type-ownership -- --dryRun=false
+npm run backfill:emag-link-type-ownership -- --shopId=5 --dryRun=false
+```
+
+`fix:emag-link-type` 为兼容别名，内部同上。按店铺从 API 重拉请用 `backfill:emag-link-type`。
 
 **竞争状态**：`number_of_offers === 0` 返回 `NO_ACTIVE_COMPETITION`（暂无竞争）；`number_of_offers === 1` 返回 `EXCLUSIVE`（独家报价）；`number_of_offers > 1` 返回 `COMPETITIVE`（多卖家竞争）；缺失、空值或非数字返回 `UNKNOWN`（竞争未知）。`number_of_offers` 只用于竞争标签，不参与自建/跟卖判断。自建链接如果出现多卖家竞争，会返回 `['投诉卖家', '检查乱价', '维护品牌']`；跟卖链接多卖家竞争返回 `['关注购物车', '调整报价', '控制毛利']`；暂无竞争时按链接身份返回库存和资料维护类提醒。
 
@@ -627,13 +639,15 @@ graph TD
 
 **模块定位**：新增独立 `/api/employee-tasks` 后端模块，支持员工之间创建、指派、跟踪个人相关任务；它不是全员任务管理后台，也不复用 `OperationDailyReport/OperationDailyLog`。所有员工任务中心查询都必须限制为 `creatorId = 当前用户 OR assigneeId = 当前用户`，管理员在本模块内也只看自己的任务，全员任务管理后续单独开发。
 
-**数据模型**：`EmployeeTask` 记录任务标题、说明、任务类型、平台、可选店铺、优先级、状态、创建人、被指派人、截止时间、完成/取消时间、SKU/SKC 文本和备注；`EmployeeTaskLog` 记录创建、状态变更、内容修改和取消操作，包含操作者、动作、前后状态和备注。任务状态只包含 `TODO/IN_PROGRESS/DONE/CANCELLED`，逾期不入库，由 `status != DONE/CANCELLED && dueDate < now` 动态计算。任务不做物理删除，取消统一使用 `CANCELLED`。
+**数据模型**：`EmployeeTask` 记录任务标题、说明、任务类型、平台、可选店铺、优先级、状态、创建人、被指派人、截止时间、完成/取消时间、SKU/SKC 文本和备注；`EmployeeTaskLog` 记录创建、状态变更、内容修改、取消、截止日期调整和评论操作，包含操作者、动作、前后状态和备注；`EmployeeTaskComment` 记录任务沟通评论与 `mentionedUserIds`（Json 数组）。任务状态只包含 `TODO/IN_PROGRESS/DONE/CANCELLED`（API 展示 TODO 为「待完成」），逾期不入库，由 `status != DONE/CANCELLED && dueDate < now` 动态计算。任务不做物理删除，取消统一使用 `CANCELLED`。
 
-**API**：`POST /api/employee-tasks` 创建任务；`GET /api/employee-tasks/my-dashboard?weekStart=YYYY-MM-DD` 查询我的任务中心；`GET /api/employee-tasks/received` 与 `GET /api/employee-tasks/created` 分页查询我收到/我发起的任务；`GET /api/employee-tasks/:id` 查询任务详情和操作日志；`PATCH /api/employee-tasks/:id/status` 更新状态；`PATCH /api/employee-tasks/:id` 仅允许创建人有限编辑未完成/未取消任务；`GET /api/employee-tasks/assignable-users` 返回 ACTIVE 用户供选择指派人。所有响应保持 `{ code, data, message }`。
+**API**：`POST /api/employee-tasks` 创建任务（默认 `TODO`）；`GET /api/employee-tasks/my-dashboard?weekStart=YYYY-MM-DD` 查询我的任务中心；`GET /api/employee-tasks/received` 与 `GET /api/employee-tasks/created` 分页查询我收到/我发起的任务；`GET /api/employee-tasks/:id` 查询任务详情和操作日志；`PATCH /api/employee-tasks/:id/status` 更新状态（被指派人可从 `TODO/IN_PROGRESS` 直接 `DONE`，无需 start；仅创建人或管理员可 `CANCELLED`）；`POST /api/employee-tasks/:id/start` 保留兼容（TODO→IN_PROGRESS）；`PATCH /api/employee-tasks/:id/due-date` 修改截止日期（仅 `YYYY-MM-DD`，被指派人/创建人/管理员）；`GET/POST /api/employee-tasks/:id/comments` 任务沟通评论；`GET /api/employee-tasks/mention-users` 可 @ 的 ACTIVE 用户；`PATCH /api/employee-tasks/:id` 仅允许创建人有限编辑未完成/未取消任务；`GET /api/employee-tasks/assignable-users` 返回 ACTIVE 用户供选择指派人。所有响应保持 `{ code, data, message }`。
 
-**权限与统计口径**：所有接口必须登录。创建任务时 `creatorId` 只能取 `req.user.userId`，禁止读取前端传入的 creator；`assigneeId` 必须是 ACTIVE 用户。assignee 只能把自己收到的任务改为 `TODO/IN_PROGRESS/DONE`，creator 只能取消自己创建的任务，不能替 assignee 标记 DONE；`DONE/CANCELLED` 后第一期禁止再改状态。`my-dashboard` 只统计当前用户相关任务：本周未完成按 `dueDate` 落在本周且非 DONE/CANCELLED，本周已完成按 `completedAt` 落在本周且 DONE，本月完成率按当前月 `dueDate` 内非 CANCELLED 任务计算 `DONE/总数`。
+**权限与统计口径**：所有接口必须登录。创建任务时 `creatorId` 只能取 `req.user.userId`，禁止读取前端传入的 creator；`assigneeId` 必须是 ACTIVE 用户。assignee 只能把自己收到的任务改为 `TODO/IN_PROGRESS/DONE`，creator 只能取消自己创建的任务，不能替 assignee 标记 DONE；`DONE/CANCELLED` 后第一期禁止再改状态。`my-dashboard` 只统计当前用户相关任务：本周未完成按 `dueDate` 落在本周且非 DONE/CANCELLED，本周已完成按 `completedAt` 落在本周且 DONE，本月完成率按当前月 `dueDate` 内非 CANCELLED 任务计算 `DONE/总数`。`historyTasks` 仅返回 `assigneeId=当前用户` 且非 CANCELLED 的任务；`createdTasks` 返回当前用户创建且指派给他人的任务；`collaborationTasks` 返回非 CANCELLED、非指派给当前用户、且满足「我创建 / 我评论 / 被 @」的协同任务（按 taskId 去重）；任务详情对评论参与者与被 @ 用户开放查看。
 
-**上周汇总**：`GET /api/employee-tasks/weekly-summary?weekStart=YYYY-MM-DD` 实时聚合当前登录用户自己的周数据，不保存周报、不接 AI、不允许传 `userId`，管理员也只能看自己的汇总。`weekStart` 不传时默认上周周一，传入时必须是周一；范围固定为 7 天。日报部分只查当前用户 `OperationDailyReport/OperationDailyLog` 的新 5 类任务；收到任务只查 `assigneeId=当前用户` 且 `dueDate/completedAt` 落周内；发起任务只查 `creatorId=当前用户` 且 `createdAt/dueDate/completedAt` 落周内。返回 `summaryText` 为规则模板生成，`aiStatus=NOT_ENABLED`。
+**上周汇总**：`GET /api/employee-tasks/weekly-summary?weekStart=YYYY-MM-DD` 实时聚合当前登录用户自己的周数据，不保存周报、不接 AI、不允许传 `userId`，管理员也只能看自己的汇总。`weekStart` 不传时默认上周周一，传入时必须是周一；范围固定为 7 天。日报部分只查当前用户 `OperationDailyReport/OperationDailyLog` 的新 5 类任务；收到任务只查 `assigneeId=当前用户` 且 `dueDate/completedAt` 落周内；发起任务只查 `creatorId=当前用户` 且 `createdAt/dueDate/completedAt` 落周内。日报缺失统计仅按 `WorkdayCalendar.status=WORKDAY`（用户可见文案称「运营日」）计算应登记/已登记/缺失；`REST/PENDING` 不计入；日志聚合也只统计 WORKDAY；若上周无 WORKDAY 则文案提示「运营日历未配置运营日」。返回 `summaryText` 为规则模板生成，`aiStatus=NOT_ENABLED`。
+
+**运营日历**：`GET /api/workday-calendar?year=YYYY` 返回全年 365/366 天（未配置日期默认 `PENDING`，`statusName` 为待定/运营日/休息日）；`PUT /api/workday-calendar/:date` 与 `POST /api/workday-calendar/batch` 仅管理员/上级可编辑（upsert `WORKDAY/REST/PENDING`，内部 enum 不变）。模型 `WorkdayCalendar` + enum `WorkdayStatus`。运营月度总览 `GET /api/operation-daily/monthly-overview` 昨日未登记仅在运营日（WORKDAY）时统计；REST/PENDING 返回空名单与提示；热力图单元格新增 `workdayStatus/registrationRequired/displayStatus/missingRequired`，REST/PENDING 不算缺失。
 
 ### 4.11 运营每日提醒 / 今日必做清单（Phase 1）
 
@@ -641,7 +655,7 @@ graph TD
 
 **数据模型**：`DailyReminderTemplate` 保存提醒标题、分类、优先级、频率、`weekdays(1-7)`、建议完成时间、平台、店铺、说明和启停状态；`DailyReminderTemplateAssignment` 保存模板适用对象，支持 `USER/ROLE`；`DailyReminderCheck` 保存员工每天对模板的检查结果，按 `templateId + userId + checkDate` 唯一 upsert。逾期不入库，由 `checkStatus=PENDING + suggestedTime + 当前时间` 动态计算。
 
-**API**：员工接口为 `GET /api/daily-reminders/today?date=YYYY-MM-DD` 和 `POST /api/daily-reminders/:templateId/check`；管理员/上级接口为 `POST /api/daily-reminders/templates`、`GET /api/daily-reminders/templates`、`GET /api/daily-reminders/templates/:id`、`PATCH /api/daily-reminders/templates/:id`、`PATCH /api/daily-reminders/templates/:id/status`。所有接口保持 `{ code, data, message }`。
+**API**：员工接口为 `GET /api/daily-reminders/today?date=YYYY-MM-DD` 和 `POST /api/daily-reminders/:templateId/check`；管理员/上级接口为 `POST /api/daily-reminders/templates`、`GET /api/daily-reminders/templates`、`GET /api/daily-reminders/templates/:id`、`PATCH /api/daily-reminders/templates/:id`、`PATCH /api/daily-reminders/templates/:id/status`、`DELETE /api/daily-reminders/templates/:id`（无历史 `DailyReminderCheck` 时硬删模板及 assignments；已有检查记录普通删除返回 409；`?force=true` 时同步删除 checks + assignments + template）。所有接口保持 `{ code, data, message }`。
 
 **权限与匹配口径**：所有接口必须登录。模板管理复用运营管理员判断：`roleName` 含 `admin/超级管理员`，或 permissions 含 `* / ALL / ADMIN_FULL / VIEW_OPERATION_DASHBOARD / MANAGE_OPERATION_LOGS`。普通员工只能查看分配给自己的今日提醒并提交自己的检查记录；管理员进入 today 也只看自己适用的提醒。today 仅返回 `isActive=true` 且 assignment 命中当前 `userId` 或 `roleId` 的模板，并按 `DAILY/WORKDAY/WEEKLY` 频率过滤日期；`ABNORMAL` 检查必须填写 note。
 
