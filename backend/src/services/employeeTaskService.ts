@@ -317,6 +317,20 @@ function resolveWeeklySummaryRange(weekStartInput?: unknown) {
   };
 }
 
+export function normalizeWeekStartInput(weekStartInput?: unknown): string {
+  if (weekStartInput == null || String(weekStartInput).trim() === '') {
+    return resolveWeeklySummaryRange().weekStart;
+  }
+  const raw = assertDateString(weekStartInput, 'weekStart');
+  const date = dateStringToDbDate(raw);
+  const day = date.getUTCDay() || 7;
+  if (day === 1) {
+    return raw;
+  }
+  date.setUTCDate(date.getUTCDate() - (day - 1));
+  return date.toISOString().slice(0, 10);
+}
+
 function monthRangeFor(date = new Date()) {
   const start = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth(), 1));
   const end = new Date(Date.UTC(date.getUTCFullYear(), date.getUTCMonth() + 1, 1) - 1);
@@ -965,8 +979,51 @@ function buildPlanSuggestions(params: {
   return suggestions;
 }
 
-export async function getEmployeeTaskWeeklySummary(user: JwtPayload, params: { weekStart?: unknown }) {
-  const range = resolveWeeklySummaryRange(params.weekStart);
+export type RuleWeeklySummary = {
+  weekStart: string;
+  weekEnd: string;
+  dailyReportSummary: {
+    submittedDays: number;
+    missingDays: number;
+    requiredDays: number;
+    workdayDates: string[];
+    missingDates: string[];
+    restDates: string[];
+    pendingDates: string[];
+    calendarStatus: 'CONFIGURED' | 'NOT_CONFIGURED';
+    productSelectionCount: number;
+    productListingCount: number;
+    approvedCount: number;
+    shipmentCount: number;
+    otherNotes: Array<{ date: string; text: string }>;
+    blockedItems: Array<{ date: string; taskType: string; taskTypeName: string; blockerReason: string }>;
+  };
+  receivedTaskSummary: ReturnType<typeof aggregateTaskSummary>;
+  createdTaskSummary: ReturnType<typeof aggregateTaskSummary>;
+  planSuggestions: string[];
+  summaryText: {
+    dailyReport: string;
+    receivedTasks: string;
+    createdTasks: string;
+    nextWeekPlan: string;
+  };
+  workdayCalendarStatus: 'CONFIGURED' | 'NOT_CONFIGURED';
+  workdayDates: string[];
+  pendingDates: string[];
+  requiredReportDays: number;
+  submittedReportDays: number;
+  missingReportDays: number;
+};
+
+export async function buildRuleWeeklySummary(
+  user: JwtPayload,
+  weekStartInput?: unknown,
+): Promise<RuleWeeklySummary> {
+  const range = resolveWeeklySummaryRange(
+    weekStartInput == null || String(weekStartInput).trim() === ''
+      ? undefined
+      : normalizeWeekStartInput(weekStartInput),
+  );
   const userId = user.userId;
 
   const [reports, logs, receivedTasks, createdTasks] = await Promise.all([
@@ -1091,7 +1148,6 @@ export async function getEmployeeTaskWeeklySummary(user: JwtPayload, params: { w
     createdTaskSummary,
     planSuggestions,
     summaryText,
-    aiStatus: 'NOT_ENABLED',
     workdayCalendarStatus: workdayStats.calendarStatus,
     workdayDates: workdayStats.workdayDates,
     pendingDates: workdayStats.pendingDates,
@@ -1099,6 +1155,15 @@ export async function getEmployeeTaskWeeklySummary(user: JwtPayload, params: { w
     submittedReportDays: dailyReportSummary.submittedDays,
     missingReportDays: workdayStats.missingDays,
   };
+}
+
+export async function getEmployeeTaskWeeklySummary(user: JwtPayload, params: { weekStart?: unknown }) {
+  const weekStart = params.weekStart == null || String(params.weekStart).trim() === ''
+    ? undefined
+    : normalizeWeekStartInput(params.weekStart);
+  const ruleSummary = await buildRuleWeeklySummary(user, weekStart);
+  const { mergeWeeklySummaryWithAiCache } = await import('./weeklyAiSummaryService');
+  return mergeWeeklySummaryWithAiCache(user, ruleSummary);
 }
 
 export async function updateEmployeeTaskStatus(user: JwtPayload, taskId: number, input: { status?: unknown; remark?: unknown }) {

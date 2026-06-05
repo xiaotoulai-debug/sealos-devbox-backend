@@ -31,6 +31,7 @@ import employeeTasksRouter from './routes/employeeTasks';
 import dailyRemindersRouter from './routes/dailyReminders';
 import workdayCalendarRouter from './routes/workdayCalendar';
 import { startSyncCrons } from './services/syncCron';
+import { startWeeklyAiSummaryCron } from './services/weeklyAiSummaryCron';
 import { backfillProductImages } from './services/storeProductSync';
 
 const app  = express();
@@ -169,6 +170,7 @@ async function start() {
     console.log(`   健康检查: http://localhost:${PORT}/api/health`);
     printRegisteredRoutes();
     startSyncCrons();
+    startWeeklyAiSummaryCron();
 
     // 启动时异步补齐 main_image 为空或 eMAG Logo 的产品（全局图片回补）
     setImmediate(async () => {

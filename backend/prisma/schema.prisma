@@ -31,6 +31,7 @@ model User {
   dailyReminderAssignments DailyReminderTemplateAssignment[]
   dailyReminderChecks DailyReminderCheck[]
   updatedWorkdayCalendars WorkdayCalendar[] @relation("WorkdayCalendarUpdatedBy")
+  employeeWeeklyAiSummaries EmployeeWeeklyAiSummary[]
   role           Role       @relation(fields: [roleId], references: [id])
 
   @@map("users")
@@ -501,6 +502,10 @@ model EmployeeTask {
 
   @@index([assigneeId, status, dueDate])
   @@index([creatorId, status, dueDate])
+  @@index([assigneeId, status, completedAt])
+  @@index([assigneeId, status, cancelledAt])
+  @@index([creatorId, status, createdAt])
+  @@index([creatorId, status, completedAt])
   @@index([dueDate])
   @@index([status])
   @@index([taskType])
@@ -545,6 +550,35 @@ model EmployeeTaskComment {
   @@index([taskId])
   @@index([authorId])
   @@map("employee_task_comments")
+}
+
+/// 员工任务上周汇总 AI 缓存：按 userId + weekStart 唯一，sourceHash 不变则复用
+model EmployeeWeeklyAiSummary {
+  id            Int                           @id @default(autoincrement())
+  userId        Int                           @map("user_id")
+  weekStart     DateTime                      @map("week_start") @db.Date
+  weekEnd       DateTime                      @map("week_end") @db.Date
+  sourceHash    String                        @map("source_hash")
+  provider      String                        @default("deepseek")
+  model         String
+  promptVersion String                        @map("prompt_version")
+  status        EmployeeWeeklyAiSummaryStatus @default(PENDING)
+  summaryJson   Json?                         @map("summary_json")
+  rawText       String?                       @map("raw_text") @db.Text
+  errorMessage  String?                       @map("error_message") @db.Text
+  inputTokens   Int?                          @map("input_tokens")
+  outputTokens  Int?                          @map("output_tokens")
+  costEstimate  Decimal?                      @map("cost_estimate") @db.Decimal(10, 6)
+  generatedAt   DateTime?                     @map("generated_at")
+  createdAt     DateTime                      @default(now()) @map("created_at")
+  updatedAt     DateTime                      @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id])
+
+  @@unique([userId, weekStart])
+  @@index([userId, weekStart, status])
+  @@index([status, weekStart])
+  @@map("employee_weekly_ai_summaries")
 }
 
 /// 全年工作日日历：管理员维护工作日/休息日/待定，用于日报缺失统计
@@ -804,6 +838,14 @@ enum WorkdayStatus {
   WORKDAY
   REST
   PENDING
+}
+
+/// 员工任务上周汇总 AI 缓存状态
+enum EmployeeWeeklyAiSummaryStatus {
+  RULE_ONLY
+  PENDING
+  READY
+  FAILED
 }
 
 /// 运营每日提醒分类

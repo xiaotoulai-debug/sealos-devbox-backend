@@ -16,6 +16,7 @@ import {
   updateEmployeeTaskDueDate,
   updateEmployeeTaskStatus,
 } from '../services/employeeTaskService';
+import { generateWeeklyAiSummary } from '../services/weeklyAiSummaryService';
 
 const router = Router();
 router.use(authenticate);
@@ -104,6 +105,23 @@ router.get('/weekly-summary', async (req: Request, res: Response) => {
   } catch (err) {
     console.error('[GET /api/employee-tasks/weekly-summary]', err);
     sendError(res, err, '查询上周汇总失败');
+  }
+});
+
+router.post('/weekly-summary/ai-generate', async (req: Request, res: Response) => {
+  try {
+    if (req.body?.userId != null) {
+      res.status(400).json({ code: 400, data: null, message: 'weekly-summary 不允许传 userId' });
+      return;
+    }
+    const data = await generateWeeklyAiSummary(req.user!, {
+      weekStart: req.body?.weekStart,
+      force: req.body?.force === true,
+    });
+    res.json({ code: 200, data, message: 'success' });
+  } catch (err) {
+    console.error('[POST /api/employee-tasks/weekly-summary/ai-generate]', err);
+    sendError(res, err, '生成 AI 周报失败');
   }
 });
 
