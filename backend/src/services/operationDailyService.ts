@@ -7,7 +7,7 @@ import {
   WorkdayStatus,
 } from '@prisma/client';
 import { prisma } from '../lib/prisma';
-import { JwtPayload } from '../middleware/auth';
+import { DASHBOARD_PERMISSION, hasStrictPermission, JwtPayload } from '../middleware/auth';
 import { getWorkdayStatusForDate, getWorkdayStatusMap } from './workdayCalendarService';
 
 const TASK_TYPES = Object.values(OperationTaskType);
@@ -108,6 +108,18 @@ export function isOperationManager(user?: JwtPayload): boolean {
   );
 }
 
+export function canSubmitOperationDaily(user?: JwtPayload): boolean {
+  if (!user) return false;
+  const roleName = String(user.roleName ?? '').trim();
+  if (roleName === '运营专员' || roleName === '运营主管') return true;
+  return hasStrictPermission(user, 'ACTION_OPERATION_DAILY_SUBMIT');
+}
+
+export function canViewOperationDailyDetail(user?: JwtPayload): boolean {
+  if (!user) return false;
+  return hasStrictPermission(user, DASHBOARD_PERMISSION.DAILY);
+}
+
 function normalizeRoleText(value: unknown): string {
   return String(value ?? '').trim().toLowerCase().replace(/[\s_-]+/g, '');
 }
@@ -142,8 +154,28 @@ function collectRoleLikeValues(user: unknown): unknown[] {
   return values.filter((value) => value != null && String(value).trim() !== '');
 }
 
+export const DAILY_REPORT_ROLE_NAMES = ['运营专员', '运营主管'] as const;
+
+export function isDailyReportRole(roleName?: string | null): boolean {
+  return DAILY_REPORT_ROLE_NAMES.includes(String(roleName ?? '').trim() as typeof DAILY_REPORT_ROLE_NAMES[number]);
+}
+
+type DailyReportParticipantCandidate = {
+  role?: { name?: string | null } | null;
+};
+
+export function isDailyReportParticipant(user?: DailyReportParticipantCandidate | null): boolean {
+  return isDailyReportRole(user?.role?.name);
+}
+
+const dailyReportParticipantWhere = {
+  status: UserStatus.ACTIVE,
+  role: { name: { in: [...DAILY_REPORT_ROLE_NAMES] } },
+};
+
 export function isOperationUser(user?: unknown): boolean {
-  const source = (user ?? {}) as { permissions?: unknown };
+  const source = (user ?? {}) as DailyReportParticipantCandidate & { permissions?: unknown };
+  if (isDailyReportParticipant(source)) return true;
   const operationRoleCodes = new Set([
     'operation',
     'operations',
@@ -158,7 +190,7 @@ export function isOperationUser(user?: unknown): boolean {
     const normalized = normalizeRoleText(raw);
     if (!normalized) return false;
     if (/仓库|warehouse/.test(raw.toLowerCase())) return false;
-    return raw.includes('运营专员') || operationRoleCodes.has(normalized) || normalized.includes('operationspecialist');
+    return operationRoleCodes.has(normalized) || normalized.includes('operationspecialist');
   });
   if (hasOperationRole) return true;
 
@@ -166,9 +198,9 @@ export function isOperationUser(user?: unknown): boolean {
   return permissions.some((permission) => operationRoleCodes.has(normalizeRoleText(permission)));
 }
 
-function assertOperationUser(user: JwtPayload): void {
-  if (!isOperationUser(user)) {
-    throw Object.assign(new Error('仅运营专员需要提交每日任务'), { statusCode: 403 });
+function assertCanSubmitOperationDaily(user: JwtPayload): void {
+  if (!canSubmitOperationDaily(user)) {
+    throw Object.assign(new Error('仅运营专员或运营主管可以提交每日登记'), { statusCode: 403 });
   }
 }
 
@@ -507,7 +539,7 @@ function formatLog(log: {
 }
 
 export async function createOperationDailyLog(user: JwtPayload, input: CreateOperationDailyLogInput) {
-  assertOperationUser(user);
+  assertCanSubmitOperationDaily(user);
   const workDateString = assertDateString(input.workDate, 'workDate');
   const taskType = parseTaskType(input.taskType);
   const platform = parsePlatform(input.platform);
@@ -544,7 +576,7 @@ export async function createOperationDailyLog(user: JwtPayload, input: CreateOpe
 }
 
 export async function submitOperationDailyReport(user: JwtPayload, input: SubmitOperationDailyReportInput) {
-  assertOperationUser(user);
+  assertCanSubmitOperationDaily(user);
   const workDateString = assertDateString(input.workDate, 'workDate');
   assertBackfillAllowed(workDateString, user);
   const items = normalizeReportItems(input.items);
@@ -596,7 +628,7 @@ export async function updateOperationDailyReport(
   reportId: number,
   input: SubmitOperationDailyReportInput,
 ) {
-  assertOperationUser(user);
+  assertCanSubmitOperationDaily(user);
   if (!Number.isInteger(reportId) || reportId <= 0) {
     throw new Error('reportId 必须是正整数');
   }
@@ -699,7 +731,7 @@ export async function getOperationDailyDashboard(params: { user: JwtPayload; dat
 
   const [activeUsers, dayReports, dayLogs, rangeLogs] = await Promise.all([
     prisma.user.findMany({
-      where: { status: UserStatus.ACTIVE },
+      where: dailyReportParticipantWhere,
       select: { id: true, name: true, role: { select: { name: true } } },
       orderBy: { id: 'asc' },
     }),
@@ -724,7 +756,7 @@ export async function getOperationDailyDashboard(params: { user: JwtPayload; dat
     }),
   ]);
 
-  const operationUsers = activeUsers.filter(isOperationUser);
+  const operationUsers = activeUsers;
   const operationUserIds = new Set(operationUsers.map((user) => user.id));
   const reportsByUser = new Map(
     dayReports
@@ -857,7 +889,7 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
 
   const [activeUsers, monthReports, monthLogs, yesterdayReports, workdayStatusMap, yesterdayWorkdayStatus] = await Promise.all([
     prisma.user.findMany({
-      where: { status: UserStatus.ACTIVE },
+      where: dailyReportParticipantWhere,
       select: { id: true, name: true, role: { select: { name: true } } },
       orderBy: { id: 'asc' },
     }),
@@ -896,7 +928,7 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
     getWorkdayStatusForDate(yesterday),
   ]);
 
-  const operationUsers = activeUsers.filter(isOperationUser);
+  const operationUsers = activeUsers;
   const operationUserIds = new Set(operationUsers.map((user) => user.id));
   const reportMap = new Map<string, { id: number; userId: number; workDate: Date; editCount: number }>();
   for (const report of monthReports) {

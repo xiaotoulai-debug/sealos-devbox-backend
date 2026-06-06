@@ -1,10 +1,22 @@
 export type EmagLinkType = 'SELF_BUILT' | 'RESELL' | 'UNKNOWN';
-export type EmagLinkTypeSource = 'PUBLISH_LOG' | 'OWNERSHIP' | 'MANUAL' | 'UNKNOWN';
+export type OwnershipContentPermission = 'OWNER' | 'OFFER_ONLY' | 'UNKNOWN';
+export type EmagLinkTypeSource =
+  | 'OWNERSHIP_CONTENT_PERMISSION'
+  | 'OWNERSHIP_UNKNOWN'
+  | 'PUBLISH_LOG'
+  | 'PUBLISH_LOG_CREATE'
+  | 'PUBLISH_LOG_ATTACH'
+  | 'OWNERSHIP'
+  | 'OWNERSHIP_FALSE'
+  | 'OWNERSHIP_UNVERIFIED'
+  | 'MANUAL'
+  | 'UNKNOWN';
 export type EmagLinkTypeConfidence = 'HIGH' | 'MEDIUM' | 'LOW';
 export type ContentPermission = 'EDITABLE' | 'OFFER_ONLY' | 'UNKNOWN';
 export type OfferCompetitionType = 'NO_ACTIVE_COMPETITION' | 'EXCLUSIVE' | 'COMPETITIVE' | 'UNKNOWN';
 
 export type PublishLogLike = {
+  shopId?: number | null;
   mode?: 'CREATE_PRODUCT' | 'ATTACH_EXISTING' | string | null;
   partNumberKey?: string | null;
   matchedBy?: 'EAN' | string | null;
@@ -58,59 +70,80 @@ export const OFFER_COMPETITION_LABELS: Record<OfferCompetitionType, string> = {
   UNKNOWN: '竞争未知',
 };
 
-export function normalizeOwnership(value: unknown): EmagLinkType {
-  if (value === true || value === 1) return 'SELF_BUILT';
-  if (value === false || value === 2) return 'RESELL';
-
+/** ownership=1/true/"1"：当前店铺拥有商品资料维护权 */
+export function isOwnershipOwner(value: unknown): boolean {
+  if (value === true || value === 1) return true;
   if (typeof value === 'string') {
     const normalized = value.trim().toLowerCase();
-    if (normalized === 'true' || normalized === '1') return 'SELF_BUILT';
-    if (normalized === 'false' || normalized === '2') return 'RESELL';
+    return normalized === 'true' || normalized === '1';
   }
+  return false;
+}
 
+/** ownership=2/false/"2"：当前店铺仅可维护报价 */
+export function isOwnershipOfferOnly(value: unknown): boolean {
+  if (value === false || value === 2) return true;
+  if (typeof value === 'string') {
+    const normalized = value.trim().toLowerCase();
+    return normalized === 'false' || normalized === '2';
+  }
+  return false;
+}
+
+/** @deprecated 使用 isOwnershipOwner */
+export function isOwnershipTrue(value: unknown): boolean {
+  return isOwnershipOwner(value);
+}
+
+/** @deprecated 使用 isOwnershipOfferOnly */
+export function isOwnershipFalse(value: unknown): boolean {
+  return isOwnershipOfferOnly(value);
+}
+
+export function normalizeOwnershipContentPermission(ownership: unknown): OwnershipContentPermission {
+  if (isOwnershipOwner(ownership)) return 'OWNER';
+  if (isOwnershipOfferOnly(ownership)) return 'OFFER_ONLY';
   return 'UNKNOWN';
 }
 
+/** @deprecated 使用 normalizeOwnershipContentPermission */
+export function normalizeOwnership(value: unknown): EmagLinkType {
+  const permission = normalizeOwnershipContentPermission(value);
+  if (permission === 'OWNER') return 'SELF_BUILT';
+  if (permission === 'OFFER_ONLY') return 'RESELL';
+  return 'UNKNOWN';
+}
+
+/**
+ * 运营口径：按 ownership 判断当前店铺资料维护权限。
+ * 自建链接 = 可维护标题/图片/描述/属性；跟卖链接 = 仅报价/价格/库存；待确认 = ownership 缺失或无法识别。
+ */
 export function inferEmagLinkType(input: EmagLinkInferenceInput): EmagLinkTypeResult {
-  const publishLog = input.publishLog;
-  if (publishLog) {
-    const mode = String(publishLog.mode ?? '').trim().toUpperCase();
-    const partNumberKey = String(publishLog.partNumberKey ?? '').trim();
-    const matchedBy = String(publishLog.matchedBy ?? '').trim().toUpperCase();
+  const ownership = input.rawApiData?.ownership;
+  const permission = normalizeOwnershipContentPermission(ownership);
 
-    if (mode === 'CREATE_PRODUCT' && !partNumberKey) {
-      return {
-        linkType: 'SELF_BUILT',
-        linkTypeLabel: LINK_TYPE_LABELS.SELF_BUILT,
-        linkTypeSource: 'PUBLISH_LOG',
-        linkTypeConfidence: 'HIGH',
-      };
-    }
-
-    if (mode === 'ATTACH_EXISTING' || partNumberKey || matchedBy === 'EAN') {
-      return {
-        linkType: 'RESELL',
-        linkTypeLabel: LINK_TYPE_LABELS.RESELL,
-        linkTypeSource: 'PUBLISH_LOG',
-        linkTypeConfidence: 'HIGH',
-      };
-    }
+  if (permission === 'OWNER') {
+    return {
+      linkType: 'SELF_BUILT',
+      linkTypeLabel: LINK_TYPE_LABELS.SELF_BUILT,
+      linkTypeSource: 'OWNERSHIP_CONTENT_PERMISSION',
+      linkTypeConfidence: 'HIGH',
+    };
   }
 
-  const linkType = normalizeOwnership(input.rawApiData?.ownership);
-  if (linkType !== 'UNKNOWN') {
+  if (permission === 'OFFER_ONLY') {
     return {
-      linkType,
-      linkTypeLabel: LINK_TYPE_LABELS[linkType],
-      linkTypeSource: 'OWNERSHIP',
-      linkTypeConfidence: 'MEDIUM',
+      linkType: 'RESELL',
+      linkTypeLabel: LINK_TYPE_LABELS.RESELL,
+      linkTypeSource: 'OWNERSHIP_CONTENT_PERMISSION',
+      linkTypeConfidence: 'HIGH',
     };
   }
 
   return {
     linkType: 'UNKNOWN',
     linkTypeLabel: LINK_TYPE_LABELS.UNKNOWN,
-    linkTypeSource: 'UNKNOWN',
+    linkTypeSource: 'OWNERSHIP_UNKNOWN',
     linkTypeConfidence: 'LOW',
   };
 }
@@ -133,6 +166,30 @@ export function inferContentPermission(linkType: EmagLinkType): ContentPermissio
   return {
     contentPermission: 'UNKNOWN',
     contentPermissionLabel: CONTENT_PERMISSION_LABELS.UNKNOWN,
+  };
+}
+
+export function buildLinkTypeUpdateFromOwnership(
+  shopId: number,
+  pnk: string,
+  ownership: unknown,
+  offerCompetitionType: OfferCompetitionType,
+) {
+  const linkTypeResult = inferEmagLinkType({
+    shopId,
+    pnk,
+    rawApiData: { ownership },
+    publishLog: null,
+  });
+  const contentPermission = inferContentPermission(linkTypeResult.linkType);
+  const linkActionTips = inferLinkActionTips(linkTypeResult.linkType, offerCompetitionType);
+
+  return {
+    emagLinkType: linkTypeResult.linkType,
+    emagLinkTypeSource: linkTypeResult.linkTypeSource,
+    emagLinkTypeConfidence: linkTypeResult.linkTypeConfidence,
+    contentPermission: contentPermission.contentPermission,
+    linkActionTips,
   };
 }
 
@@ -205,6 +262,10 @@ export function inferLinkActionTips(linkType: EmagLinkType, offerCompetitionType
 
   if (linkType === 'UNKNOWN' && offerCompetitionType === 'NO_ACTIVE_COMPETITION') {
     return ['确认链接来源', '观察库存状态'];
+  }
+
+  if (linkType === 'UNKNOWN' && offerCompetitionType === 'COMPETITIVE') {
+    return ['确认链接来源', '关注购物车', '检查报价'];
   }
 
   return ['确认链接来源', '检查资料权限'];

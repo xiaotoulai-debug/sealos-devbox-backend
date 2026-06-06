@@ -9,7 +9,7 @@ import {
   UserStatus,
 } from '@prisma/client';
 import { prisma } from '../lib/prisma';
-import { JwtPayload } from '../middleware/auth';
+import { canManageEmployeeTasks, JwtPayload } from '../middleware/auth';
 import { resolveWeekWorkdayReportStats } from './workdayCalendarService';
 import { mergeWeeklySummaryWithAiCache } from './weeklyAiSummaryService';
 
@@ -45,18 +45,6 @@ const PRIORITY_NAMES: Record<EmployeeTaskPriority, string> = {
 };
 
 const MAX_COMMENT_LENGTH = 1000;
-
-function isEmployeeTaskAdmin(user: JwtPayload): boolean {
-  const roleNameLower = (user.roleName ?? '').toLowerCase();
-  const permissions = user.permissions ?? [];
-  return (
-    roleNameLower.includes('admin') ||
-    roleNameLower.includes('超级管理员') ||
-    permissions.includes('*') ||
-    permissions.includes('ALL') ||
-    permissions.includes('ADMIN_FULL')
-  );
-}
 
 function parseDueDateOnly(value: unknown): Date {
   const raw = String(value ?? '').trim();
@@ -489,12 +477,16 @@ function sortHistoryTasks(tasks: EmployeeTaskWithRelations[]): EmployeeTaskWithR
   );
 }
 
-function taskInclude() {
+export function employeeTaskListInclude() {
   return {
     creator: { select: { id: true, name: true } },
     assignee: { select: { id: true, name: true } },
     shop: { select: { id: true, shopName: true } },
   } satisfies Prisma.EmployeeTaskInclude;
+}
+
+function taskInclude() {
+  return employeeTaskListInclude();
 }
 
 function taskDetailInclude() {
@@ -507,7 +499,7 @@ function taskDetailInclude() {
   } satisfies Prisma.EmployeeTaskInclude;
 }
 
-function formatTask(task: EmployeeTaskWithRelations) {
+export function formatEmployeeTaskDto(task: EmployeeTaskWithRelations) {
   return {
     id: task.id,
     title: task.title,
@@ -542,7 +534,7 @@ function formatTask(task: EmployeeTaskWithRelations) {
 
 function formatTaskDetail(task: EmployeeTaskDetail) {
   return {
-    ...formatTask(task),
+    ...formatEmployeeTaskDto(task),
     logs: task.logs.map((log) => ({
       id: log.id,
       taskId: log.taskId,
@@ -589,7 +581,7 @@ async function getVisibleTaskOrThrow(taskId: number, user: JwtPayload) {
   if (
     task.creatorId !== user.userId &&
     task.assigneeId !== user.userId &&
-    !isEmployeeTaskAdmin(user)
+    !canManageEmployeeTasks(user)
   ) {
     const participated = await userHasTaskParticipation(taskId, user.userId);
     if (!participated) {
@@ -610,7 +602,7 @@ async function assertCanViewTaskComments(taskId: number, user: JwtPayload) {
   if (
     task.creatorId === user.userId ||
     task.assigneeId === user.userId ||
-    isEmployeeTaskAdmin(user)
+    canManageEmployeeTasks(user)
   ) {
     return task;
   }
@@ -626,7 +618,7 @@ function canCommentOnTask(task: { creatorId: number; assigneeId: number }, user:
   return (
     task.creatorId === user.userId ||
     task.assigneeId === user.userId ||
-    isEmployeeTaskAdmin(user)
+    canManageEmployeeTasks(user)
   );
 }
 
@@ -799,7 +791,7 @@ async function listEmployeeTasks(params: {
   ]);
 
   return {
-    items: tasks.map(formatTask),
+    items: tasks.map(formatEmployeeTaskDto),
     total,
     page,
     pageSize,
@@ -907,7 +899,7 @@ export async function getMyEmployeeTaskDashboard(user: JwtPayload, params: { wee
   ]);
 
   const todoTasks = sortTodoTasks(todoTasksRaw);
-  const formattedTodoTasks = todoTasks.map(formatTask);
+  const formattedTodoTasks = todoTasks.map(formatEmployeeTaskDto);
   const sortedHistoryTasks = sortHistoryTasks(historyTasks);
 
   return {
@@ -926,10 +918,10 @@ export async function getMyEmployeeTaskDashboard(user: JwtPayload, params: { wee
     lastWeekEnd,
     todoTasks: formattedTodoTasks,
     weeklyTasks: formattedTodoTasks,
-    historyTasks: sortedHistoryTasks.map(formatTask),
-    receivedTasks: receivedTasks.map(formatTask),
-    createdTasks: createdTasks.map(formatTask),
-    collaborationTasks: collaborationTasks.map(formatTask),
+    historyTasks: sortedHistoryTasks.map(formatEmployeeTaskDto),
+    receivedTasks: receivedTasks.map(formatEmployeeTaskDto),
+    createdTasks: createdTasks.map(formatEmployeeTaskDto),
+    collaborationTasks: collaborationTasks.map(formatEmployeeTaskDto),
   };
 }
 
@@ -942,9 +934,9 @@ function aggregateTaskSummary(tasks: EmployeeTaskWithRelations[], includeInProgr
     doneCount: doneTasks.length,
     pendingCount: pendingTasks.length,
     overdueCount: overdueTasks.length,
-    doneTasks: doneTasks.slice(0, WEEKLY_SUMMARY_TASK_LIMIT).map(formatTask),
-    pendingTasks: pendingTasks.slice(0, WEEKLY_SUMMARY_TASK_LIMIT).map(formatTask),
-    overdueTasks: overdueTasks.slice(0, WEEKLY_SUMMARY_TASK_LIMIT).map(formatTask),
+    doneTasks: doneTasks.slice(0, WEEKLY_SUMMARY_TASK_LIMIT).map(formatEmployeeTaskDto),
+    pendingTasks: pendingTasks.slice(0, WEEKLY_SUMMARY_TASK_LIMIT).map(formatEmployeeTaskDto),
+    overdueTasks: overdueTasks.slice(0, WEEKLY_SUMMARY_TASK_LIMIT).map(formatEmployeeTaskDto),
   };
   return includeInProgress
     ? { ...base, inProgressCount: tasks.filter((task) => task.status === EmployeeTaskStatus.IN_PROGRESS).length }
@@ -1259,7 +1251,7 @@ export async function updateEmployeeTaskStatus(user: JwtPayload, taskId: number,
   const isCreator = existing.creatorId === user.userId;
 
   if (nextStatus === EmployeeTaskStatus.CANCELLED) {
-    const canCancel = isCreator || isEmployeeTaskAdmin(user);
+    const canCancel = isCreator || canManageEmployeeTasks(user);
     if (!canCancel) {
       throw Object.assign(new Error('只有派发任务的人可以取消任务'), { statusCode: 403 });
     }

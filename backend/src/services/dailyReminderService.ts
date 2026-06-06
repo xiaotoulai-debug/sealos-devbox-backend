@@ -9,8 +9,7 @@ import {
   UserStatus,
 } from '@prisma/client';
 import { prisma } from '../lib/prisma';
-import { JwtPayload } from '../middleware/auth';
-import { isOperationManager } from './operationDailyService';
+import { JwtPayload, DASHBOARD_PERMISSION, hasStrictPermission } from '../middleware/auth';
 
 const CATEGORIES = Object.values(ReminderCategory);
 const PRIORITIES = Object.values(ReminderPriority);
@@ -99,10 +98,21 @@ type TodayTemplate = Prisma.DailyReminderTemplateGetPayload<{
   };
 }>;
 
-function assertManager(user: JwtPayload): void {
-  if (!isOperationManager(user)) {
-    throw Object.assign(new Error('无权限管理每日提醒模板'), { statusCode: 403 });
+function assertReminderTemplateRead(user: JwtPayload): void {
+  if (
+    hasStrictPermission(user, DASHBOARD_PERMISSION.TASK_CENTER)
+    || hasStrictPermission(user, DASHBOARD_PERMISSION.REMINDER_TEMPLATE_MANAGE)
+  ) {
+    return;
   }
+  throw Object.assign(new Error('无权限访问提醒模板'), { statusCode: 403 });
+}
+
+function assertReminderTemplateWrite(user: JwtPayload): void {
+  if (hasStrictPermission(user, DASHBOARD_PERMISSION.REMINDER_TEMPLATE_MANAGE)) {
+    return;
+  }
+  throw Object.assign(new Error('无权限管理提醒模板'), { statusCode: 403 });
 }
 
 function parseRequiredString(value: unknown, fieldName: string, maxLength = 255): string {
@@ -488,7 +498,7 @@ export async function checkReminder(user: JwtPayload, templateId: number, input:
 }
 
 export async function createReminderTemplate(user: JwtPayload, input: TemplateInput) {
-  assertManager(user);
+  assertReminderTemplateWrite(user);
   const parsed = parseTemplateInput(input);
   const assignments = await validateAssignments(input.assignments);
   await assertShopExists(parsed.shopId);
@@ -515,7 +525,7 @@ export async function createReminderTemplate(user: JwtPayload, input: TemplateIn
 }
 
 export async function updateReminderTemplate(user: JwtPayload, id: number, input: TemplateInput) {
-  assertManager(user);
+  assertReminderTemplateWrite(user);
   if (!Number.isInteger(id) || id <= 0) throw new Error('id 必须是正整数');
   const existing = await prisma.dailyReminderTemplate.findUnique({ where: { id }, select: { id: true, frequency: true } });
   if (!existing) throw Object.assign(new Error('提醒模板不存在'), { statusCode: 404 });
@@ -555,7 +565,7 @@ export async function updateReminderTemplate(user: JwtPayload, id: number, input
 }
 
 export async function updateReminderTemplateStatus(user: JwtPayload, id: number, input: { isActive?: unknown }) {
-  assertManager(user);
+  assertReminderTemplateWrite(user);
   if (!Number.isInteger(id) || id <= 0) throw new Error('id 必须是正整数');
   if (typeof input.isActive !== 'boolean') throw new Error('isActive 必须是 boolean');
   const updated = await prisma.dailyReminderTemplate.update({
@@ -567,7 +577,7 @@ export async function updateReminderTemplateStatus(user: JwtPayload, id: number,
 }
 
 export async function listReminderTemplates(user: JwtPayload, query: { page?: unknown; pageSize?: unknown; isActive?: unknown; category?: unknown; priority?: unknown }) {
-  assertManager(user);
+  assertReminderTemplateRead(user);
   const { page, pageSize, skip } = parsePagination(query);
   const where: Prisma.DailyReminderTemplateWhereInput = {};
   if (query.isActive !== undefined && query.isActive !== '') where.isActive = parseBoolean(query.isActive, true);
@@ -587,7 +597,7 @@ export async function listReminderTemplates(user: JwtPayload, query: { page?: un
 }
 
 export async function getReminderTemplateDetail(user: JwtPayload, id: number) {
-  assertManager(user);
+  assertReminderTemplateRead(user);
   if (!Number.isInteger(id) || id <= 0) throw new Error('id 必须是正整数');
   const template = await prisma.dailyReminderTemplate.findUnique({
     where: { id },
@@ -595,4 +605,65 @@ export async function getReminderTemplateDetail(user: JwtPayload, id: number) {
   });
   if (!template) throw Object.assign(new Error('提醒模板不存在'), { statusCode: 404 });
   return formatTemplate(template);
+}
+
+export async function deleteReminderTemplate(
+  user: JwtPayload,
+  id: number,
+  options?: { force?: boolean },
+) {
+  assertReminderTemplateWrite(user);
+
+  if (!Number.isInteger(id) || id <= 0) {
+    throw new Error('id 必须是正整数');
+  }
+
+  const existing = await prisma.dailyReminderTemplate.findUnique({
+    where: { id },
+    select: { id: true, title: true },
+  });
+
+  if (!existing) {
+    throw Object.assign(new Error('提醒模板不存在'), { statusCode: 404 });
+  }
+
+  const force = options?.force === true;
+
+  const checkCount = await prisma.dailyReminderCheck.count({
+    where: { templateId: id },
+  });
+
+  if (checkCount > 0 && !force) {
+    throw Object.assign(
+      new Error('该模板已有历史处理记录，无法直接删除，请使用强制删除或先停用'),
+      { statusCode: 409 },
+    );
+  }
+
+  if (force && checkCount > 0) {
+    console.log('[DailyReminder] force delete template', {
+      templateId: existing.id,
+      title: existing.title,
+      checkCount,
+      operatorUserId: user.userId,
+    });
+  }
+
+  await prisma.$transaction(async (tx) => {
+    if (checkCount > 0) {
+      await tx.dailyReminderCheck.deleteMany({
+        where: { templateId: id },
+      });
+    }
+
+    await tx.dailyReminderTemplateAssignment.deleteMany({
+      where: { templateId: id },
+    });
+
+    await tx.dailyReminderTemplate.delete({
+      where: { id },
+    });
+  });
+
+  return true;
 }

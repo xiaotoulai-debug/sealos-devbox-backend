@@ -1,5 +1,10 @@
 import { Router, Request, Response } from 'express';
-import { authenticate } from '../middleware/auth';
+import {
+  authenticate,
+  DASHBOARD_PERMISSION,
+  requireStrictPermission,
+  requireWeeklyAiGeneratePermission,
+} from '../middleware/auth';
 import {
   createEmployeeTask,
   createEmployeeTaskComment,
@@ -16,6 +21,15 @@ import {
   updateEmployeeTaskDueDate,
   updateEmployeeTaskStatus,
 } from '../services/employeeTaskService';
+import {
+  getAdminEmployeeTaskDashboard,
+  getAdminEmployeeUsersSummary,
+  listAdminEmployeeTasks,
+} from '../services/employeeTaskAdminService';
+import {
+  enqueueAdminWeeklySummaryGeneration,
+  listAdminWeeklySummaries,
+} from '../services/adminWeeklySummaryService';
 import { generateWeeklyAiSummary } from '../services/weeklyAiSummaryService';
 
 const router = Router();
@@ -30,8 +44,9 @@ function errorStatus(err: unknown): number {
   const statusCode = (err as { statusCode?: number } | null)?.statusCode;
   if (statusCode === 404) return 404;
   if (statusCode === 403) return 403;
+  if (statusCode === 503) return 503;
   const message = err instanceof Error ? err.message : '';
-  return /无效|必须|必填|只能|合法值|格式|不存在|不能|不允许|长度|状态流转|截止日期|content|mentionedUserIds/.test(message) ? 400 : 500;
+  return /无效|必须|必填|只能|合法值|格式|不存在|不能|不允许|长度|状态流转|截止日期|content|mentionedUserIds|未找到|未启用/.test(message) ? 400 : 500;
 }
 
 function sendError(res: Response, err: unknown, fallback = '服务器内部错误'): void {
@@ -108,7 +123,7 @@ router.get('/weekly-summary', async (req: Request, res: Response) => {
   }
 });
 
-router.post('/weekly-summary/ai-generate', async (req: Request, res: Response) => {
+router.post('/weekly-summary/ai-generate', requireWeeklyAiGeneratePermission, async (req: Request, res: Response) => {
   try {
     if (req.body?.userId != null) {
       res.status(400).json({ code: 400, data: null, message: 'weekly-summary 不允许传 userId' });
@@ -142,6 +157,95 @@ router.get('/mention-users', async (_req: Request, res: Response) => {
   } catch (err) {
     console.error('[GET /api/employee-tasks/mention-users]', err);
     sendError(res, err, '查询可 @ 用户失败');
+  }
+});
+
+router.get(
+  '/admin-weekly-summaries',
+  requireStrictPermission(DASHBOARD_PERMISSION.COMPANY_MANAGEMENT, '无权限访问公司管理'),
+  async (req: Request, res: Response) => {
+  try {
+    const data = await listAdminWeeklySummaries({
+      weekStart: firstQueryValue(req.query.weekStart),
+      assigneeId: firstQueryValue(req.query.assigneeId),
+    });
+    res.json({ code: 200, data, message: 'success' });
+  } catch (err) {
+    console.error('[GET /api/employee-tasks/admin-weekly-summaries]', err);
+    sendError(res, err, '查询员工周报汇总失败');
+  }
+});
+
+router.post(
+  '/admin-weekly-summaries/generate',
+  requireStrictPermission(DASHBOARD_PERMISSION.COMPANY_WEEKLY_AI_GENERATE, '无权限生成员工AI周报'),
+  async (req: Request, res: Response) => {
+  try {
+    const data = await enqueueAdminWeeklySummaryGeneration({
+      weekStart: req.body?.weekStart,
+      assigneeId: req.body?.assigneeId,
+      force: req.body?.force,
+    });
+    res.json({ code: 200, data, message: 'AI汇总生成任务已提交' });
+  } catch (err) {
+    console.error('[POST /api/employee-tasks/admin-weekly-summaries/generate]', err);
+    sendError(res, err, '提交 AI 汇总生成任务失败');
+  }
+});
+
+router.get(
+  '/admin-dashboard',
+  requireStrictPermission(DASHBOARD_PERMISSION.COMPANY_TASK_MANAGE, '无权限访问公司管理'),
+  async (req: Request, res: Response) => {
+  try {
+    const data = await getAdminEmployeeTaskDashboard(req.user!, {
+      weekStart: firstQueryValue(req.query.weekStart),
+      assigneeId: firstQueryValue(req.query.assigneeId),
+      status: firstQueryValue(req.query.status),
+      platform: firstQueryValue(req.query.platform),
+    });
+    res.json({ code: 200, data, message: 'success' });
+  } catch (err) {
+    console.error('[GET /api/employee-tasks/admin-dashboard]', err);
+    sendError(res, err, '查询管理员工任务统计失败');
+  }
+});
+
+router.get(
+  '/admin-users-summary',
+  requireStrictPermission(DASHBOARD_PERMISSION.COMPANY_TASK_MANAGE, '无权限访问公司管理'),
+  async (req: Request, res: Response) => {
+  try {
+    const data = await getAdminEmployeeUsersSummary(req.user!, {
+      weekStart: firstQueryValue(req.query.weekStart),
+      assigneeId: firstQueryValue(req.query.assigneeId),
+      status: firstQueryValue(req.query.status),
+      platform: firstQueryValue(req.query.platform),
+    });
+    res.json({ code: 200, data, message: 'success' });
+  } catch (err) {
+    console.error('[GET /api/employee-tasks/admin-users-summary]', err);
+    sendError(res, err, '查询员工任务汇总失败');
+  }
+});
+
+router.get(
+  '/admin-tasks',
+  requireStrictPermission(DASHBOARD_PERMISSION.COMPANY_TASK_MANAGE, '无权限访问公司管理'),
+  async (req: Request, res: Response) => {
+  try {
+    const data = await listAdminEmployeeTasks(req.user!, {
+      weekStart: firstQueryValue(req.query.weekStart),
+      assigneeId: firstQueryValue(req.query.assigneeId),
+      status: firstQueryValue(req.query.status),
+      platform: firstQueryValue(req.query.platform),
+      page: firstQueryValue(req.query.page),
+      pageSize: firstQueryValue(req.query.pageSize),
+    });
+    res.json({ code: 200, data, message: 'success' });
+  } catch (err) {
+    console.error('[GET /api/employee-tasks/admin-tasks]', err);
+    sendError(res, err, '查询管理员工任务列表失败');
   }
 });
 

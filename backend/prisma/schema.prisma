@@ -511,6 +511,9 @@ model EmployeeTask {
   @@index([taskType])
   @@index([platform])
   @@index([createdAt])
+  @@index([assigneeId, dueDate])
+  @@index([status, dueDate])
+  @@index([updatedAt])
   @@map("employee_tasks")
 }
 

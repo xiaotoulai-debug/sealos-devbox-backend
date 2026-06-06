@@ -6,9 +6,9 @@ import {
   getMyTodayOperationLogs,
   getOperationDailyDashboard,
   getOperationDailyMonthlyOverview,
+  canViewOperationDailyDetail,
   getOperationDailyReportForUser,
   getUserLogsForDate,
-  isOperationManager,
   submitOperationDailyReport,
   updateOperationDailyReport,
 } from '../services/operationDailyService';
@@ -130,8 +130,8 @@ router.get('/monthly-overview', async (req: Request, res: Response) => {
 
 router.get('/users/:userId/logs', async (req: Request, res: Response) => {
   try {
-    if (!isOperationManager(req.user)) {
-      res.status(403).json({ code: 403, data: null, message: '无权限查看员工运营明细' });
+    if (!canViewOperationDailyDetail(req.user)) {
+      res.status(403).json({ code: 403, data: null, message: '无权限查看员工运营日报' });
       return;
     }
 
@@ -157,7 +157,7 @@ router.get('/users/:userId/logs', async (req: Request, res: Response) => {
 
 router.get('/users/:userId/report', async (req: Request, res: Response) => {
   try {
-    if (!isOperationManager(req.user)) {
+    if (!canViewOperationDailyDetail(req.user)) {
       res.status(403).json({ code: 403, data: null, message: '无权限查看员工运营日报' });
       return;
     }

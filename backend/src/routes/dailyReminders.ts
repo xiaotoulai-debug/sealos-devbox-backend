@@ -3,6 +3,7 @@ import { authenticate } from '../middleware/auth';
 import {
   checkReminder,
   createReminderTemplate,
+  deleteReminderTemplate,
   getReminderTemplateDetail,
   getTodayReminders,
   listReminderTemplates,
@@ -22,6 +23,7 @@ function errorStatus(err: unknown): number {
   const statusCode = (err as { statusCode?: number } | null)?.statusCode;
   if (statusCode === 404) return 404;
   if (statusCode === 403) return 403;
+  if (statusCode === 409) return 409;
   const message = err instanceof Error ? err.message : '';
   return /无效|必须|必填|只能|合法值|格式|不存在|不能|不允许|长度|boolean|适用|未启用/.test(message) ? 400 : 500;
 }
@@ -98,6 +100,17 @@ router.patch('/templates/:id', async (req: Request, res: Response) => {
   } catch (err) {
     console.error('[PATCH /api/daily-reminders/templates/:id]', err);
     sendError(res, err, '更新提醒模板失败');
+  }
+});
+
+router.delete('/templates/:id', async (req: Request, res: Response) => {
+  try {
+    const force = firstQueryValue(req.query.force) === 'true';
+    const data = await deleteReminderTemplate(req.user!, Number(req.params.id), { force });
+    res.json({ code: 200, data, message: 'success' });
+  } catch (err) {
+    console.error('[DELETE /api/daily-reminders/templates/:id]', err);
+    sendError(res, err, '删除提醒模板失败');
   }
 });
 

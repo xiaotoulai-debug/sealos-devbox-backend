@@ -20,6 +20,8 @@
     "cleanup:placeholder-images": "node -r ./scripts/preload-file-polyfill.js -r tsx/cjs scripts/cleanup-placeholder-images.ts",
     "backfill:product-urls": "node -r ./scripts/preload-file-polyfill.js -r tsx/cjs scripts/backfill-product-urls.ts",
     "backfill:emag-link-type": "tsx scripts/backfillEmagLinkType.ts",
+    "backfill:emag-link-type-ownership": "tsx scripts/backfillEmagLinkTypeByOwnership.ts",
+    "fix:emag-link-type": "tsx scripts/backfillEmagLinkTypeByOwnership.ts",
     "backfill:buy-box": "tsx scripts/backfillBuyBoxStatus.ts",
     "inspect:emag-product": "node -r ./scripts/preload-file-polyfill.js -r tsx/cjs scripts/inspect-emag-product-response.ts",
     "sync:platform-orders": "node -r ./scripts/preload-file-polyfill.js -r tsx/cjs scripts/sync-platform-orders.ts",

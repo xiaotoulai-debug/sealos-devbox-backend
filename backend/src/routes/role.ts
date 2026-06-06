@@ -278,46 +278,47 @@ router.put('/:id/permissions', async (req: Request, res: Response) => {
 
     if (hasCodes) {
       // 前端传 code 字符串数组 → 批量查库换取 id
-      const codes: string[] = (rawCodes as unknown[])
+      const codes = Array.from(new Set((rawCodes as unknown[])
         .map((v) => String(v).trim())
-        .filter((v) => v.length > 0);
+        .filter((v) => v.length > 0)));
 
       if (codes.length > 0) {
         const found = await prisma.permission.findMany({
           where: { code: { in: codes } },
           select: { id: true, code: true },
         });
-        // 软跳过：不存在的 code 只打警告日志，不阻断保存
-        // 原因：前端权限树可能包含尚未注册的父节点/动态 code，硬拒绝会导致整个保存失败
         const foundCodes = new Set(found.map((p) => p.code));
         const ghostCodes = codes.filter((c) => !foundCodes.has(c));
         if (ghostCodes.length > 0) {
-          console.warn(
-            `[PUT /api/roles/${id}/permissions] 以下 code 在 Permission 表中不存在，已跳过：`,
-            ghostCodes,
-          );
+          res.status(400).json({
+            code: 400,
+            data: { invalidPermissionCodes: ghostCodes },
+            message: '存在无效权限码，权限保存已取消',
+          });
+          return;
         }
         permissionIds = found.map((p) => p.id);
       }
     } else {
       // 前端传 number[] id 数组
-      const ids: number[] = (rawIds as unknown[])
+      const ids = Array.from(new Set((rawIds as unknown[])
         .map((v) => Number(v))
-        .filter((v) => Number.isInteger(v) && v > 0);
+        .filter((v) => Number.isInteger(v) && v > 0)));
 
       if (ids.length > 0) {
         const found = await prisma.permission.findMany({
           where: { id: { in: ids } },
-          select: { id: true },
+          select: { id: true, code: true },
         });
-        // 软跳过：不存在的 id 只打警告日志，不阻断保存
         const foundSet = new Set(found.map((p) => p.id));
         const ghostIds = ids.filter((pid) => !foundSet.has(pid));
         if (ghostIds.length > 0) {
-          console.warn(
-            `[PUT /api/roles/${id}/permissions] 以下 permissionId 不存在，已跳过：`,
-            ghostIds,
-          );
+          res.status(400).json({
+            code: 400,
+            data: { invalidPermissionIds: ghostIds },
+            message: '存在无效权限 ID，权限保存已取消',
+          });
+          return;
         }
         permissionIds = found.map((p) => p.id);
       }
@@ -335,10 +336,35 @@ router.put('/:id/permissions', async (req: Request, res: Response) => {
       }
     });
 
+    const latestRolePermissions = await prisma.rolePermission.findMany({
+      where: { roleId: id },
+      select: {
+        permissionId: true,
+        permission: {
+          select: { code: true, name: true, type: true },
+        },
+      },
+      orderBy: { permissionId: 'asc' },
+    });
+
+    const latestPermissionIds = latestRolePermissions.map((rp) => rp.permissionId);
+    const latestPermissions = latestRolePermissions.map((rp) => ({
+      id: rp.permissionId,
+      code: rp.permission.code,
+      name: rp.permission.name,
+      type: rp.permission.type,
+    }));
+
     res.json({
       code: 200,
-      data: { roleId: id, permissionCount: permissionIds.length },
-      message: `角色「${role.name}」权限已更新，共绑定 ${permissionIds.length} 个权限`,
+      data: {
+        roleId: id,
+        permissionCount: latestPermissionIds.length,
+        permissionIds: latestPermissionIds,
+        permissionCodes: latestPermissions.map((permission) => permission.code),
+        permissions: latestPermissions,
+      },
+      message: `角色「${role.name}」权限已更新，共绑定 ${latestPermissionIds.length} 个权限`,
     });
   } catch (err) {
     console.error('[PUT /api/roles/:id/permissions]', err);
