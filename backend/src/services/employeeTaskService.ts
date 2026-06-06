@@ -11,6 +11,7 @@ import {
 import { prisma } from '../lib/prisma';
 import { JwtPayload } from '../middleware/auth';
 import { resolveWeekWorkdayReportStats } from './workdayCalendarService';
+import { mergeWeeklySummaryWithAiCache } from './weeklyAiSummaryService';
 
 const TASK_TYPES = Object.values(EmployeeTaskType);
 const PLATFORMS = Object.values(OperationPlatform);
@@ -1162,7 +1163,6 @@ export async function getEmployeeTaskWeeklySummary(user: JwtPayload, params: { w
     ? undefined
     : normalizeWeekStartInput(params.weekStart);
   const ruleSummary = await buildRuleWeeklySummary(user, weekStart);
-  const { mergeWeeklySummaryWithAiCache } = await import('./weeklyAiSummaryService');
   return mergeWeeklySummaryWithAiCache(user, ruleSummary);
 }
 
