@@ -980,6 +980,31 @@ function buildPlanSuggestions(params: {
   return suggestions;
 }
 
+function resolveCollaborationRole(
+  task: { id: number; creatorId: number },
+  userId: number,
+  commentedTaskIds: Set<number>,
+): 'commented' | 'mentioned' | 'creator_follow' {
+  if (task.creatorId === userId) return 'creator_follow';
+  if (commentedTaskIds.has(task.id)) return 'commented';
+  return 'mentioned';
+}
+
+function buildCollaborationSampleTasks(
+  tasks: EmployeeTaskWithRelations[],
+  userId: number,
+  commentedTaskIds: Set<number>,
+) {
+  return tasks.slice(0, 5).map((task) => ({
+    title: task.title,
+    platform: task.platform,
+    priority: task.priority,
+    status: task.status,
+    role: resolveCollaborationRole(task, userId, commentedTaskIds),
+    dueDate: dueDateToDateString(task.dueDate),
+  }));
+}
+
 export type RuleWeeklySummary = {
   weekStart: string;
   weekEnd: string;
@@ -1001,6 +1026,15 @@ export type RuleWeeklySummary = {
   };
   receivedTaskSummary: ReturnType<typeof aggregateTaskSummary>;
   createdTaskSummary: ReturnType<typeof aggregateTaskSummary>;
+  collaborationTaskSummary: ReturnType<typeof aggregateTaskSummary>;
+  collaborationSampleTasks: Array<{
+    title: string;
+    platform: string | null;
+    priority: string;
+    status: string;
+    role: 'commented' | 'mentioned' | 'creator_follow';
+    dueDate: string;
+  }>;
   planSuggestions: string[];
   summaryText: {
     dailyReport: string;
@@ -1026,8 +1060,9 @@ export async function buildRuleWeeklySummary(
       : normalizeWeekStartInput(weekStartInput),
   );
   const userId = user.userId;
+  const participatedTaskIds = await getCollaborationParticipationTaskIds(userId);
 
-  const [reports, logs, receivedTasks, createdTasks] = await Promise.all([
+  const [reports, logs, receivedTasks, createdTasks, collaborationTasks] = await Promise.all([
     prisma.operationDailyReport.findMany({
       where: {
         userId,
@@ -1075,7 +1110,38 @@ export async function buildRuleWeeklySummary(
       include: taskInclude(),
       orderBy: [{ dueDate: 'asc' }, { updatedAt: 'desc' }],
     }),
+    prisma.employeeTask.findMany({
+      where: {
+        AND: [
+          collaborationTasksWhere(userId, participatedTaskIds),
+          { status: { not: EmployeeTaskStatus.CANCELLED } },
+          {
+            OR: [
+              { createdAt: { gte: range.start, lte: range.end } },
+              { dueDate: { gte: range.start, lte: range.end } },
+              { completedAt: { gte: range.start, lte: range.end } },
+            ],
+          },
+        ],
+      },
+      include: taskInclude(),
+      orderBy: [{ dueDate: 'asc' }, { updatedAt: 'desc' }],
+      take: 100,
+    }),
   ]);
+
+  const collaborationTaskIds = collaborationTasks.map((task) => task.id);
+  const commentedTaskIds = new Set<number>();
+  if (collaborationTaskIds.length > 0) {
+    const authoredComments = await prisma.employeeTaskComment.findMany({
+      where: { authorId: userId, taskId: { in: collaborationTaskIds } },
+      select: { taskId: true },
+      distinct: ['taskId'],
+    });
+    for (const comment of authoredComments) {
+      commentedTaskIds.add(comment.taskId);
+    }
+  }
 
   const allSubmittedDates = new Set(reports.map((report) => report.workDate.toISOString().slice(0, 10)));
   const workdayStats = await resolveWeekWorkdayReportStats(range.weekStart, range.weekEnd, allSubmittedDates);
@@ -1127,6 +1193,12 @@ export async function buildRuleWeeklySummary(
 
   const receivedTaskSummary = aggregateTaskSummary(receivedTasks, true);
   const createdTaskSummary = aggregateTaskSummary(createdTasks, false);
+  const collaborationTaskSummary = aggregateTaskSummary(collaborationTasks, true);
+  const collaborationSampleTasks = buildCollaborationSampleTasks(
+    collaborationTasks,
+    userId,
+    commentedTaskIds,
+  );
   const planSuggestions = buildPlanSuggestions({
     dailyReportSummary,
     receivedTaskSummary,
@@ -1147,6 +1219,8 @@ export async function buildRuleWeeklySummary(
     dailyReportSummary,
     receivedTaskSummary,
     createdTaskSummary,
+    collaborationTaskSummary,
+    collaborationSampleTasks,
     planSuggestions,
     summaryText,
     workdayCalendarStatus: workdayStats.calendarStatus,

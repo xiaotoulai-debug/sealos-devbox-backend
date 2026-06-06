@@ -56,7 +56,23 @@ const FORBIDDEN_AI_FIELDS = ['review', 'nextActions', 'suggestionText', 'content
 
 const inflight = new Map<string, Promise<WeeklySummaryWithAi>>();
 
-const SYSTEM_PROMPT = `你是跨境电商运营团队的周报分析助手。请根据输入的结构化 JSON 数据，生成员工上周工作周报总结。
+const SYSTEM_PROMPT = `你是「员工本人周报助手」，帮助员工基于结构化工作数据撰写上周个人复盘周报。
+输入 JSON 中的 sourcePayload 仅包含：每日日报登记、我收到的任务、我发起/指派的任务、我参与的协同任务。不包含任何销售额、订单量、利润、GMV、转化率等销售或平台业绩数据（meta.hasSalesData=false）。
+严禁推测、编造或引用任何销售表现；若数据中没有某项，不要提及。
+
+写作视角：
+- overview、highlights、risks、completionAnalysis、nextWeekSuggestions 必须使用第一人称「我」，以员工本人口吻复盘。
+- 禁止使用「该员工」「他/她」「员工表现」等第三人称表述。
+- 仅 managerNote 可使用克制的主管视角，给主管简短管理提醒。
+
+字段含义：
+- overview：我上周整体复盘，覆盖日报、收到任务、协同任务、指派任务。
+- highlights：自我表扬；若无明显亮点，如实写「本周暂未形成明显完成亮点，需要下周补齐基础动作」，不要硬夸。
+- risks：自我批评与风险，含日报缺失、任务逾期、未完成、协同停滞、指派任务未推进等。
+- completionAnalysis：明确判断我本周完成情况（完成较好/一般/较差），并给出数据依据。
+- nextWeekSuggestions：下周可执行的具体动作，如每天几点前提交日报、优先完成哪些任务、跟进协同、检查指派任务推进。
+- managerNote：给主管的简短提醒，可提示是否需要介入、一对一沟通或拆解任务。
+
 必须严格返回 JSON 对象，且只包含以下 6 个字段：
 overview(string)、highlights(string[])、risks(string[])、completionAnalysis(string)、nextWeekSuggestions(string[])、managerNote(string)。
 禁止返回 review、nextActions、suggestionText、content、markdown 或其他字段。
@@ -74,7 +90,7 @@ function getAiConfig() {
   return {
     provider: process.env.WEEKLY_AI_PROVIDER ?? 'deepseek',
     model: process.env.DEEPSEEK_MODEL ?? 'deepseek-chat',
-    promptVersion: process.env.WEEKLY_AI_PROMPT_VERSION ?? 'v1',
+    promptVersion: process.env.WEEKLY_AI_PROMPT_VERSION ?? 'v2',
     timeoutMs: Number(process.env.WEEKLY_AI_TIMEOUT_MS ?? 25000),
     baseUrl: (process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com').replace(/\/$/, ''),
   };
@@ -151,9 +167,14 @@ export async function buildAiSourcePayload(user: JwtPayload, ruleSummary: RuleWe
   });
 
   const daily = ruleSummary.dailyReportSummary;
+  const cfg = getAiConfig();
   return {
-    user: { id: user.userId, name: dbUser?.name ?? user.username },
-    week: { start: ruleSummary.weekStart, end: ruleSummary.weekEnd },
+    user: {
+      userId: user.userId,
+      name: dbUser?.name ?? user.username,
+      username: user.username,
+    },
+    week: { weekStart: ruleSummary.weekStart, weekEnd: ruleSummary.weekEnd },
     dailyReportSummary: {
       submittedDays: daily.submittedDays,
       missingDays: daily.missingDays,
@@ -167,7 +188,14 @@ export async function buildAiSourcePayload(user: JwtPayload, ruleSummary: RuleWe
     },
     receivedTaskSummary: slimTaskSummary(ruleSummary.receivedTaskSummary),
     createdTaskSummary: slimTaskSummary(ruleSummary.createdTaskSummary),
-    planSuggestions: ruleSummary.planSuggestions,
+    collaborationTaskSummary: {
+      ...slimTaskSummary(ruleSummary.collaborationTaskSummary),
+      sampleTasks: ruleSummary.collaborationSampleTasks,
+    },
+    meta: {
+      promptVersion: cfg.promptVersion,
+      hasSalesData: false,
+    },
   };
 }
 
