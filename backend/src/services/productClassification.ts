@@ -7,6 +7,7 @@ export const PRODUCT_CLASSES = [
   'POTENTIAL',
   'NORMAL',
   'CLEARANCE',
+  'NEW',
 ] as const;
 
 export type ProductClass = typeof PRODUCT_CLASSES[number];
@@ -16,7 +17,22 @@ export const PRODUCT_CLASS_NAMES: Record<ProductClass, string> = {
   POTENTIAL: '成长款',
   NORMAL: '常规款',
   CLEARANCE: '清理款',
+  NEW: '新品',
 };
+
+export const NEW_PRODUCT_STAGES = [
+  'NEW_WAITING_INBOUND',
+  'NEW_OBSERVATION',
+] as const;
+
+export type NewProductStage = typeof NEW_PRODUCT_STAGES[number];
+
+export const NEW_PRODUCT_STAGE_LABELS: Record<NewProductStage, string> = {
+  NEW_WAITING_INBOUND: '新品待入仓',
+  NEW_OBSERVATION: '新品观察',
+};
+
+export const NEW_OBSERVATION_WINDOW_DAYS = 30;
 
 export const STOCK_STATUSES = [
   'OUT_OF_STOCK',
@@ -40,6 +56,9 @@ export const PRODUCT_CLASS_RULES = {
 export type ClassifyStoreProductInput = {
   stock: number;
   inTransitStock?: number;
+  firstAvailableAt?: Date | string | null;
+  firstStockSignalAt?: Date | string | null;
+  firstInboundAt?: Date | string | null;
   syncedAt?: Date;
   mappedInventorySku?: string | null;
   mainImage?: string | null;
@@ -81,6 +100,9 @@ export type ClassificationMetrics = {
   comprehensiveSales: number;
   daysSinceSynced: number;
   stockoutProtected: boolean;
+  firstAvailableAt: string | null;
+  daysSinceFirstAvailable: number | null;
+  newProductStage: NewProductStage | null;
 };
 
 export type StockStatusResult = {
@@ -93,6 +115,7 @@ export type ClassifyStoreProductResult = {
   productClass: ProductClass;
   classificationName: string;
   reason: string;
+  newProductStage: NewProductStage | null;
   metrics: ClassificationMetrics;
   riskTags: string[];
 };
@@ -123,7 +146,8 @@ export function normalizeProductClassQuery(raw: unknown): ProductClass | 'all' |
   const value = String(Array.isArray(raw) ? raw[0] : raw).trim().toUpperCase();
   if (!value || value === 'ALL') return 'all';
   if (value === 'DEAD' || value === 'TO_BE_ELIMINATED') return 'CLEARANCE';
-  if (value === 'NEW' || value === 'OUT_OF_STOCK_WATCH') return 'NORMAL';
+  if (value === 'OUT_OF_STOCK_WATCH') return 'NEW';
+  if (value === 'NEW') return 'NEW';
   return isProductClass(value) ? value : null;
 }
 
@@ -136,6 +160,31 @@ function normalizeDate(value: Date | string | null | undefined): Date | null {
   if (!value) return null;
   const date = value instanceof Date ? value : new Date(value);
   return Number.isNaN(date.getTime()) ? null : date;
+}
+
+function daysSinceDate(value: Date | string | null | undefined, now: Date): number | null {
+  const date = normalizeDate(value);
+  if (!date) return null;
+  return Math.max(0, Math.floor((now.getTime() - date.getTime()) / DAY_MS));
+}
+
+export function isWithinWindowDays(
+  value: Date | string | null | undefined,
+  windowDays: number,
+  now = new Date(),
+): boolean {
+  const days = daysSinceDate(value, now);
+  return days != null && days <= windowDays;
+}
+
+export function hasNoHistoricalSales(salesStats: ClassificationSalesStats): boolean {
+  return (
+    numberValue(salesStats.d7) === 0 &&
+    numberValue(salesStats.d14) === 0 &&
+    numberValue(salesStats.d30) === 0 &&
+    numberValue(salesStats.d60) === 0 &&
+    numberValue(salesStats.d90) === 0
+  );
 }
 
 export function calculateBaseComprehensiveSales(salesStats: ClassificationSalesStats): number {
@@ -195,7 +244,93 @@ export function calculateStockStatus(platformStock: number, comprehensiveSales: 
   return { stockStatus: 'OVERSTOCK', stockDays, referenceDailySales: roundedReferenceDailySales };
 }
 
-function buildClassificationMetrics(input: ClassifyStoreProductInput, salesStats: ClassificationSalesStats, now: Date): ClassificationMetrics {
+export function detectNewProductStage(
+  input: ClassifyStoreProductInput,
+  salesStats: ClassificationSalesStats,
+  now = new Date(),
+): NewProductStage | null {
+  if (!hasNoHistoricalSales(salesStats)) {
+    return null;
+  }
+
+  const stock = numberValue(input.stock);
+  const inTransitStock = numberValue(input.inTransitStock);
+  const firstAvailableAt = normalizeDate(input.firstAvailableAt);
+  const firstStockSignalAt = normalizeDate(input.firstStockSignalAt);
+  const firstInboundAt = normalizeDate(input.firstInboundAt);
+
+  const recentStockSignal =
+    isWithinWindowDays(firstStockSignalAt, NEW_OBSERVATION_WINDOW_DAYS, now);
+  const recentInbound =
+    isWithinWindowDays(firstInboundAt, NEW_OBSERVATION_WINDOW_DAYS, now);
+
+  if (
+    !firstAvailableAt &&
+    stock <= 0 &&
+    inTransitStock > 0 &&
+    (recentStockSignal || recentInbound)
+  ) {
+    return 'NEW_WAITING_INBOUND';
+  }
+
+  if (
+    firstAvailableAt &&
+    firstStockSignalAt &&
+    stock > 0 &&
+    isWithinWindowDays(firstAvailableAt, NEW_OBSERVATION_WINDOW_DAYS, now) &&
+    isWithinWindowDays(firstStockSignalAt, NEW_OBSERVATION_WINDOW_DAYS, now)
+  ) {
+    return 'NEW_OBSERVATION';
+  }
+
+  return null;
+}
+
+export function matchesPostObservationClearance(
+  firstAvailableAt: Date | string | null | undefined,
+  stock: number,
+  salesStats: ClassificationSalesStats,
+  comprehensiveSales: number,
+  now = new Date(),
+): boolean {
+  if (numberValue(stock) <= 0) return false;
+  if (!hasNoHistoricalSales(salesStats)) return false;
+
+  const availableAt = normalizeDate(firstAvailableAt);
+  if (!availableAt) {
+    return matchesClearanceCriteria(stock, numberValue(salesStats.d30), numberValue(salesStats.d60), numberValue(salesStats.d90), comprehensiveSales);
+  }
+
+  const daysSinceFirstAvailable = daysSinceDate(availableAt, now);
+  if (daysSinceFirstAvailable == null || daysSinceFirstAvailable <= NEW_OBSERVATION_WINDOW_DAYS) {
+    return false;
+  }
+
+  return (
+    comprehensiveSales < PRODUCT_CLASS_RULES.clearanceComprehensiveSales ||
+    (numberValue(salesStats.d30) === 0 && numberValue(salesStats.d60) === 0 && numberValue(salesStats.d90) === 0)
+  );
+}
+
+export function matchesClearanceCriteria(
+  stock: number,
+  sales30: number,
+  sales60: number,
+  sales90: number,
+  comprehensiveSales: number,
+): boolean {
+  return (
+    (stock > 0 && sales30 === 0 && sales60 === 0 && sales90 === 0) ||
+    (stock > 0 && comprehensiveSales < PRODUCT_CLASS_RULES.clearanceComprehensiveSales)
+  );
+}
+
+function buildClassificationMetrics(
+  input: ClassifyStoreProductInput,
+  salesStats: ClassificationSalesStats,
+  newProductStage: NewProductStage | null,
+  now: Date,
+): ClassificationMetrics {
   const stock = numberValue(input.stock);
   const inTransitStock = numberValue(input.inTransitStock);
   const sales3 = numberValue(salesStats.d3);
@@ -213,6 +348,10 @@ function buildClassificationMetrics(input: ClassifyStoreProductInput, salesStats
   const lastOrderAt = normalizeDate(salesStats.lastOrderAt);
   const daysSinceLastOrder = lastOrderAt
     ? Math.max(0, Math.floor((now.getTime() - lastOrderAt.getTime()) / DAY_MS))
+    : null;
+  const firstAvailableAt = normalizeDate(input.firstAvailableAt);
+  const daysSinceFirstAvailable = firstAvailableAt
+    ? Math.max(0, Math.floor((now.getTime() - firstAvailableAt.getTime()) / DAY_MS))
     : null;
 
   return {
@@ -238,6 +377,9 @@ function buildClassificationMetrics(input: ClassifyStoreProductInput, salesStats
     comprehensiveSales,
     daysSinceSynced,
     stockoutProtected: stockoutProtectedSales > 0,
+    firstAvailableAt: firstAvailableAt ? firstAvailableAt.toISOString() : null,
+    daysSinceFirstAvailable,
+    newProductStage,
   };
 }
 
@@ -265,7 +407,8 @@ export function classifyStoreProduct(
   salesStats: ClassificationSalesStats,
   now = new Date(),
 ): ClassifyStoreProductResult {
-  const metrics = buildClassificationMetrics(input, salesStats, now);
+  const newProductStage = detectNewProductStage(input, salesStats, now);
+  const metrics = buildClassificationMetrics(input, salesStats, newProductStage, now);
   const stock = metrics.stock;
   const sales3 = metrics.sales3;
   const sales7 = metrics.sales7;
@@ -276,6 +419,28 @@ export function classifyStoreProduct(
   const comprehensiveSales = metrics.comprehensiveSales;
   const riskTags = getProductRiskTags(input, salesStats);
 
+  if (newProductStage === 'NEW_WAITING_INBOUND') {
+    return {
+      productClass: 'NEW',
+      classificationName: PRODUCT_CLASS_NAMES.NEW,
+      newProductStage,
+      reason: '新品待入仓：近期首次出现库存信号，平台无库存但 FBE 在途 > 0，全历史无销量，等待到货。',
+      metrics,
+      riskTags,
+    };
+  }
+
+  if (newProductStage === 'NEW_OBSERVATION') {
+    return {
+      productClass: 'NEW',
+      classificationName: PRODUCT_CLASS_NAMES.NEW,
+      newProductStage,
+      reason: '新品观察：首次平台可售后 30 天内，全历史无销量，暂不按清理款处理。',
+      metrics,
+      riskTags,
+    };
+  }
+
   if (
     comprehensiveSales >= PRODUCT_CLASS_RULES.hotComprehensiveSales ||
     sales30 >= PRODUCT_CLASS_RULES.hotSales30 ||
@@ -284,6 +449,7 @@ export function classifyStoreProduct(
     return {
       productClass: 'HOT',
       classificationName: PRODUCT_CLASS_NAMES.HOT,
+      newProductStage: null,
       reason: stock <= 0 && (sales60 >= PRODUCT_CLASS_RULES.hotStockoutSales60 || sales90 >= PRODUCT_CLASS_RULES.hotStockoutSales90)
         ? '当前断货但 60/90 天历史销量达到主推阈值，需要重点保供。'
         : '综合日销或近30天销量达到主推阈值。',
@@ -296,6 +462,7 @@ export function classifyStoreProduct(
     return {
       productClass: 'POTENTIAL',
       classificationName: PRODUCT_CLASS_NAMES.POTENTIAL,
+      newProductStage: null,
       reason: sales3 > 0 || sales7 > 0 || sales14 > 0
         ? '近3/7/14天已有动销，归为成长款继续观察。'
         : '综合日销达到成长款阈值。',
@@ -304,13 +471,22 @@ export function classifyStoreProduct(
     };
   }
 
-  if (
-    (stock > 0 && sales30 === 0 && sales60 === 0 && sales90 === 0) ||
-    (stock > 0 && comprehensiveSales < PRODUCT_CLASS_RULES.clearanceComprehensiveSales)
-  ) {
+  if (matchesPostObservationClearance(input.firstAvailableAt, stock, salesStats, comprehensiveSales, now)) {
     return {
       productClass: 'CLEARANCE',
       classificationName: PRODUCT_CLASS_NAMES.CLEARANCE,
+      newProductStage: null,
+      reason: '首次可售已超过 30 天仍无销量，或综合日销低于清理阈值，建议清理库存。',
+      metrics,
+      riskTags,
+    };
+  }
+
+  if (matchesClearanceCriteria(stock, sales30, sales60, sales90, comprehensiveSales)) {
+    return {
+      productClass: 'CLEARANCE',
+      classificationName: PRODUCT_CLASS_NAMES.CLEARANCE,
+      newProductStage: null,
       reason: sales30 === 0 && sales60 === 0 && sales90 === 0
         ? '当前有库存但近30/60/90天均无销量，建议清理库存。'
         : '当前有库存且综合日销低于清理阈值，建议降价、清仓或停止采购。',
@@ -322,7 +498,8 @@ export function classifyStoreProduct(
   return {
     productClass: 'NORMAL',
     classificationName: PRODUCT_CLASS_NAMES.NORMAL,
-    reason: '未命中主推、成长或清理规则，归为常规款。',
+    newProductStage: null,
+    reason: '未命中主推、成长、清理或新品规则，归为常规款。',
     metrics,
     riskTags,
   };
@@ -395,6 +572,9 @@ async function recalcForProducts(shopId: number, dryRun: boolean): Promise<Produ
       mappedInventorySku: true,
       stock: true,
       syncedAt: true,
+      firstAvailableAt: true,
+      firstStockSignalAt: true,
+      firstInboundAt: true,
       productClass: true,
       mainImage: true,
       imageUrl: true,
@@ -445,6 +625,9 @@ async function recalcForProducts(shopId: number, dryRun: boolean): Promise<Produ
     const classified = classifyStoreProduct({
       stock: p.stock,
       inTransitStock,
+      firstAvailableAt: p.firstAvailableAt,
+      firstStockSignalAt: p.firstStockSignalAt,
+      firstInboundAt: p.firstInboundAt,
       syncedAt: p.syncedAt,
       mappedInventorySku: p.mappedInventorySku,
       mainImage: p.mainImage,

@@ -26,6 +26,8 @@ export interface OperationAdvice {
 
 export type BuildOperationAdviceInput = {
   productClass: ProductClass;
+  newProductStage?: 'NEW_WAITING_INBOUND' | 'NEW_OBSERVATION' | null;
+  replenishmentStage?: string | null;
   stockStatus: StockStatus;
   stock: number;
   stockDays: number | null;
@@ -109,10 +111,16 @@ function isSalesClass(productClass: ProductClass): boolean {
   return productClass === 'HOT' || productClass === 'POTENTIAL';
 }
 
+function isNewProductClass(productClass: ProductClass): boolean {
+  return productClass === 'NEW';
+}
+
 export function buildOperationAdvice(input: BuildOperationAdviceInput): OperationAdvice {
   const metrics = buildMetrics(input);
   const {
     productClass,
+    newProductStage,
+    replenishmentStage,
     stockStatus,
     stock,
     platformInTransit,
@@ -129,7 +137,40 @@ export function buildOperationAdvice(input: BuildOperationAdviceInput): Operatio
     profitMarginPct,
   } = input;
 
-  const hasReplenishDemand = stock === 0 && replenishReferenceDailySales > 0;
+  const hasReplenishDemand = stock === 0 && replenishReferenceDailySales > 0 && !isNewProductClass(productClass);
+
+  if (newProductStage === 'NEW_WAITING_INBOUND') {
+    return {
+      priority: 'P2',
+      action: 'WAIT_FOR_ARRIVAL',
+      title: '新品待入仓',
+      reason: '新品待入仓，货物仍在路上，暂不判断销量，等待到货。',
+      tags: withProfitDataTag(input, ['新品', '待入仓', '等待到货']),
+      metrics,
+    };
+  }
+
+  if (newProductStage === 'NEW_OBSERVATION') {
+    return {
+      priority: 'P2',
+      action: suggestAmount > 0 ? 'STILL_NEED_REPLENISH' : 'OBSERVE',
+      title: suggestAmount > 0 ? '新品观察试补' : '新品观察',
+      reason: '新品观察期，当前处于首次入仓后 30 天内，先观察销量，不按清理款处理。',
+      tags: withProfitDataTag(input, ['新品', '观察期']),
+      metrics,
+    };
+  }
+
+  if (replenishmentStage === 'CLEARANCE_REVIVAL') {
+    return {
+      priority: 'P2',
+      action: suggestAmount > 0 ? 'STILL_NEED_REPLENISH' : 'OBSERVE',
+      title: '复活观察',
+      reason: '清理款近期销量回升，进入复活观察期，仅允许小批量试补。',
+      tags: withProfitDataTag(input, ['清理款', '复活观察']),
+      metrics,
+    };
+  }
 
   if (
     estimatedProfit != null &&

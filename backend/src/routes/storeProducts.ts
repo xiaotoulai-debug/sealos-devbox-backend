@@ -16,6 +16,7 @@ import { tryAcquireLock, releaseLock } from '../lib/syncStatus';
 import { backfillProductUrls, backfillProductImages, syncStoreProducts, backfillComprehensiveSales } from '../services/storeProductSync';
 import { recalcProfitForShop, recalcProfitForAllShops } from '../services/profitCalculator';
 import { syncExchangeRates } from '../services/exchangeRateSync';
+import { resolveEffectiveStockSignals, scheduleStockSignalBackfill } from '../services/firstAvailableAt';
 import { buildOperationAdvice } from '../services/operationAdvice';
 import {
   buildPurchaseSuggestion,
@@ -38,6 +39,7 @@ import {
   classifyStoreProduct,
   normalizeProductClassQuery,
   PRODUCT_CLASSES,
+  PRODUCT_CLASS_NAMES,
   recalcProductClassForAllShops,
   recalcProductClassForShop,
   type StockStatus,
@@ -650,7 +652,7 @@ router.get('/', async (req: Request, res: Response) => {
       res.status(400).json({
         code: 400,
         data: null,
-        message: 'productClass 无效，合法值：HOT/POTENTIAL/NORMAL/CLEARANCE/all',
+        message: 'productClass 无效，合法值：HOT/POTENTIAL/NORMAL/CLEARANCE/NEW/all',
       });
       return;
     }
@@ -886,7 +888,7 @@ router.get('/', async (req: Request, res: Response) => {
           inTransitQuantity:  prod.inTransitQuantity ?? 0,
         };
         if (prod.sku) {
-          inventoryMap.set(prod.sku, entry);
+          inventoryMap.set(normalizeSkuKey(prod.sku), entry);
           if (!prod.imageUrl) noImageProductSkus.push(prod.sku); // 命中但无图，标记补查
         }
         if (prod.pnk) pnkMap.set(prod.pnk, entry); // 同时填充 pnkMap
@@ -895,7 +897,7 @@ router.get('/', async (req: Request, res: Response) => {
       // ── 路径②：Inventory 表兜底 ─────────────────────────────────
       // 查询范围 = ① Product 完全未命中的 SKU  +  ② Product 命中但 imageUrl 为空的 SKU
       // 字段说明：Inventory.localImage (local_image) = 手动上传的本地高清图
-      const missingSkus     = skuArr.filter((s) => !inventoryMap.has(s));
+      const missingSkus     = skuArr.filter((s) => !inventoryMap.has(normalizeSkuKey(s)));
       const invQuerySkus    = [...new Set([...missingSkus, ...noImageProductSkus])];
       if (invQuerySkus.length > 0) {
         const invList = await prisma.inventory.findMany({
@@ -903,7 +905,7 @@ router.get('/', async (req: Request, res: Response) => {
           select: { sku: true, localImage: true, purchaseCost: true, weight: true },
         });
         for (const inv of invList) {
-          const existing = inventoryMap.get(inv.sku);
+          const existing = inventoryMap.get(normalizeSkuKey(inv.sku));
           if (existing) {
             // Product 命中但无图：用 Inventory.localImage 回填图片，保留 Product 的其他字段
             if (!existing.localImage && inv.localImage) {
@@ -911,7 +913,7 @@ router.get('/', async (req: Request, res: Response) => {
             }
           } else {
             // Product 完全未命中：从 Inventory 建立完整条目
-            inventoryMap.set(inv.sku, {
+            inventoryMap.set(normalizeSkuKey(inv.sku), {
               localImage:         inv.localImage ?? null,
               purchaseCost:       Number(inv.purchaseCost ?? 0),
               weight:             inv.weight != null ? Number(inv.weight) : null,
@@ -929,7 +931,7 @@ router.get('/', async (req: Request, res: Response) => {
     const pnksToFetch = list
       .filter((p) => {
         const skuKey = (p.mappedInventorySku ?? '').trim() || (p.sku ?? p.vendorSku ?? '').trim();
-        return !skuKey || !inventoryMap.has(skuKey);
+        return !skuKey || !inventoryMap.has(normalizeSkuKey(skuKey));
       })
       .map((p) => p.pnk)
       .filter((pnk) => !!pnk && !pnkMap.has(pnk));
@@ -950,7 +952,7 @@ router.get('/', async (req: Request, res: Response) => {
         };
         if (prod.pnk) pnkMap.set(prod.pnk, entry);
         // 如果该 Product 有 SKU，顺便补充到 inventoryMap 以供后续 skuKey 命中
-        if (prod.sku) inventoryMap.set(prod.sku, entry);
+        if (prod.sku) inventoryMap.set(normalizeSkuKey(prod.sku), entry);
       }
     }
 
@@ -1060,6 +1062,33 @@ router.get('/', async (req: Request, res: Response) => {
         entry.inTransitQuantity = shopInTransitMap.get(entry.localProductId) ?? 0;
       }
     }
+
+    const stockSignalPatches = new Map<number, import('../services/firstAvailableAt').StockSignalDbPatch>();
+    const stockSignalMap = new Map<number, import('../services/firstAvailableAt').EffectiveStockSignals>();
+    for (const p of list) {
+      const skuKey = (p.mappedInventorySku ?? '').trim() || (p.sku ?? p.vendorSku ?? '').trim();
+      const inv = (skuKey ? inventoryMap.get(normalizeSkuKey(skuKey)) : undefined) ?? pnkMap.get(p.pnk);
+      const inTransit = Number(inv?.inTransitQuantity ?? 0);
+      const salesStats = getSalesForProduct(salesMap, p.sku, p.vendorSku, p.pnk);
+      const { signals, pendingDbPatch } = resolveEffectiveStockSignals(
+        {
+          id: p.id,
+          stock: p.stock,
+          inTransitStock: inTransit,
+          firstAvailableAt: p.firstAvailableAt ?? null,
+          firstInboundAt: p.firstInboundAt ?? null,
+          firstStockSignalAt: p.firstStockSignalAt ?? null,
+        },
+        salesStats,
+      );
+      stockSignalMap.set(p.id, signals);
+      if (Object.keys(pendingDbPatch).length > 0) {
+        stockSignalPatches.set(p.id, pendingDbPatch);
+      }
+    }
+    if (stockSignalPatches.size > 0) {
+      scheduleStockSignalBackfill(stockSignalPatches);
+    }
     // ─────────────────────────────────────────────────────────────────
 
     const shopName = list[0]?.shop?.shopName ?? '';
@@ -1080,7 +1109,7 @@ router.get('/', async (req: Request, res: Response) => {
 
       const skuKey = (p.mappedInventorySku ?? '').trim() || (p.sku ?? p.vendorSku ?? '').trim();
       // 三路查：① SKU 精确匹配 → ② pnk 兜底（mappedInventorySku 为空或 SKU 对不上时）
-      const inv = (skuKey ? inventoryMap.get(skuKey) : undefined) ?? pnkMap.get(p.pnk);
+      const inv = (skuKey ? inventoryMap.get(normalizeSkuKey(skuKey)) : undefined) ?? pnkMap.get(p.pnk);
 
       // 图片三级回退：平台主图 → 平台副图 → 本地库存 SKU 图片
       const emagImage = p.mainImage ?? p.imageUrl ?? null;
@@ -1116,9 +1145,13 @@ router.get('/', async (req: Request, res: Response) => {
         : undefined;
       // FBE 平台在途必须与列表「在途库存」列同源，避免明细气泡与主列不一致。
       const fbeInTransitQuantity = Number(inv?.inTransitQuantity ?? 0);
+      const effectiveSignals = stockSignalMap.get(p.id)!;
       const fallbackClassification = classifyStoreProduct({
         stock: stockNum,
         inTransitStock: fbeInTransitQuantity,
+        firstAvailableAt: effectiveSignals.firstAvailableAt,
+        firstStockSignalAt: effectiveSignals.firstStockSignalAt,
+        firstInboundAt: effectiveSignals.firstInboundAt,
         syncedAt: p.syncedAt,
         mappedInventorySku: p.mappedInventorySku,
         mainImage: p.mainImage,
@@ -1126,6 +1159,8 @@ router.get('/', async (req: Request, res: Response) => {
         estimatedProfit: p.estimatedProfit != null ? Number(p.estimatedProfit) : null,
       }, sales_stats);
       const productClass = fallbackClassification.productClass;
+      const newProductStage = fallbackClassification.newProductStage;
+
       const classificationReason = fallbackClassification.reason;
       const classificationMetrics = fallbackClassification.metrics;
       const classificationName = fallbackClassification.classificationName;
@@ -1145,6 +1180,7 @@ router.get('/', async (req: Request, res: Response) => {
         : null;
       const purchaseSuggestion = buildPurchaseSuggestion({
         productClass,
+        newProductStage,
         stockStatus: stockStatusResult.stockStatus,
         platformStock,
         platformInTransit,
@@ -1152,10 +1188,16 @@ router.get('/', async (req: Request, res: Response) => {
         purchasingInTransit,
         planningStock,
         comprehensiveSales: compSales,
+        sales7: sales_stats.d7,
+        sales14: sales_stats.d14,
         sales30: sales_stats.d30,
         sales60: sales_stats.d60,
         sales90: sales_stats.d90,
         sales180: sales_stats.d180 ?? 0,
+        estimatedProfit: p.estimatedProfit != null ? Number(p.estimatedProfit) : null,
+        firstAvailableAt: effectiveSignals.firstAvailableAt,
+        firstStockSignalAt: effectiveSignals.firstStockSignalAt,
+        firstInboundAt: effectiveSignals.firstInboundAt,
         lastOrderAt,
         daysSinceSynced,
       });
@@ -1183,6 +1225,8 @@ router.get('/', async (req: Request, res: Response) => {
         targetStock: purchaseSuggestion.targetStock,
         coverageStock: purchaseSuggestion.coverageStock,
         suggestAmount: purchaseSuggestion.suggestAmount,
+        replenishmentStage: purchaseSuggestion.replenishmentStage ?? null,
+        newProductStage,
         estimatedProfit,
         profitMarginPct,
         price: Number.isFinite(salePriceNum) ? salePriceNum : null,
@@ -1292,6 +1336,16 @@ router.get('/', async (req: Request, res: Response) => {
         salesStats: salesStatsObj,
         product_class: productClass,
         productClass,
+        product_class_label: PRODUCT_CLASS_NAMES[productClass],
+        productClassLabel: PRODUCT_CLASS_NAMES[productClass],
+        new_product_stage: newProductStage,
+        newProductStage,
+        first_stock_signal_at: effectiveSignals.firstStockSignalAt?.toISOString() ?? null,
+        firstStockSignalAt: effectiveSignals.firstStockSignalAt?.toISOString() ?? null,
+        first_inbound_at: effectiveSignals.firstInboundAt?.toISOString() ?? null,
+        firstInboundAt: effectiveSignals.firstInboundAt?.toISOString() ?? null,
+        first_available_at: effectiveSignals.firstAvailableAt?.toISOString() ?? null,
+        firstAvailableAt: effectiveSignals.firstAvailableAt?.toISOString() ?? null,
         classification_name: classificationName,
         classificationName,
         classification_reason: classificationReason,

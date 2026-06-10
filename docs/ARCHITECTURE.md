@@ -332,72 +332,67 @@ req.query.sortOrder = 'descend'
 - `Product.findMany(sku in ..., status=PURCHASING, purchaseOrderId=null, shopId=当前店铺 OR null)`：按 SKU 汇总采购计划中数量，兼容通用备货计划。
 - `FbeShipmentItem.findMany(productId in ..., shipment.shopId=当前店铺, shipment.status=SHIPPED)`：沿用店铺隔离的 FBE 在途汇总。
 
-计算公式：
+计算公式（2026-06-06 升级）：
 
 ```typescript
-targetStock = Math.floor(comprehensiveSales * 60);
-suggestAmount = Math.max(
-  0,
-  targetStock
-    - platformStock
-    - platformInTransit
-    - localStock
-    - purchasingInTransit
-    - planningStock,
-);
+// 分类目标库存天数（后端常量 TARGET_STOCK_DAYS_BY_CLASS / BY_STAGE）
+targetStockDays = resolveByClassAndStage(productClass, newProductStage, replenishmentStage);
+targetStock = ceil(replenishReferenceDailySales * targetStockDays);
+
+// 核心覆盖库存（不含 localStock，本地仓仅展示）
+coverageStock = platformStock + platformInTransit + purchasingInTransit + planningStock;
+
+suggestAmount = targetStockDays <= 0 ? 0 : max(0, targetStock - coverageStock);
+
+platformStockDays = replenishReferenceDailySales > 0 ? platformStock / replenishReferenceDailySales : null;
+totalCoverageDays = replenishReferenceDailySales > 0 ? coverageStock / replenishReferenceDailySales : null;
 ```
 
-`purchaseSuggestion.inventoryTag` 与实时 `productClass` 保持一致，只输出 `HOT/POTENTIAL/NORMAL/CLEARANCE` 四类，并叠加库存状态输出采购建议主文案：
+分类目标天数：`HOT=90`、`POTENTIAL=75`、`NORMAL=70`、`CLEARANCE=0`、`NEW=30`（观察期内部阶段可覆盖为 0/30/45）。清理款默认 `suggestAmount=0`；满足复活观察条件（近7天销量>0 且 d7/7 >= d30/30×2 且毛利非负）时 `replenishmentStage=CLEARANCE_REVIVAL`，目标 30 天小批量试补。
 
-1. `productClass === CLEARANCE`：有库存压力时 `清仓处理`，少量库存时 `停止补货`。
-2. `productClass === NORMAL`：按库存状态输出温和建议：低库存 `少量补货`、预警 `观察补货`、库存充足 `暂不补货`、库存偏多 `暂停补货`、无货有在途 `等待到货`、无货无在途 `待确认补货`。
-3. `productClass in (HOT, POTENTIAL) && platformStock === 0`：按平台缺货采购建议输出：无在途为 `立即补货`；有在途时根据 `inTransitStock / max(comprehensiveSales, sales30 / 30)` 是否覆盖 30 天，输出 `等待到货` 或 `仍需补货`。
-4. `productClass in (HOT, POTENTIAL) && platformStock > 0 && stockStatus in (LOW_STOCK, WARNING)`：按低库存预警输出：主推低库存 `紧急补货`、主推预警 `建议补货`、成长低库存 `小批量补货`、成长预警 `观察备货`。
+`purchaseSuggestion.inventoryTag` 与实时 `productClass` 保持一致，输出 `HOT/POTENTIAL/NORMAL/CLEARANCE/NEW` 五类。`newProductStage` 为内部阶段：`NEW_WAITING_INBOUND`（待入仓）/ `NEW_OBSERVATION`（观察期）/ `null`，不作为前端一级 Tab。
 
 DTO 字段：
 
 ```typescript
 purchaseSuggestion: {
   targetStock,
+  targetStockDays,
   platformStock,
   platformInTransit,
-  localStock,
+  localStock,              // 仅展示，不参与 suggestAmount 扣减
   purchasingInTransit,
   planningStock,
   suggestAmount,
+  coverageStock,           // 核心覆盖库存，不含 localStock
+  platformStockDays,
+  totalCoverageDays,
+  replenishReferenceDailySales,
   inventoryTag,
-  text?,   // CLEARANCE 时为“清仓处理/停止补货”
-           // NORMAL 时为“少量补货/观察补货/暂不补货/暂停补货/等待到货/待确认补货”
-           // HOT/POTENTIAL 平台缺货时为“立即补货/等待到货/仍需补货”
-           // HOT/POTENTIAL 平台低库存时为“紧急补货/建议补货/小批量补货/观察备货”
-  label?,  // 与 text 同步，兼容前端不同字段读取
-  reason?, // 特殊采购建议原因说明
+  newProductStage,         // NEW_WAITING_INBOUND | NEW_OBSERVATION | null
+  newProductStageLabel,    // 新品待入仓 | 新品观察 | null
+  firstAvailableAt,        // ISO 字符串
+  replenishmentStage?,     // CLEARANCE_REVIVAL 等
+  text?, label?, reason?,
 }
 ```
 
-#### 4.5.1 采购与库存智能分析引擎 V1.0
+#### 4.5.1 采购与库存智能分析引擎 V2.0（2026-06-06）
 
-**业务背景**：平台产品列表通过智能采购建议解决业务员凭感觉补货、重复下单、忽略在途资产的问题；库存健康度打标用于直观暴露资金滞压风险与潜在断货风险。
+**新品保护（首次库存信号，2026-06-10）**：`first_available_at`（首次平台库存>0）、`first_stock_signal_at`（首次平台库存>0 或 FBE/ERP 在途>0）、`first_inbound_at`（首次在途>0）。三者只写第一次，归零不清空。`syncedAt` 不再作为新品判定依据。分类优先级：**NEW_WAITING_INBOUND → NEW_OBSERVATION → HOT → POTENTIAL → CLEARANCE → NORMAL**。
 
-**批量聚合查询（防 N+1）**：`GET /api/store-products` 在拿到当前分页 `StoreProduct` 后，不逐行查库，而是一次性聚合当前页关联 SKU / 产品的资产数据：
-
-- `WarehouseStock`：按本地产品汇总 `stockQuantity`，作为本地可用库存。
-- `PurchaseOrderItem + PurchaseOrder`：按活跃采购单状态汇总未入库数量，作为采购在途。
-- `Product`：按 `status=PURCHASING` 且 `purchaseOrderId=null` 汇总 `purchaseQuantity`，作为计划中数量。
-- `FbeShipmentItem`：按当前店铺的 `SHIPPED` FBE 发货单汇总平台在途。
+**NEW 判定**：
+- `NEW_WAITING_INBOUND`：平台库存=0、在途>0、`firstAvailableAt` 为空、`firstStockSignalAt` 或 `firstInboundAt` 距今≤30天、d7~d90 全 0。
+- `NEW_OBSERVATION`：平台库存>0、`firstAvailableAt` 与 `firstStockSignalAt` 均距今≤30天、d7~d90 全 0。
+- 首次可售超过 30 天仍无销量 → `CLEARANCE`（`matchesPostObservationClearance`）。
+- 有 d60/d90 历史销量：可有「等待到货」运营建议，但不得判 `NEW`。
 
 **核心算账公式**：
 
 ```typescript
-suggestAmount = Math.max(
-  0,
-  Math.ceil(replenishReferenceDailySales * 60)
-    - platformStock
-    - platformInTransit
-    - localStock
-    - purchasingInTransit
-    - planningStock,
-);
+replenishReferenceDailySales = max(comprehensiveSales, d30/30, d90/90, d180/180);
+coverageStock = platformStock + platformInTransit + purchasingInTransit + planningStock;
+suggestAmount = max(0, ceil(replenishReferenceDailySales * targetStockDays) - coverageStock);
 ```
 
 **通用备货容错**：计算“采购在途”和“计划中”资产时，必须同时纳入当前店铺与无归属的通用备货，避免历史采购单或通用计划漏算导致缺口虚高：
@@ -406,32 +401,34 @@ suggestAmount = Math.max(
 OR: [{ shopId: currentShopId }, { shopId: null }]
 ```
 
-**库存健康度标签**：库存健康风险由 `stockStatus` 与 `riskTags` 表达，不再把 `NEW/DEAD/OUT_OF_STOCK_WATCH` 作为主分类。新品判断需要真实 `firstSeenAt` 后再扩展，严禁使用 `syncedAt` 强判新品。
+**库存健康度标签**：库存健康风险由 `stockStatus` 与 `riskTags` 表达；新品生命周期依赖 `first_stock_signal_at` / `first_inbound_at` / `first_available_at`，禁止仅凭在途/近30天无销判新品。
 
-### 4.5.2 平台产品业务分类 productClass（2026-06-04，统一实时口径）
+### 4.5.2 平台产品业务分类 productClass（2026-06-06，含 NEW）
 
 `productClass` 是面向运营筛选的主分类。前台列表展示、分类卡片统计、`store-overview.productStructure`、`productClass` 筛选、运营建议和采购建议全部优先使用 `classifyStoreProduct(product, salesStats)` 实时计算结果，确保卡片数量与点击后的列表 total 同口径。
 
-**落库字段兼容**：`store_products.product_class`、`classification_reason`、`classification_metrics`、`classified_at` 继续保留，不删除、不新增 migration、不修改 Prisma schema。`backfillComprehensiveSales()` 与手动重算接口会刷新这些缓存字段，但前台最终口径不直接依赖旧落库值。
+**落库字段**：`store_products.product_class`、`classification_reason`、`classification_metrics`、`classified_at`、`first_available_at`、`first_stock_signal_at`、`first_inbound_at`（migrations `20260606120000_*`、`20260610120000_add_store_product_stock_signals`）。
 
-**合法主分类**：`HOT`（主推款）、`POTENTIAL`（成长款）、`NORMAL`（常规款）、`CLEARANCE`（清理款）。断货、低库存、无销量等只作为 `riskTags` 风险标签，不作为主分类；旧查询别名 `DEAD/TO_BE_ELIMINATED` 可兼容映射到 `CLEARANCE`，`NEW/OUT_OF_STOCK_WATCH` 可兼容映射到 `NORMAL`，但不会作为主分类输出。
+**合法主分类**：`HOT`（主推款）、`POTENTIAL`（成长款）、`NORMAL`（常规款）、`CLEARANCE`（清理款）、`NEW`（新品）。内部阶段 `newProductStage`：`NEW_WAITING_INBOUND` / `NEW_OBSERVATION`，仅出现在 DTO，不作为前端 Tab。旧查询别名：`DEAD/TO_BE_ELIMINATED` → `CLEARANCE`；`OUT_OF_STOCK_WATCH` → `NEW`。
 
 **严格优先级**：
 
-1. `HOT`：满足其一即主推款：`comprehensiveSales >= 0.8`、`d30 >= 15`、或 `stock <= 0 && (d60 >= 20 || d90 >= 30)`。第三条用于历史明显热销但当前断货的保供识别，断货本身仍只进入风险标签。
-2. `POTENTIAL`：不属于 HOT，且满足 `d3 > 0 || d7 > 0 || d14 > 0`，或 `comprehensiveSales >= 0.15`。
-3. `CLEARANCE`：不属于 HOT/POTENTIAL，且满足 `stock > 0 && d30 === 0 && d60 === 0 && d90 === 0`，或 `stock > 0 && comprehensiveSales < 0.03`。
-4. `NORMAL`：未命中以上规则，归为常规款。
+1. `NEW` + `NEW_WAITING_INBOUND`：平台库存=0 + FBE在途>0 + `firstAvailableAt IS NULL` + 近期库存信号（`firstStockSignalAt`/`firstInboundAt`≤30天）+ d7~d90 全 0。
+2. `NEW` + `NEW_OBSERVATION`：`firstAvailableAt` 与 `firstStockSignalAt` 均≤30天 + 平台库存>0 + d7~d90 全 0。
+3. `HOT`：综合日销/近30天/断货历史销量达主推阈值。
+4. `POTENTIAL`：近3/7/14有动销或综合日销达成长阈值。
+5. `CLEARANCE`：有库存且长期无销量或综合日销低于清理阈值（新品观察期内不触发）。
+6. `NORMAL`：兜底常规款。
 
-**风险标签 `riskTags`**：`getProductRiskTags(product, salesStats)` 输出可叠加标签，包括 `断货`、`低库存`、`库存偏多`、`无销量`、`未关联SKU`、`无图片`、`负毛利`。典型规则：`stock <= 0 && (d30 > 0 || d60 > 0 || d90 > 0)` 标记断货；`stock / comprehensiveSales <= 7` 标记低库存；`stock / comprehensiveSales >= 60` 标记库存偏多；`d30/d60/d90` 全为 0 标记无销量。
+**风险标签 `riskTags`**：`getProductRiskTags(product, salesStats)` 输出可叠加标签，包括 `断货`、`低库存`、`库存偏多`、`无销量`、`未关联SKU`、`无图片`、`负毛利`。
 
-**计算入口**：`src/services/productClassification.ts` 提供 `classifyStoreProduct()` 纯函数、`recalcProductClassForShop()` 和 `recalcProductClassForAllShops()`。脚本 `npm run ops:recalc-product-class` 默认 dry-run；追加 `-- --fix` 写库；支持 `-- --shopId=1 --fix` 单店重算。
+**计算入口**：`src/services/productClassification.ts` 提供 `classifyStoreProduct()` 纯函数、`recalcProductClassForShop()` 和 `recalcProductClassForAllShops()`。
 
-**API**：`GET /api/store-products?productClass=HOT|POTENTIAL|NORMAL|CLEARANCE|all`。不传或 `all` 不过滤，非法值返回 400。筛选先按 `shopId/mappingStatus/search` 得到候选范围，再批量计算实时分类匹配的 `StoreProduct.id`，最后写入 Prisma `where.id in (...)` 做 `count/findMany`，严禁分页后过滤。DTO 保留 `d7/d14/d30/sales7/sales14/sales30/comprehensiveSales/comprehensive_sales/productClass/classificationName/classificationReason`，可新增 `d3/d60/d90/riskTags`，但前端表格仍只展示 7/14/30 天销量。
+**API**：`GET /api/store-products?productClass=HOT|POTENTIAL|NORMAL|CLEARANCE|NEW|all`。筛选先按候选范围批量实时分类，再 `where.id in (...)` 分页。
 
-**分类统计 API**：`GET /api/store-products/classification-summary?shopId=5` 返回固定字段 `{ total, HOT, POTENTIAL, NORMAL, CLEARANCE }`。统计不再直接 `groupBy store_products.product_class`，而是在与列表一致的候选范围内逐品调用实时分类函数，确保卡片数量与点击分类后的列表 total 一致。
+**分类统计 API**：`GET /api/store-products/classification-summary?shopId=5` 返回 `{ total, HOT, POTENTIAL, NORMAL, CLEARANCE, NEW }`。
 
-**店铺结构概览 API**：`GET /api/store-products/store-overview?shopId=5` 返回 `{ productStructure, stockRisk, purchaseActions, generatedAt }`。`productStructure` 与 `classification-summary` 共用实时分类函数；`stockRisk` 复用 `calculateStockStatus()`，基于实时 `salesStats` 计算 `comprehensiveSales` 与 `referenceDailySales` 后归入 `OUT_OF_STOCK/LOW_STOCK/WARNING/SAFE/OVERSTOCK`；`purchaseActions` 复用后端采购建议 helper。全店计算使用批量查询本地库存、FBE 在途、采购在途和计划中数量，避免逐品 N+1。
+**店铺结构概览 API**：`GET /api/store-products/store-overview?shopId=5` 返回 `{ productStructure, stockRisk, purchaseActions, generatedAt }`。`productStructure` 与 `classification-summary` 共用实时分类函数；`stockRisk` 复用 `calculateStockStatus()`；`purchaseActions` 复用后端采购建议 helper。全店计算使用批量查询本地库存、FBE 在途、采购在途和计划中数量，避免逐品 N+1。
 
 ### 4.5.2.1 eMAG 店铺维度链接身份（自建/跟卖）
 
@@ -490,7 +487,7 @@ npm run backfill:buy-box -- --shopId=5 --dryRun=false
 
 **运营动作建议 operationAdvice（实时 DTO，不落库）**：`GET /api/store-products` 每行返回双命名 `operationAdvice/operation_advice`，用于回答“运营接下来做什么”，与 `purchaseSuggestion` 的供应链采购动作分离。规则引擎实时使用四类主分类与风险标签含义：主推款优先保供、补货和广告；成长款观察趋势并适度加广告；常规款正常维护；清理款降价、清仓或停止采购。动作集合：`REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/RAISE_PRICE/LOWER_PRICE/JOIN_CAMPAIGN/ADVERTISE/CLEARANCE/PAUSE_PURCHASE/WAIT_FOR_ARRIVAL/OBSERVE`；优先级：`P0/P1/P2/P3`。断货补货规则优先于普通调价、广告、活动和观察兜底：`stock=0 && replenishReferenceDailySales>0 && coverageStock<=0` 返回立即/紧急补货，`coverageStock<targetStock` 返回仍需补货，`coverageStock>=targetStock` 返回等待到货。其他规则按顺序短路：负毛利动销异常、清仓处理、暂停采购、等待到货、建议涨价、建议降价、加广告、参加活动、观察即可。阈值集中配置为 `lowProfitMarginPct=15`、`goodProfitMarginPct=25`、`lowStockDays=30`、`warningStockDays=60`、`overstockDays=120`、`clearanceStockThreshold=10`；`profitMarginPct` 单位是百分数（`15` 表示 15%）。因当前缺少竞品价格、价格历史、广告 ROI、曝光点击转化数据，涨价/降价/广告/活动文案必须表达为“可考虑/测试”，不能作为强结论。
 
-**补货参考日销**：`purchaseSuggestion` 与 `operationAdvice` 统一使用 `replenishReferenceDailySales = max(comprehensiveSales, sales30/30, sales90/90, sales180/180)`。该指标只用于采购建议和运营建议，不改变 `productClass` 分类；`targetStock = ceil(replenishReferenceDailySales * 60)`，`coverageStock = platformStock + platformInTransit + localStock + purchasingInTransit + planningStock`，`suggestAmount = max(0, targetStock - coverageStock)`。当平台库存为 0 且历史/近期有销量时，即使近 7/14/30 综合日销因断货归零，也能基于 90/180 天历史销量给出补货、仍需补货或等待到货建议。
+**补货参考日销**：`purchaseSuggestion` 与 `operationAdvice` 统一使用 `replenishReferenceDailySales = max(comprehensiveSales, sales30/30, sales90/90, sales180/180)`。该指标只用于采购建议和运营建议，不改变 `productClass` 分类；`targetStockDays` 按分类/阶段常量解析（HOT=90 等），`coverageStock = platformStock + platformInTransit + purchasingInTransit + planningStock`（不含 localStock），`suggestAmount = max(0, ceil(replenishReferenceDailySales * targetStockDays) - coverageStock)`。清理款默认 targetStockDays=0；复活观察时 targetStockDays=30。
 
 **库存状态 stockStatus（DTO 计算字段，不落库）**：
 

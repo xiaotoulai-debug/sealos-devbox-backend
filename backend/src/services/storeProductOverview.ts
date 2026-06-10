@@ -5,13 +5,16 @@ import {
   calculateStockStatus,
   classifyStoreProduct,
   isProductClass,
+  NEW_PRODUCT_STAGE_LABELS,
   PRODUCT_CLASSES,
   STOCK_STATUSES,
+  type NewProductStage,
   type ProductClass,
   type ClassifyStoreProductResult,
   type ClassificationSalesStats,
   type StockStatus,
 } from './productClassification';
+import { resolveEffectiveStockSignals, scheduleStockSignalBackfill, type EffectiveStockSignals } from './firstAvailableAt';
 import { getSalesForProduct, getSalesStatsByShop } from './salesStats';
 
 export type PurchaseActionKey =
@@ -29,8 +32,27 @@ export type StockGroupKey =
   | 'OUT_OF_STOCK_REPLENISHED'
   | 'OUT_OF_STOCK_NOT_REPLENISHED';
 
+export const TARGET_STOCK_DAYS_BY_CLASS = {
+  HOT: 90,
+  POTENTIAL: 75,
+  NORMAL: 70,
+  CLEARANCE: 0,
+  NEW: 30,
+} as const;
+
+export const TARGET_STOCK_DAYS_BY_STAGE = {
+  NEW_WAITING_INBOUND: 0,
+  NEW_OBSERVATION_NO_SALES: 0,
+  NEW_OBSERVATION_TRIAL: 30,
+  NEW_OBSERVATION_STABLE: 45,
+  CLEARANCE_REVIVAL: 30,
+} as const;
+
+export type ReplenishmentStage = keyof typeof TARGET_STOCK_DAYS_BY_STAGE;
+
 export type PurchaseSuggestion = {
   targetStock: number;
+  targetStockDays: number;
   platformStock: number;
   platformInTransit: number;
   localStock: number;
@@ -38,8 +60,16 @@ export type PurchaseSuggestion = {
   planningStock: number;
   suggestAmount: number;
   coverageStock: number;
+  platformStockDays: number | null;
+  totalCoverageDays: number | null;
   replenishReferenceDailySales: number;
   inventoryTag: ProductClass;
+  newProductStage: NewProductStage | null;
+  newProductStageLabel: string | null;
+  firstAvailableAt: string | null;
+  firstStockSignalAt: string | null;
+  firstInboundAt: string | null;
+  replenishmentStage?: ReplenishmentStage;
   text?: string;
   label?: string;
   reason?: string;
@@ -47,6 +77,7 @@ export type PurchaseSuggestion = {
 
 type BuildPurchaseSuggestionInput = {
   productClass: ProductClass;
+  newProductStage: NewProductStage | null;
   stockStatus: StockStatus;
   platformStock: number;
   platformInTransit: number;
@@ -54,10 +85,16 @@ type BuildPurchaseSuggestionInput = {
   purchasingInTransit: number;
   planningStock: number;
   comprehensiveSales: number;
+  sales7: number;
+  sales14: number;
   sales30: number;
   sales60?: number;
   sales90?: number;
   sales180?: number;
+  estimatedProfit?: number | null;
+  firstAvailableAt?: Date | string | null;
+  firstStockSignalAt?: Date | string | null;
+  firstInboundAt?: Date | string | null;
   lastOrderAt?: Date | null;
   daysSinceSynced: number;
 };
@@ -119,6 +156,9 @@ type RealtimeClassifiableProduct = {
   mappedInventorySku: string | null;
   stock: number;
   syncedAt?: Date;
+  firstAvailableAt?: Date | null;
+  firstStockSignalAt?: Date | null;
+  firstInboundAt?: Date | null;
   mainImage?: string | null;
   imageUrl?: string | null;
   estimatedProfit?: unknown;
@@ -136,11 +176,26 @@ export function classifyProductWithRealtimeSales(
   product: RealtimeClassifiableProduct,
   sales: ClassificationSalesStats,
   inTransitStock = 0,
+  signals?: EffectiveStockSignals,
 ): RealtimeProductClassification {
   const comprehensiveSales = calculateComprehensiveSales(sales, product.stock);
+  const resolvedSignals = signals ?? resolveEffectiveStockSignals(
+    {
+      id: product.id,
+      stock: product.stock,
+      inTransitStock,
+      firstAvailableAt: product.firstAvailableAt ?? null,
+      firstInboundAt: product.firstInboundAt ?? null,
+      firstStockSignalAt: product.firstStockSignalAt ?? null,
+    },
+    sales,
+  ).signals;
   const classified = classifyStoreProduct({
     stock: product.stock,
     inTransitStock,
+    firstAvailableAt: resolvedSignals.firstAvailableAt,
+    firstStockSignalAt: resolvedSignals.firstStockSignalAt,
+    firstInboundAt: resolvedSignals.firstInboundAt,
     syncedAt: product.syncedAt,
     mappedInventorySku: product.mappedInventorySku,
     mainImage: product.mainImage,
@@ -155,11 +210,37 @@ export async function buildRealtimeClassificationMap(
   products: RealtimeClassifiableProduct[],
   forceRefresh = false,
 ): Promise<Map<number, RealtimeProductClassification>> {
-  const salesStats = await getSalesStatsByShop(shopId, forceRefresh);
+  const [salesStats, assets] = await Promise.all([
+    getSalesStatsByShop(shopId, forceRefresh),
+    buildLocalProductAssets(shopId, products),
+  ]);
   const result = new Map<number, RealtimeProductClassification>();
+  const patches = new Map<number, import('./firstAvailableAt').StockSignalDbPatch>();
   for (const product of products) {
     const sales = getSalesForProduct(salesStats.map, product.sku, product.vendorSku, product.pnk);
-    result.set(product.id, classifyProductWithRealtimeSales(product, sales));
+    const localProductId = assets.storeProductToProductId.get(product.id);
+    const inTransitStock = localProductId ? assets.platformInTransitByProductId.get(localProductId) ?? 0 : 0;
+    const { signals, pendingDbPatch } = resolveEffectiveStockSignals(
+      {
+        id: product.id,
+        stock: product.stock,
+        inTransitStock,
+        firstAvailableAt: product.firstAvailableAt ?? null,
+        firstInboundAt: product.firstInboundAt ?? null,
+        firstStockSignalAt: product.firstStockSignalAt ?? null,
+      },
+      sales,
+    );
+    if (Object.keys(pendingDbPatch).length > 0) {
+      patches.set(product.id, pendingDbPatch);
+    }
+    result.set(
+      product.id,
+      classifyProductWithRealtimeSales(product, sales, inTransitStock, signals),
+    );
+  }
+  if (patches.size > 0) {
+    scheduleStockSignalBackfill(patches);
   }
   return result;
 }
@@ -191,9 +272,69 @@ export function calculateReplenishReferenceDailySales(
   return parseFloat(referenceDailySales.toFixed(4));
 }
 
+function normalizeFirstAvailableAtIso(value: Date | string | null | undefined): string | null {
+  if (!value) return null;
+  const date = value instanceof Date ? value : new Date(value);
+  return Number.isNaN(date.getTime()) ? null : date.toISOString();
+}
+
+function resolveNewObservationReplenishmentStage(
+  sales7: number,
+  sales14: number,
+  sales30: number,
+): ReplenishmentStage {
+  if (sales7 === 0 && sales14 === 0 && sales30 === 0) {
+    return 'NEW_OBSERVATION_NO_SALES';
+  }
+  const daily7 = sales7 / 7;
+  const daily14 = sales14 / 14;
+  const daily30 = sales30 / 30;
+  if (sales7 > 0 && sales14 > 0 && daily7 >= daily14 * 0.7 && (daily30 <= 0 || daily14 >= daily30 * 0.8)) {
+    return 'NEW_OBSERVATION_STABLE';
+  }
+  return 'NEW_OBSERVATION_TRIAL';
+}
+
+function detectClearanceRevival(input: BuildPurchaseSuggestionInput): boolean {
+  const { productClass, sales7, sales30, estimatedProfit } = input;
+  if (productClass !== 'CLEARANCE') return false;
+  if (sales7 <= 0) return false;
+  const daily7 = sales7 / 7;
+  const daily30 = sales30 / 30;
+  if (daily30 > 0 && daily7 < daily30 * 2) return false;
+  if (estimatedProfit != null && estimatedProfit <= 0) return false;
+  return true;
+}
+
+function resolveTargetStockDays(input: BuildPurchaseSuggestionInput): {
+  targetStockDays: number;
+  replenishmentStage?: ReplenishmentStage;
+} {
+  const { productClass, newProductStage, sales7, sales14, sales30, comprehensiveSales, platformStock, estimatedProfit } = input;
+
+  if (newProductStage === 'NEW_WAITING_INBOUND') {
+    return { targetStockDays: TARGET_STOCK_DAYS_BY_STAGE.NEW_WAITING_INBOUND, replenishmentStage: 'NEW_WAITING_INBOUND' };
+  }
+
+  if (newProductStage === 'NEW_OBSERVATION') {
+    const stage = resolveNewObservationReplenishmentStage(sales7, sales14, sales30);
+    return { targetStockDays: TARGET_STOCK_DAYS_BY_STAGE[stage], replenishmentStage: stage };
+  }
+
+  if (productClass === 'CLEARANCE') {
+    if (detectClearanceRevival(input)) {
+      return { targetStockDays: TARGET_STOCK_DAYS_BY_STAGE.CLEARANCE_REVIVAL, replenishmentStage: 'CLEARANCE_REVIVAL' };
+    }
+    return { targetStockDays: TARGET_STOCK_DAYS_BY_CLASS.CLEARANCE };
+  }
+
+  return { targetStockDays: TARGET_STOCK_DAYS_BY_CLASS[productClass] };
+}
+
 export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): PurchaseSuggestion {
   const {
     productClass,
+    newProductStage,
     stockStatus,
     platformStock,
     platformInTransit,
@@ -201,9 +342,14 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
     purchasingInTransit,
     planningStock,
     comprehensiveSales,
+    sales7,
+    sales14,
     sales30,
     sales90,
     sales180,
+    firstAvailableAt,
+    firstStockSignalAt,
+    firstInboundAt,
   } = input;
 
   const replenishReferenceDailySales = calculateReplenishReferenceDailySales(
@@ -212,13 +358,29 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
     sales90,
     sales180,
   );
-  const targetStock = replenishReferenceDailySales > 0 ? Math.ceil(replenishReferenceDailySales * 60) : 0;
-  const coverageStock = platformStock + platformInTransit + localStock + purchasingInTransit + planningStock;
-  const suggestAmount = Math.max(0, targetStock - coverageStock);
+  const { targetStockDays, replenishmentStage } = resolveTargetStockDays(input);
+  const coverageStock = platformStock + platformInTransit + purchasingInTransit + planningStock;
+  const targetStock = replenishReferenceDailySales > 0 && targetStockDays > 0
+    ? Math.ceil(replenishReferenceDailySales * targetStockDays)
+    : 0;
+  const suggestAmount = targetStockDays <= 0
+    ? 0
+    : Math.max(0, targetStock - coverageStock);
+  const platformStockDays = replenishReferenceDailySales > 0
+    ? parseFloat((platformStock / replenishReferenceDailySales).toFixed(2))
+    : null;
+  const totalCoverageDays = replenishReferenceDailySales > 0
+    ? parseFloat((coverageStock / replenishReferenceDailySales).toFixed(2))
+    : null;
+  const newProductStageLabel = newProductStage ? NEW_PRODUCT_STAGE_LABELS[newProductStage] : null;
+  const firstAvailableAtIso = normalizeFirstAvailableAtIso(firstAvailableAt);
+  const firstStockSignalAtIso = normalizeFirstAvailableAtIso(firstStockSignalAt);
+  const firstInboundAtIso = normalizeFirstAvailableAtIso(firstInboundAt);
 
   const isNormalProduct = productClass === 'NORMAL';
   const isClearanceProduct = productClass === 'CLEARANCE';
-  const isOutOfStockWithSales = platformStock === 0 && replenishReferenceDailySales > 0;
+  const isNewProduct = productClass === 'NEW';
+  const isOutOfStockWithSales = platformStock === 0 && replenishReferenceDailySales > 0 && !isNewProduct;
   const isHotOrPotentialOutOfStock = (productClass === 'HOT' || productClass === 'POTENTIAL') && platformStock === 0;
   const isHotOrPotentialLowStockWarning =
     (productClass === 'HOT' || productClass === 'POTENTIAL') &&
@@ -229,7 +391,22 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
 
   let text: string | undefined;
   let reason: string | undefined;
-  if (isOutOfStockWithSales) {
+
+  if (newProductStage === 'NEW_WAITING_INBOUND') {
+    text = '等待到货';
+    reason = '新品待入仓，货物仍在路上，暂不判断销量，等待到货。';
+  } else if (newProductStage === 'NEW_OBSERVATION') {
+    if (suggestAmount > 0) {
+      text = replenishmentStage === 'NEW_OBSERVATION_STABLE' ? '小批量试补' : '观察试补';
+      reason = '新品观察期，当前处于首次入仓后 30 天内，先观察销量，不按清理款处理。';
+    } else {
+      text = '观察即可';
+      reason = '新品观察期，当前处于首次入仓后 30 天内，先观察销量，不按清理款处理。';
+    }
+  } else if (replenishmentStage === 'CLEARANCE_REVIVAL') {
+    text = suggestAmount > 0 ? '复活观察' : '观察即可';
+    reason = '清理款近期销量回升，进入复活观察期，仅允许小批量试补。';
+  } else if (isOutOfStockWithSales) {
     const pendingStock = platformInTransit + purchasingInTransit + planningStock;
     if (suggestAmount > 0 && coverageStock <= 0) {
       text = replenishReferenceDailySales >= 1 ? '立即补货' : '紧急补货';
@@ -244,22 +421,14 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
       reason = '当前平台库存为0，但已有在途、采购中或计划库存覆盖目标库存，建议等待到货并观察销售恢复情况。';
     } else if (localStock > 0) {
       text = '仍需补货';
-      reason = '当前平台库存为0，本地库存可覆盖目标库存，建议尽快安排补货或发往平台仓，避免继续丢单。';
+      reason = '当前平台库存为0，本地仓仍有库存，建议尽快安排补货或发往平台仓，避免继续丢单。';
     } else {
       text = '仍需补货';
       reason = '当前平台库存为0且历史/近期有销量，建议复核库存保障并安排补货。';
     }
   } else if (isClearanceProduct) {
-    if (platformStock >= 10 || stockStatus === 'OVERSTOCK') {
-      text = '清仓处理';
-      reason = '清理款销量弱且存在库存压力，建议降价清仓，回收资金并停止继续采购。';
-    } else if (platformStock > 0) {
-      text = '停止补货';
-      reason = '清理款仍有少量平台库存，建议停止补货，观察是否自然售出。';
-    } else {
-      text = '停止补货';
-      reason = '清理款暂无平台库存，建议不再补货，除非人工确认重新开发。';
-    }
+    text = platformStock >= 10 || stockStatus === 'OVERSTOCK' ? '清仓处理' : '停止补货';
+    reason = '清理款默认不补货，优先降低库存占用。';
   } else if (isNormalProduct) {
     if (stockStatus === 'LOW_STOCK') {
       text = '少量补货';
@@ -315,6 +484,7 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
 
   return {
     targetStock,
+    targetStockDays,
     platformStock,
     platformInTransit,
     localStock,
@@ -322,8 +492,16 @@ export function buildPurchaseSuggestion(input: BuildPurchaseSuggestionInput): Pu
     planningStock,
     suggestAmount,
     coverageStock,
+    platformStockDays,
+    totalCoverageDays,
     replenishReferenceDailySales,
     inventoryTag,
+    newProductStage,
+    newProductStageLabel,
+    firstAvailableAt: firstAvailableAtIso,
+    firstStockSignalAt: firstStockSignalAtIso,
+    firstInboundAt: firstInboundAtIso,
+    ...(replenishmentStage ? { replenishmentStage } : {}),
     ...(text ? { text, label: text } : {}),
     ...(reason ? { reason } : {}),
   };
@@ -342,8 +520,9 @@ export function mapPurchaseAction(suggestion: PurchaseSuggestion): PurchaseActio
   ) {
     return 'STILL_NEED_REPLENISH';
   }
-  if (text.includes('等待到货') || text.includes('待到货')) return 'WAIT_FOR_ARRIVAL';
+  if (text.includes('等待到货') || text.includes('待到货') || text.includes('观察即可')) return 'WAIT_FOR_ARRIVAL';
   if (text.includes('清仓')) return 'CLEARANCE';
+  if (text.includes('复活观察') || text.includes('观察试补')) return 'STILL_NEED_REPLENISH';
   if (
     text.includes('暂不补货') ||
     text.includes('暂停补货') ||
@@ -492,6 +671,9 @@ export async function getProductStructureSummary(
       mappedInventorySku: true,
       stock: true,
       syncedAt: true,
+      firstAvailableAt: true,
+      firstStockSignalAt: true,
+      firstInboundAt: true,
       mainImage: true,
       imageUrl: true,
       estimatedProfit: true,
@@ -523,6 +705,9 @@ export async function getMatchedStoreProductIdsByProductClass(
       mappedInventorySku: true,
       stock: true,
       syncedAt: true,
+      firstAvailableAt: true,
+      firstStockSignalAt: true,
+      firstInboundAt: true,
       mainImage: true,
       imageUrl: true,
       estimatedProfit: true,
@@ -558,6 +743,12 @@ export async function getMatchedStoreProductIdsByOverviewFilters(
         stock: true,
         productClass: true,
         syncedAt: true,
+        firstAvailableAt: true,
+        firstStockSignalAt: true,
+        firstInboundAt: true,
+        mainImage: true,
+        imageUrl: true,
+        estimatedProfit: true,
       },
       orderBy: { id: 'asc' },
     }),
@@ -607,16 +798,34 @@ export async function getMatchedStoreProductIdsByOverviewFilters(
       const localStock = localProductId ? assets.localStockByProductId.get(localProductId) ?? 0 : 0;
       const purchasingInTransit = localProductId ? assets.purchasingInTransitByProductId.get(localProductId) ?? 0 : 0;
       const planningStock = skuKey ? assets.planningStockBySku.get(skuKey) ?? 0 : 0;
+      const { signals } = resolveEffectiveStockSignals(
+        {
+          id: product.id,
+          stock: product.stock,
+          inTransitStock: platformInTransit,
+          firstAvailableAt: product.firstAvailableAt ?? null,
+          firstInboundAt: product.firstInboundAt ?? null,
+          firstStockSignalAt: product.firstStockSignalAt ?? null,
+        },
+        sales,
+      );
       const fallbackClassification = classifyStoreProduct({
         stock: product.stock,
         inTransitStock: platformInTransit,
+        firstAvailableAt: signals.firstAvailableAt,
+        firstStockSignalAt: signals.firstStockSignalAt,
+        firstInboundAt: signals.firstInboundAt,
         syncedAt: product.syncedAt,
         mappedInventorySku: product.mappedInventorySku,
+        mainImage: product.mainImage,
+        imageUrl: product.imageUrl,
+        estimatedProfit: product.estimatedProfit != null ? Number(product.estimatedProfit) : null,
       }, sales);
       const productClass = fallbackClassification.productClass;
       const daysSinceSynced = Math.max(0, Math.floor((nowMs - product.syncedAt.getTime()) / dayMs));
       const suggestion = buildPurchaseSuggestion({
         productClass,
+        newProductStage: fallbackClassification.newProductStage,
         stockStatus: stockStatusResult.stockStatus,
         platformStock: product.stock,
         platformInTransit,
@@ -624,10 +833,16 @@ export async function getMatchedStoreProductIdsByOverviewFilters(
         purchasingInTransit,
         planningStock,
         comprehensiveSales,
+        sales7: sales.d7,
+        sales14: sales.d14,
         sales30: sales.d30,
         sales60: sales.d60,
         sales90: sales.d90,
         sales180: sales.d180,
+        estimatedProfit: product.estimatedProfit != null ? Number(product.estimatedProfit) : null,
+        firstAvailableAt: signals.firstAvailableAt,
+        firstStockSignalAt: signals.firstStockSignalAt,
+        firstInboundAt: signals.firstInboundAt,
         lastOrderAt: normalizeNullableDate(sales.lastOrderAt),
         daysSinceSynced,
       });
@@ -661,6 +876,9 @@ export async function getStoreProductOverview(shopId: number): Promise<StoreProd
         stock: true,
         productClass: true,
         syncedAt: true,
+        firstAvailableAt: true,
+        firstStockSignalAt: true,
+        firstInboundAt: true,
         mainImage: true,
         imageUrl: true,
         estimatedProfit: true,
@@ -695,11 +913,13 @@ export async function getStoreProductOverview(shopId: number): Promise<StoreProd
     const localStock = localProductId ? assets.localStockByProductId.get(localProductId) ?? 0 : 0;
     const purchasingInTransit = localProductId ? assets.purchasingInTransitByProductId.get(localProductId) ?? 0 : 0;
     const planningStock = skuKey ? assets.planningStockBySku.get(skuKey) ?? 0 : 0;
-    const productClass = classificationMap.get(product.id)?.classified.productClass ?? normalizeProductClass(product.productClass);
+    const classified = classificationMap.get(product.id)?.classified;
+    const productClass = classified?.productClass ?? normalizeProductClass(product.productClass);
     const daysSinceSynced = Math.max(0, Math.floor((nowMs - product.syncedAt.getTime()) / dayMs));
 
     const suggestion = buildPurchaseSuggestion({
       productClass,
+      newProductStage: classified?.newProductStage ?? null,
       stockStatus: stockStatusResult.stockStatus,
       platformStock: product.stock,
       platformInTransit,
@@ -707,10 +927,16 @@ export async function getStoreProductOverview(shopId: number): Promise<StoreProd
       purchasingInTransit,
       planningStock,
       comprehensiveSales,
+      sales7: sales.d7,
+      sales14: sales.d14,
       sales30: sales.d30,
       sales60: sales.d60,
       sales90: sales.d90,
       sales180: sales.d180,
+      estimatedProfit: product.estimatedProfit != null ? Number(product.estimatedProfit) : null,
+      firstAvailableAt: classified?.metrics.firstAvailableAt ? new Date(classified.metrics.firstAvailableAt) : product.firstAvailableAt,
+      firstStockSignalAt: product.firstStockSignalAt,
+      firstInboundAt: product.firstInboundAt,
       lastOrderAt: normalizeNullableDate(sales.lastOrderAt),
       daysSinceSynced,
     });

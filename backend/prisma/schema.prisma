@@ -333,6 +333,9 @@ model StoreProduct {
   buyBoxActionTips       Json?     @map("buy_box_action_tips")       // 购物车状态动作提醒数组
   buyBoxMeta             Json?     @map("buy_box_meta")              // compact meta，不保存完整 raw response
   isArchived      Boolean  @default(false) @map("is_archived") // eMAG 变更 PNK/SKU 后保留审计用的归档标记；列表默认过滤
+  firstAvailableAt DateTime? @map("first_available_at") // 当前店铺下首次平台库存 > 0 的时间（新品观察期基准）
+  firstStockSignalAt DateTime? @map("first_stock_signal_at") // 首次平台库存>0 或 FBE/ERP 在途>0 的时间
+  firstInboundAt     DateTime? @map("first_inbound_at") // 首次 FBE/ERP 在途 > 0 的时间
   syncedAt         DateTime @default(now()) @map("synced_at")
   shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
   inventorySnapshots StoreProductInventorySnapshot[]
@@ -350,6 +353,9 @@ model StoreProduct {
   @@index([shopId, comprehensiveSales(sort: Desc)])
   @@index([shopId, productClass])
   @@index([shopId, productClass, comprehensiveSales(sort: Desc)])
+  @@index([shopId, firstAvailableAt])
+  @@index([shopId, firstStockSignalAt])
+  @@index([shopId, firstInboundAt])
   @@map("store_products")
 }
 

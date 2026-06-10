@@ -9,6 +9,7 @@
 
 import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
+import { resolveStockSignalsForSync } from './firstAvailableAt';
 import { EmagCredentials, getEmagCredentials, REGION_DOMAIN } from './emagClient';
 import { readProductOffers, findDocumentationByEans, readProductsByPnk } from './emagProduct';
 import { normalizeEmagProduct, slugifyProductName } from './emagProductNormalizer';
@@ -77,7 +78,13 @@ async function saveStoreProductByBusinessIdentity(
       { syncedAt: 'desc' },
       { id: 'desc' },
     ],
-    select: { id: true, pnk: true },
+    select: {
+      id: true,
+      pnk: true,
+      firstAvailableAt: true,
+      firstInboundAt: true,
+      firstStockSignalAt: true,
+    },
   });
 
   if (existing) {
@@ -87,14 +94,24 @@ async function saveStoreProductByBusinessIdentity(
         `Offer=${np.emagOfferId ?? '(none)'} PNK ${existing.pnk} -> ${np.pnk}`,
       );
     }
+    const signalPatch = resolveStockSignalsForSync(np.stock, 0, existing);
     await prisma.storeProduct.update({
       where: { id: existing.id },
-      data: updateData,
+      data: {
+        ...updateData,
+        ...signalPatch,
+      },
     });
     return;
   }
 
-  await prisma.storeProduct.create({ data });
+  const createSignalPatch = resolveStockSignalsForSync(np.stock, 0, {});
+  await prisma.storeProduct.create({
+    data: {
+      ...data,
+      ...createSignalPatch,
+    },
+  });
 }
 
 function isJpgOrPngUrl(u: string): boolean {
