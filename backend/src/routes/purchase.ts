@@ -77,8 +77,9 @@ function buildProductIdsJsonForItem(
 //
 // Body: {
 //   items: [{ productId: number, quantity: number }],
-//   warehouseId?: number,   // 目标入库仓（可选）
+//   warehouseId?: number,   // 目标入库仓（必传）
 //   shopId?: number,        // 归属店铺（可选，老数据可为空）
+//   alibabaAuthId?: number, // 1688 采购账号 ID（可选，兼容 alibabaAccountId）
 //   remark?: string
 // }
 // ─────────────────────────────────────────────────────────────────────
@@ -86,7 +87,14 @@ router.post('/create-local', async (req: Request, res: Response) => {
   try {
     const userId   = req.user!.userId;
     const username = req.user!.username ?? 'unknown';
-    const { items, warehouseId, shopId, remark } = req.body ?? {};
+    const {
+      items,
+      warehouseId,
+      shopId,
+      remark,
+      alibabaAuthId: bodyAlibabaAuthId,
+      alibabaAccountId,
+    } = req.body ?? {};
 
     if (!Array.isArray(items) || items.length === 0) {
       res.status(400).json({ code: 400, data: null, message: '请提供至少一个产品' });
@@ -130,6 +138,20 @@ router.post('/create-local', async (req: Request, res: Response) => {
       validShopId = shop.id;
       shopNameSnapshot = shop.shopName;
     }
+
+    // 1688 采购账号：body 指定 ID，否则回退默认启用账号（与 place-1688-order 一致）
+    const requestedAuthIdRaw = bodyAlibabaAuthId ?? alibabaAccountId;
+    const requestedAuthId = requestedAuthIdRaw != null && String(requestedAuthIdRaw).trim() !== ''
+      ? Number(requestedAuthIdRaw)
+      : NaN;
+    const resolvedAuth = await resolveAlibabaAuthRecord(
+      Number.isInteger(requestedAuthId) && requestedAuthId > 0 ? requestedAuthId : null,
+    );
+    if (Number.isInteger(requestedAuthId) && requestedAuthId > 0 && !resolvedAuth) {
+      res.status(400).json({ code: 400, data: null, message: '指定的 1688 采购账号不存在或已禁用' });
+      return;
+    }
+    const createAlibabaAuthId = resolvedAuth?.id ?? null;
 
     // 校验产品存在（多字段解析 productId，避免前端只传 product.id 等变体导致整单跳过写入）
     const productIds = items
@@ -204,6 +226,7 @@ router.post('/create-local', async (req: Request, res: Response) => {
             warehouseId: validWarehouseId,
             shopId:      orderShopId,
             shopNameSnapshot: orderShopNameSnapshot,
+            alibabaAuthId: createAlibabaAuthId,
             remark:      remark ?? null,
             items: {
               create: {
@@ -247,6 +270,8 @@ router.post('/create-local', async (req: Request, res: Response) => {
         shopId:      order.shopId,
         shopName:    order.shopNameSnapshot ?? order.shop?.shopName ?? null,
         shop:        order.shop,
+        alibabaAuthId:   order.alibabaAuthId ?? createAlibabaAuthId,
+        alibabaAccountName: resolvedAuth?.accountName ?? null,
         has1688:     !!(prod.externalProductId && prod.externalSkuId),
       });
     }
