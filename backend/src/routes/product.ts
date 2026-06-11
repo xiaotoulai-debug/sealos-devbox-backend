@@ -606,6 +606,15 @@ router.get('/purchasing', async (req: Request, res: Response) => {
         take: pageSize,
         include: {
           shop: { select: { id: true, shopName: true, region: true } },
+          sourceStoreProduct: {
+            select: {
+              id: true, pnk: true, name: true, productUrl: true, sku: true,
+              vendorSku: true, mappedInventorySku: true, mainImage: true,
+            },
+          },
+          fbeShipment: {
+            select: { id: true, shipmentNumber: true, status: true },
+          },
         },
       }),
     ]);
@@ -631,6 +640,24 @@ router.get('/purchasing', async (req: Request, res: Response) => {
       shopId:           p.shopId           ?? null,
       shopName:         p.shop?.shopName    ?? null,
       shop:             p.shop             ?? null,
+      site:             p.shop?.region      ?? null,
+      sourceStoreProductId: p.sourceStoreProductId ?? null,
+      storeProductId:   p.sourceStoreProductId ?? null,
+      storeProduct:     p.sourceStoreProduct ? {
+        id: p.sourceStoreProduct.id,
+        pnk: p.sourceStoreProduct.pnk,
+        name: p.sourceStoreProduct.name,
+        productUrl: p.sourceStoreProduct.productUrl,
+        sku: p.sourceStoreProduct.sku,
+        vendorSku: p.sourceStoreProduct.vendorSku,
+        mappedInventorySku: p.sourceStoreProduct.mappedInventorySku,
+        mainImage: p.sourceStoreProduct.mainImage,
+      } : null,
+      platformProductUrl: p.sourceStoreProduct?.productUrl ?? p.productUrl ?? null,
+      fbeShipmentId:    p.fbeShipmentId    ?? null,
+      fbeCreatedAt:     p.fbeCreatedAt     ?? null,
+      fbeStatus:        p.fbeStatus        ?? p.fbeShipment?.status ?? null,
+      fbeShipmentNo:    p.fbeShipment?.shipmentNumber ?? null,
       length:           p.length        ? Number(p.length)        : null,
       width:            p.width         ? Number(p.width)         : null,
       height:           p.height        ? Number(p.height)        : null,
@@ -2031,6 +2058,117 @@ router.post('/remove-from-plan', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('[POST /api/products/remove-from-plan]', err?.message ?? err);
     res.status(500).json({ code: 500, data: null, message: '移除计划产品失败' });
+  }
+});
+
+// ── PATCH /api/products/:id/link-store-product ───────────────────────────
+// 采购计划产品关联平台产品（StoreProduct）
+// body: { storeProductId: number, shopId?: number }
+// ──────────────────────────────────────────────────────────────────────────
+router.patch('/:id/link-store-product', async (req: Request, res: Response) => {
+  try {
+    const productId = parseInt(String(req.params.id), 10);
+    if (isNaN(productId) || productId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: '产品 ID 无效' });
+      return;
+    }
+
+    const storeProductId = Number(req.body?.storeProductId);
+    if (!Number.isInteger(storeProductId) || storeProductId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: 'storeProductId 必填且必须为有效平台产品 ID' });
+      return;
+    }
+
+    const product = await prisma.product.findFirst({
+      where: {
+        id: productId,
+        status: 'PURCHASING',
+        purchaseOrderId: null,
+        isDeleted: false,
+      },
+      select: { id: true, sku: true, shopId: true, ownerId: true },
+    });
+    if (!product) {
+      res.status(404).json({ code: 404, data: null, message: '采购计划产品不存在或已建采购单' });
+      return;
+    }
+
+    const bodyShopId = parseOptionalPositiveInt(req.body?.shopId);
+    if (bodyShopId === 'INVALID') {
+      res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+      return;
+    }
+    const targetShopId = bodyShopId ?? product.shopId;
+    if (targetShopId == null) {
+      res.status(400).json({ code: 400, data: null, message: '请提供 shopId 或先为采购计划产品设置归属店铺' });
+      return;
+    }
+
+    const storeProduct = await prisma.storeProduct.findFirst({
+      where: { id: storeProductId, shopId: targetShopId, isArchived: false },
+      select: {
+        id: true, shopId: true, pnk: true, name: true, productUrl: true,
+        sku: true, vendorSku: true, mappedInventorySku: true, mainImage: true,
+        shop: { select: { id: true, shopName: true, region: true } },
+      },
+    });
+    if (!storeProduct) {
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: '平台产品不存在、已归档或不属于指定店铺',
+      });
+      return;
+    }
+
+    if (product.shopId != null && product.shopId !== storeProduct.shopId) {
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: '平台产品所属店铺与采购计划产品归属店铺不一致',
+      });
+      return;
+    }
+
+    const updated = await prisma.product.update({
+      where: { id: productId },
+      data: {
+        sourceStoreProductId: storeProduct.id,
+        shopId: product.shopId ?? storeProduct.shopId,
+        productUrl: storeProduct.productUrl ?? undefined,
+        imageUrl: storeProduct.mainImage ?? undefined,
+      },
+      select: {
+        id: true,
+        sku: true,
+        shopId: true,
+        sourceStoreProductId: true,
+        productUrl: true,
+      },
+    });
+
+    res.json({
+      code: 200,
+      data: {
+        productId: updated.id,
+        sourceStoreProductId: updated.sourceStoreProductId,
+        storeProductId: updated.sourceStoreProductId,
+        storeProduct: {
+          id: storeProduct.id,
+          pnk: storeProduct.pnk,
+          name: storeProduct.name,
+          productUrl: storeProduct.productUrl,
+          sku: storeProduct.sku,
+          vendorSku: storeProduct.vendorSku,
+          mappedInventorySku: storeProduct.mappedInventorySku,
+          shop: storeProduct.shop,
+        },
+      },
+      message: '平台产品关联成功',
+    });
+  } catch (err) {
+    console.error('[PATCH /api/products/:id/link-store-product]', err);
+    res.status(500).json({ code: 500, data: null, message: '关联平台产品失败' });
   }
 });
 

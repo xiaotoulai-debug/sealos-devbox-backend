@@ -136,9 +136,15 @@ model Product {
   ownerId           Int?           @map("owner_id")
   purchaseOrderId   Int?           @map("purchase_order_id")
   shopId            Int?           @map("shop_id") // 采购计划归属店铺（从平台产品发起采购时透传，老数据可为空）
+  sourceStoreProductId Int?        @map("source_store_product_id") // 采购计划关联的平台产品（StoreProduct.id）
+  fbeShipmentId     Int?           @map("fbe_shipment_id")         // 已创建的 FBE 发货单（防重复）
+  fbeCreatedAt      DateTime?      @map("fbe_created_at")
+  fbeStatus         String?        @map("fbe_status")              // FBE 发货单状态快照（如 PENDING）
   owner             User?          @relation(fields: [ownerId], references: [id])
   purchaseOrder     PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
   shop              ShopAuthorization? @relation(fields: [shopId], references: [id], onDelete: SetNull)
+  sourceStoreProduct StoreProduct? @relation("ProductSourceStoreProduct", fields: [sourceStoreProductId], references: [id], onDelete: SetNull)
+  fbeShipment       FbeShipment?   @relation("ProductFbeShipment", fields: [fbeShipmentId], references: [id], onDelete: SetNull)
 
   @@index([status, createdAt(sort: Desc)])
   @@index([category])
@@ -149,6 +155,8 @@ model Product {
   @@index([shopId])
   @@index([sku])
   @@index([externalProductId])
+  @@index([sourceStoreProductId])
+  @@index([fbeShipmentId])
   @@map("products")
 
   fbeShipmentItems  FbeShipmentItem[]
@@ -343,6 +351,7 @@ model StoreProduct {
   syncedAt         DateTime @default(now()) @map("synced_at")
   shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
   inventorySnapshots StoreProductInventorySnapshot[]
+  purchasePlanProducts Product[] @relation("ProductSourceStoreProduct")
 
   @@unique([shopId, pnk])
   @@unique([shopId, sku])
@@ -1025,6 +1034,7 @@ model FbeShipment {
   warehouse      Warehouse?         @relation(fields: [warehouseId], references: [id])
   owner          User?             @relation(fields: [ownerId], references: [id])
   items          FbeShipmentItem[]
+  purchasePlanProducts Product[]   @relation("ProductFbeShipment")
 
   @@index([status])
   @@index([shopId])

@@ -743,7 +743,7 @@ RECEIVED（已全部入库）
 
 | 接口 | 文件 | 说明 |
 |------|------|------|
-| `GET /api/products/purchasing` | `routes/product.ts` | 采购计划列表（动态视图）：查 `status=PURCHASING AND purchaseOrderId IS NULL`；返回 `shopId/shopName/shop`；**已通过 create-local 建单的产品自动隐藏** |
+| `GET /api/products/purchasing` | `routes/product.ts` | 采购计划列表（动态视图）：查 `status=PURCHASING AND purchaseOrderId IS NULL`；返回 `shopId/shopName/shop/site`、`sourceStoreProductId/storeProduct/platformProductUrl`、`fbeShipmentId/fbeStatus/fbeShipmentNo`；**已通过 create-local 建单的产品自动隐藏** |
 | `PUT /api/products/batch-to-purchasing` | `routes/product.ts` | 从库存SKU/平台产品批量推入采购计划；支持顶层 `shopId` 或每行 `items[].shopId` 写入 `Product.shopId`；**★ 必须同时清空 `purchaseOrderId: null`**，防止二次入计划的产品因残留旧采购单ID被过滤掉 |
 | `PUT /api/products/:id/publish` | `routes/product.ts` | 意向产品确认采购（SELECTED→PURCHASING）；支持可选 `shopId` 写入采购计划归属店铺；**★ 同上，需清空 `purchaseOrderId`** |
 | `POST /api/products/remove-from-plan` | `routes/product.ts` | **从采购计划移除产品**（body: `{ productIds: number[] }`）；只操作 `status=PURCHASING + purchaseOrderId=null` 的计划中产品；MAN- 手工产品物理删除，真实 eMAG 产品退回 SELECTED |
@@ -940,6 +940,8 @@ RECEIVED（已全部入库）
 | `POST /api/emag/*` | `routes/emag.ts` | eMAG 类目同步/产品发布 |
 | `POST /api/translate` | `routes/translate.ts` | 翻译代理（MyMemory API 转发，罗马尼亚语→中文等，需登录） |
 | `POST /api/fbe-shipments` | `routes/fbeShipment.ts` | 创建 FBE 发货单（**shopId 必填**，`items[].storeProductId` 优先；批量解析 `StoreProduct.mappedInventorySku → Product.sku → Product.id`，兼容旧前端只传 `sku` 时按 `StoreProduct.sku/vendorSku/pnk/mappedInventorySku` 降级匹配；shipmentNumber 可选自定义） |
+| `POST /api/fbe-shipments/from-purchase-plans` | `routes/fbeShipment.ts` | **采购计划批量创建 FBE 发货单**：入参 `purchasePlanItemIds/productIds` + `shopId` + 可选 `site/warehouseId/items[]`；校验同店铺/同站点、平台产品关联、防重复（`Product.fbeShipmentId`）；成功回写 `sourceStoreProductId/fbeShipmentId/fbeCreatedAt/fbeStatus` |
+| `PATCH /api/products/:id/link-store-product` | `routes/product.ts` | 采购计划产品关联 `StoreProduct`（写 `Product.sourceStoreProductId`，同步 `productUrl/mainImage`） |
 | `GET /api/fbe-shipments` | `routes/fbeShipment.ts` | 发货单列表（分页 + 明细 + `productCount`/`totalQuantity` 聚合字段）|
 | `GET /api/fbe-shipments/counts` | `routes/fbeShipment.ts` | 各状态发货单数量（`groupBy status`）；**必须注册在 `GET /:id` 之前**，否则 `counts` 会被误匹配为 `:id` |
 | `PUT /api/fbe-shipments/:id` | `routes/fbeShipment.ts` | 编辑发货单（改单号/备注/明细数量；**支持追加新SKU行**；仅 PENDING/ALLOCATING 可编辑）。`items` 数组两种元素：`{id, quantity}` 更新已有行；`{storeProductId, quantity}` 追加新行（同一事务内执行锁仓）。**无合法 `id` 且无合法 `storeProductId` 的元素 → 400，禁止静默跳过**。 |

@@ -54,6 +54,373 @@ const VALID_TRANSITIONS: Record<FbeShipmentStatus, FbeShipmentStatus[]> = {
 
 const ALL_STATUSES = ['PENDING', 'ALLOCATING', 'SHIPPED', 'ARRIVED', 'CANCELLED'];
 
+type PlanProductRow = {
+  id: number;
+  sku: string | null;
+  chineseName: string | null;
+  shopId: number | null;
+  purchaseQuantity: number | null;
+  sourceStoreProductId: number | null;
+  fbeShipmentId: number | null;
+  productUrl: string | null;
+};
+
+async function resolveStoreProductForPlanProduct(
+  product: PlanProductRow,
+  shopId: number,
+  explicitStoreProductId?: number | null,
+): Promise<{ storeProduct: { id: number; productUrl: string | null; pnk: string; name: string; mappedInventorySku: string | null } | null; reason?: string }> {
+  const pick = async (id: number) => prisma.storeProduct.findFirst({
+    where: { id, shopId, isArchived: false },
+    select: { id: true, productUrl: true, pnk: true, name: true, mappedInventorySku: true, sku: true },
+  });
+
+  if (explicitStoreProductId != null && explicitStoreProductId > 0) {
+    const sp = await pick(explicitStoreProductId);
+    return sp ? { storeProduct: sp } : { storeProduct: null, reason: '指定的 storeProductId 不存在或不属于该店铺' };
+  }
+  if (product.sourceStoreProductId) {
+    const sp = await pick(product.sourceStoreProductId);
+    if (sp) return { storeProduct: sp };
+  }
+  const sku = String(product.sku ?? '').trim();
+  if (sku) {
+    const byMapped = await prisma.storeProduct.findFirst({
+      where: { shopId, isArchived: false, mappedInventorySku: sku },
+      select: { id: true, productUrl: true, pnk: true, name: true, mappedInventorySku: true, sku: true },
+    });
+    if (byMapped) return { storeProduct: byMapped };
+    const byIdentifiers = await prisma.storeProduct.findFirst({
+      where: {
+        shopId,
+        isArchived: false,
+        OR: [{ sku }, { vendorSku: sku }, { pnk: sku }],
+      },
+      select: { id: true, productUrl: true, pnk: true, name: true, mappedInventorySku: true, sku: true },
+    });
+    if (byIdentifiers) return { storeProduct: byIdentifiers };
+  }
+  return { storeProduct: null, reason: '未关联平台产品' };
+}
+
+// ─────────────────────────────────────────────────────────────────────
+// POST /api/fbe-shipments/from-purchase-plans
+// 采购计划批量创建 FBE 发货单（同一店铺/站点，一单多 SKU）
+//
+// Body:
+//   purchasePlanItemIds / productIds: number[]   采购计划 Product.id 列表
+//   shopId: number                                 目标店铺
+//   site?: string                                  站点 RO/BG/HU，与 shop.region 校验
+//   warehouseId?: number
+//   remark?: string
+//   items?: [{ purchasePlanItemId|productId, storeProductId?, quantity? }]
+// ─────────────────────────────────────────────────────────────────────
+router.post('/from-purchase-plans', async (req: Request, res: Response) => {
+  try {
+    const userId = req.user!.userId;
+    const {
+      purchasePlanItemIds,
+      productIds,
+      shopId: bodyShopId,
+      site,
+      warehouseId,
+      remark,
+      items: bodyItems,
+    } = req.body ?? {};
+
+    const idSet = new Set<number>();
+    for (const raw of [...(Array.isArray(purchasePlanItemIds) ? purchasePlanItemIds : []), ...(Array.isArray(productIds) ? productIds : [])]) {
+      const n = Number(raw);
+      if (Number.isInteger(n) && n > 0) idSet.add(n);
+    }
+    if (Array.isArray(bodyItems)) {
+      for (const row of bodyItems) {
+        const n = Number(row?.purchasePlanItemId ?? row?.productId);
+        if (Number.isInteger(n) && n > 0) idSet.add(n);
+      }
+    }
+    const planProductIds = [...idSet];
+    if (planProductIds.length === 0) {
+      res.status(400).json({ code: 400, data: null, message: '请提供至少一个采购计划产品 ID（purchasePlanItemIds / productIds）' });
+      return;
+    }
+
+    const shopId = Number(bodyShopId);
+    if (!Number.isInteger(shopId) || shopId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: 'shopId 必填且必须为有效店铺 ID' });
+      return;
+    }
+
+    const shop = await prisma.shopAuthorization.findUnique({
+      where: { id: shopId },
+      select: { id: true, shopName: true, region: true, status: true },
+    });
+    if (!shop || shop.status !== 'active') {
+      res.status(400).json({ code: 400, data: null, message: '店铺不存在或已停用' });
+      return;
+    }
+
+    const siteNorm = site != null && String(site).trim() ? String(site).trim().toUpperCase() : null;
+    if (siteNorm && shop.region && shop.region.toUpperCase() !== siteNorm) {
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: `站点 ${siteNorm} 与店铺「${shop.shopName}」所属站点 ${shop.region} 不一致`,
+      });
+      return;
+    }
+
+    const validWarehouseId = Number.isInteger(Number(warehouseId)) && Number(warehouseId) > 0
+      ? Number(warehouseId)
+      : null;
+    if (validWarehouseId !== null) {
+      const wh = await prisma.warehouse.findUnique({
+        where: { id: validWarehouseId },
+        select: { id: true, name: true, status: true },
+      });
+      if (!wh || wh.status !== 'ACTIVE') {
+        res.status(400).json({ code: 400, data: null, message: '仓库不存在或已停用' });
+        return;
+      }
+    }
+
+    const itemOverrideMap = new Map<number, { storeProductId?: number; quantity?: number }>();
+    if (Array.isArray(bodyItems)) {
+      for (const row of bodyItems) {
+        const pid = Number(row?.purchasePlanItemId ?? row?.productId);
+        if (!Number.isInteger(pid) || pid <= 0) continue;
+        const spId = row?.storeProductId != null ? Number(row.storeProductId) : undefined;
+        const qty = row?.quantity != null ? Number(row.quantity) : undefined;
+        itemOverrideMap.set(pid, {
+          storeProductId: Number.isInteger(spId) && spId! > 0 ? spId : undefined,
+          quantity: Number.isInteger(qty) && qty! > 0 ? qty : undefined,
+        });
+      }
+    }
+
+    const planProducts = await prisma.product.findMany({
+      where: {
+        id: { in: planProductIds },
+        status: 'PURCHASING',
+        purchaseOrderId: null,
+        isDeleted: false,
+      },
+      select: {
+        id: true,
+        sku: true,
+        chineseName: true,
+        shopId: true,
+        purchaseQuantity: true,
+        sourceStoreProductId: true,
+        fbeShipmentId: true,
+        productUrl: true,
+      },
+    });
+
+    const foundIds = new Set(planProducts.map((p) => p.id));
+    const notFoundIds = planProductIds.filter((id) => !foundIds.has(id));
+    if (notFoundIds.length > 0) {
+      res.status(400).json({
+        code: 400,
+        data: { notFoundIds },
+        message: `以下 ID 不是有效的采购计划产品（需 status=PURCHASING 且未建采购单）：${notFoundIds.join(', ')}`,
+      });
+      return;
+    }
+
+    const shopIdsInPlan = new Set(planProducts.map((p) => p.shopId).filter((id): id is number => id != null));
+    if (shopIdsInPlan.size > 1) {
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: '所选采购计划产品归属多个店铺，不能跨店铺创建同一 FBE 发货单',
+      });
+      return;
+    }
+    if (shopIdsInPlan.size === 1) {
+      const onlyShopId = [...shopIdsInPlan][0]!;
+      if (onlyShopId !== shopId) {
+        res.status(400).json({
+          code: 400,
+          data: null,
+          message: `采购计划产品归属店铺 ID=${onlyShopId}，与请求 shopId=${shopId} 不一致`,
+        });
+        return;
+      }
+    }
+
+    const alreadyCreated: Array<{ productId: number; sku: string | null; chineseName: string | null; fbeShipmentId: number; shipmentNumber: string; fbeStatus: string }> = [];
+    const fbeIds = planProducts.map((p) => p.fbeShipmentId).filter((id): id is number => id != null);
+    const fbeMap = new Map<number, { shipmentNumber: string; status: string }>();
+    if (fbeIds.length > 0) {
+      const rows = await prisma.fbeShipment.findMany({
+        where: { id: { in: fbeIds } },
+        select: { id: true, shipmentNumber: true, status: true },
+      });
+      for (const r of rows) fbeMap.set(r.id, { shipmentNumber: r.shipmentNumber, status: r.status });
+    }
+    for (const p of planProducts) {
+      if (!p.fbeShipmentId) continue;
+      const fbe = fbeMap.get(p.fbeShipmentId);
+      if (fbe && fbe.status !== 'CANCELLED') {
+        alreadyCreated.push({
+          productId: p.id,
+          sku: p.sku,
+          chineseName: p.chineseName,
+          fbeShipmentId: p.fbeShipmentId,
+          shipmentNumber: fbe.shipmentNumber,
+          fbeStatus: fbe.status,
+        });
+      }
+    }
+    if (alreadyCreated.length > 0) {
+      res.status(400).json({
+        code: 400,
+        data: { alreadyCreated },
+        message: '部分采购计划产品已创建 FBE 发货单，请勿重复创建',
+      });
+      return;
+    }
+
+    const missingLinks: Array<{ productId: number; sku: string | null; chineseName: string | null; reason: string }> = [];
+    const resolvedLines: Array<{ productId: number; storeProductId: number; productSku: string; quantity: number }> = [];
+
+    for (const p of planProducts) {
+      const override = itemOverrideMap.get(p.id);
+      const qty = override?.quantity ?? Math.max(1, Number(p.purchaseQuantity) || 1);
+      if (qty <= 0) {
+        res.status(400).json({ code: 400, data: null, message: `产品 ${p.sku ?? p.id} 数量必须大于 0` });
+        return;
+      }
+
+      const { storeProduct, reason } = await resolveStoreProductForPlanProduct(
+        p,
+        shopId,
+        override?.storeProductId ?? null,
+      );
+      if (!storeProduct) {
+        missingLinks.push({
+          productId: p.id,
+          sku: p.sku,
+          chineseName: p.chineseName,
+          reason: reason ?? '未关联平台产品',
+        });
+        continue;
+      }
+
+      const mappedSku = String(storeProduct.mappedInventorySku ?? p.sku ?? '').trim();
+      if (!mappedSku) {
+        missingLinks.push({
+          productId: p.id,
+          sku: p.sku,
+          chineseName: p.chineseName,
+          reason: '平台产品未绑定本地库存 SKU（mappedInventorySku 为空）',
+        });
+        continue;
+      }
+
+      resolvedLines.push({
+        productId: p.id,
+        storeProductId: storeProduct.id,
+        productSku: mappedSku,
+        quantity: qty,
+      });
+    }
+
+    if (missingLinks.length > 0) {
+      res.status(400).json({
+        code: 400,
+        data: { missingLinks },
+        message: `${missingLinks.length} 个采购计划产品缺少平台产品关联，请先关联后再创建 FBE 发货单`,
+      });
+      return;
+    }
+
+    const mappedSkus = [...new Set(resolvedLines.map((l) => l.productSku))];
+    const inventoryProducts = await prisma.product.findMany({
+      where: { sku: { in: mappedSkus }, isDeleted: false },
+      select: { id: true, sku: true, purchasePrice: true },
+    });
+    const skuToProductId = new Map(inventoryProducts.map((row) => [row.sku!, row.id]));
+    const skuToPurchasePrice = new Map(inventoryProducts.map((row) => [row.sku!, Number(row.purchasePrice ?? 0)]));
+
+    const missingInventorySkus = mappedSkus.filter((sku) => !skuToProductId.has(sku));
+    if (missingInventorySkus.length > 0) {
+      res.status(400).json({
+        code: 400,
+        data: { missingInventorySkus },
+        message: `绑定的本地库存 SKU 不存在：${missingInventorySkus.join(', ')}`,
+      });
+      return;
+    }
+
+    const finalNumber = await generateShipmentNumber();
+    const totalProductValue = resolvedLines.reduce((sum, line) => {
+      const price = skuToPurchasePrice.get(line.productSku) ?? 0;
+      return sum + line.quantity * price;
+    }, 0);
+
+    const now = new Date();
+    const shipment = await prisma.$transaction(async (tx) => {
+      const created = await tx.fbeShipment.create({
+        data: {
+          shipmentNumber: finalNumber,
+          status: 'PENDING',
+          shopId,
+          warehouseId: validWarehouseId,
+          totalProductValue: parseFloat(totalProductValue.toFixed(2)),
+          remark: remark ?? null,
+          ownerId: userId,
+          items: {
+            create: resolvedLines.map((line) => ({
+              productId: skuToProductId.get(line.productSku)!,
+              quantity: line.quantity,
+              receivedQuantity: 0,
+            })),
+          },
+        },
+        select: { id: true, shipmentNumber: true, status: true },
+      });
+
+      for (const line of resolvedLines) {
+        await tx.product.update({
+          where: { id: line.productId },
+          data: {
+            sourceStoreProductId: line.storeProductId,
+            fbeShipmentId: created.id,
+            fbeCreatedAt: now,
+            fbeStatus: created.status,
+            ...(planProducts.find((p) => p.id === line.productId)?.shopId == null ? { shopId } : {}),
+          },
+        });
+      }
+
+      return created;
+    });
+
+    console.log(
+      `[FBE from-purchase-plans] 创建发货单 ${shipment.shipmentNumber}，` +
+      `shop=${shop.shopName} items=${resolvedLines.length}`,
+    );
+
+    res.json({
+      code: 200,
+      data: {
+        fbeShipmentId: shipment.id,
+        shipmentNo: shipment.shipmentNumber,
+        shipmentNumber: shipment.shipmentNumber,
+        itemCount: resolvedLines.length,
+        status: shipment.status,
+      },
+      message: 'FBE 发货单创建成功',
+    });
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : '未知错误';
+    console.error('[FBE from-purchase-plans]', err);
+    res.status(500).json({ code: 500, data: null, message: `创建 FBE 发货单失败：${msg}` });
+  }
+});
+
 // ─────────────────────────────────────────────────────────────────────
 // POST /api/fbe-shipments   创建发货单
 // Body:
