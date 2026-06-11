@@ -21,6 +21,25 @@ import { authenticate, requireSuperAdmin } from '../middleware/auth';
 import { FbeShipmentStatus } from '@prisma/client';
 import { applyStockChange } from './inventory';
 
+/** FBE 详情对外 linkType（DB 存 RESELL，API 统一为 FOLLOW_SELL） */
+type FbeLinkType = 'SELF_BUILT' | 'FOLLOW_SELL' | 'UNKNOWN';
+
+const FBE_LINK_TYPE_LABELS: Record<FbeLinkType, string> = {
+  SELF_BUILT: '自建链接',
+  FOLLOW_SELL: '跟卖链接',
+  UNKNOWN: '未知',
+};
+
+function toFbeLinkType(emagLinkType: string | null | undefined): { linkType: FbeLinkType; linkTypeLabel: string } {
+  if (emagLinkType === 'SELF_BUILT') {
+    return { linkType: 'SELF_BUILT', linkTypeLabel: FBE_LINK_TYPE_LABELS.SELF_BUILT };
+  }
+  if (emagLinkType === 'RESELL') {
+    return { linkType: 'FOLLOW_SELL', linkTypeLabel: FBE_LINK_TYPE_LABELS.FOLLOW_SELL };
+  }
+  return { linkType: 'UNKNOWN', linkTypeLabel: FBE_LINK_TYPE_LABELS.UNKNOWN };
+}
+
 const router = Router();
 router.use(authenticate);
 
@@ -804,6 +823,8 @@ type FbeItemStoreProductMeta = {
   ean: string | null;
   emagOfferId: string | null;
   productUrl: string | null;
+  linkType: FbeLinkType;
+  linkTypeLabel: string;
 };
 
 /** 为 FBE 明细批量解析同店铺 StoreProduct（sourceStoreProductId 优先，其次 mappedInventorySku） */
@@ -818,16 +839,21 @@ async function resolveStoreProductMetaForShipmentItems(
     };
   }>,
 ): Promise<Map<number, FbeItemStoreProductMeta>> {
+  const emptyLink = toFbeLinkType(null);
   const empty: FbeItemStoreProductMeta = {
     storeProductId: null,
     pnk: null,
     ean: null,
     emagOfferId: null,
     productUrl: null,
+    linkType: emptyLink.linkType,
+    linkTypeLabel: emptyLink.linkTypeLabel,
   };
   const result = new Map<number, FbeItemStoreProductMeta>();
   if (!shopId) {
-    for (const item of items) result.set(item.product.id, { ...empty, pnk: item.product.pnk ?? null });
+    for (const item of items) {
+      result.set(item.product.id, { ...empty, pnk: item.product.pnk ?? null });
+    }
     return result;
   }
 
@@ -847,6 +873,7 @@ async function resolveStoreProductMetaForShipmentItems(
         where: { shopId, isArchived: false, OR: orClauses },
         select: {
           id: true, pnk: true, ean: true, emagOfferId: true, productUrl: true, mappedInventorySku: true,
+          emagLinkType: true,
         },
       })
     : [];
@@ -865,6 +892,7 @@ async function resolveStoreProductMetaForShipmentItems(
       const sku = String(p.sku ?? '').trim();
       if (sku) sp = byMappedSku.get(sku);
     }
+    const linkMeta = toFbeLinkType(sp?.emagLinkType);
     result.set(p.id, sp
       ? {
           storeProductId: sp.id,
@@ -872,6 +900,8 @@ async function resolveStoreProductMetaForShipmentItems(
           ean: sp.ean ?? null,
           emagOfferId: sp.emagOfferId ?? null,
           productUrl: sp.productUrl ?? null,
+          linkType: linkMeta.linkType,
+          linkTypeLabel: linkMeta.linkTypeLabel,
         }
       : { ...empty, pnk: p.pnk ?? null });
   }
@@ -932,6 +962,8 @@ router.get('/:id', async (req: Request, res: Response) => {
         ean: null,
         emagOfferId: null,
         productUrl: null,
+        linkType: 'UNKNOWN' as FbeLinkType,
+        linkTypeLabel: FBE_LINK_TYPE_LABELS.UNKNOWN,
       };
       return {
         ...item,
@@ -945,6 +977,8 @@ router.get('/:id', async (req: Request, res: Response) => {
         ean: meta.ean,
         emagOfferId: meta.emagOfferId,
         productUrl: meta.productUrl,
+        linkType: meta.linkType,
+        linkTypeLabel: meta.linkTypeLabel,
       };
     });
 
