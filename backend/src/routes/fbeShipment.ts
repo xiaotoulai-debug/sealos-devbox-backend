@@ -40,6 +40,10 @@ function toFbeLinkType(emagLinkType: string | null | undefined): { linkType: Fbe
   return { linkType: 'UNKNOWN', linkTypeLabel: FBE_LINK_TYPE_LABELS.UNKNOWN };
 }
 
+function normalizeInventorySku(value: string | null | undefined): string {
+  return String(value ?? '').trim();
+}
+
 const router = Router();
 router.use(authenticate);
 
@@ -827,7 +831,7 @@ type FbeItemStoreProductMeta = {
   linkTypeLabel: string;
 };
 
-/** 为 FBE 明细批量解析同店铺 StoreProduct（sourceStoreProductId 优先，其次 mappedInventorySku） */
+/** 为 FBE 明细批量解析同店铺 StoreProduct（sourceStoreProductId 优先，其次 sku/vendorSku/pnk/mappedInventorySku） */
 async function resolveStoreProductMetaForShipmentItems(
   shopId: number | null,
   items: Array<{
@@ -861,36 +865,51 @@ async function resolveStoreProductMetaForShipmentItems(
     items.map((i) => i.product.sourceStoreProductId).filter((id): id is number => id != null && id > 0),
   )];
   const skus = [...new Set(
-    items.map((i) => String(i.product.sku ?? '').trim()).filter(Boolean),
+    items.map((i) => normalizeInventorySku(i.product.sku)).filter(Boolean),
   )];
 
   const orClauses: Array<Record<string, unknown>> = [];
   if (sourceIds.length > 0) orClauses.push({ id: { in: sourceIds } });
-  if (skus.length > 0) orClauses.push({ mappedInventorySku: { in: skus } });
+  if (skus.length > 0) {
+    orClauses.push(
+      { mappedInventorySku: { in: skus } },
+      { sku: { in: skus } },
+      { vendorSku: { in: skus } },
+      { pnk: { in: skus } },
+    );
+  }
 
   const storeProducts = orClauses.length > 0
     ? await prisma.storeProduct.findMany({
         where: { shopId, isArchived: false, OR: orClauses },
         select: {
-          id: true, pnk: true, ean: true, emagOfferId: true, productUrl: true, mappedInventorySku: true,
-          emagLinkType: true,
+          id: true, pnk: true, ean: true, emagOfferId: true, productUrl: true,
+          sku: true, vendorSku: true, mappedInventorySku: true, emagLinkType: true,
         },
+        orderBy: { id: 'asc' },
       })
     : [];
 
   const byId = new Map(storeProducts.map((sp) => [sp.id, sp]));
-  const byMappedSku = new Map<string, (typeof storeProducts)[number]>();
+  const lookupBySkuKey = new Map<string, (typeof storeProducts)[number]>();
   for (const sp of storeProducts) {
-    const mapped = String(sp.mappedInventorySku ?? '').trim();
-    if (mapped && !byMappedSku.has(mapped)) byMappedSku.set(mapped, sp);
+    for (const key of [sp.mappedInventorySku, sp.sku, sp.vendorSku, sp.pnk]) {
+      const normalized = normalizeInventorySku(key);
+      if (!normalized) continue;
+      if (!lookupBySkuKey.has(normalized)) lookupBySkuKey.set(normalized, sp);
+      const lower = normalized.toLowerCase();
+      if (!lookupBySkuKey.has(lower)) lookupBySkuKey.set(lower, sp);
+    }
   }
 
   for (const item of items) {
     const p = item.product;
     let sp = p.sourceStoreProductId ? byId.get(p.sourceStoreProductId) : undefined;
     if (!sp) {
-      const sku = String(p.sku ?? '').trim();
-      if (sku) sp = byMappedSku.get(sku);
+      const sku = normalizeInventorySku(p.sku);
+      if (sku) {
+        sp = lookupBySkuKey.get(sku) ?? lookupBySkuKey.get(sku.toLowerCase());
+      }
     }
     const linkMeta = toFbeLinkType(sp?.emagLinkType);
     result.set(p.id, sp
