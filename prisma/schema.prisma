@@ -122,6 +122,7 @@ model Product {
   updatedAt         DateTime       @updatedAt @map("updated_at")
   ownerId           Int?           @map("owner_id")
   purchaseOrderId   Int?           @map("purchase_order_id")
+  sourceStoreProductId Int?        @map("source_store_product_id") // 采购计划关联的平台产品（StoreProduct.id）
   owner             User?          @relation(fields: [ownerId], references: [id])
   purchaseOrder     PurchaseOrder? @relation(fields: [purchaseOrderId], references: [id])
 
@@ -131,6 +132,7 @@ model Product {
   @@index([title])
   @@index([status, ownerId, collectedAt(sort: Desc)])
   @@index([purchaseOrderId])
+  @@index([sourceStoreProductId])
   @@index([sku])
   @@index([externalProductId])
   @@map("products")
@@ -284,6 +286,8 @@ model StoreProduct {
   profitMarginPct      Float?     @map("profit_margin_pct")        // 毛利率 % = profit / salePrice × 100
   profitCalculatedAt   DateTime?  @map("profit_calculated_at")     // 上次利润计算时间
   profitBreakdown      Json?      @map("profit_breakdown")          // 利润明细拆解 JSON（各项扣费 + 估算标识）
+  emagLinkType         String?    @map("emag_link_type")            // SELF_BUILT / RESELL / UNKNOWN
+  isArchived           Boolean    @default(false) @map("is_archived")
   syncedAt         DateTime @default(now()) @map("synced_at")
   shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
 
