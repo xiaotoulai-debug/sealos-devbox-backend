@@ -70,17 +70,18 @@ export function isAlibabaSpecInvalidError(result: Pick<AlibabaAPIResult<unknown>
 export async function createAlibabaOrder(
   items: CargoParam[],
   addressId?: string,
+  alibabaAuthId?: number | null,
 ): Promise<AlibabaAPIResult<CreateOrderResult> & { debugPayload?: AlibabaOrderDebugPayload }> {
   console.log('═══════════════════════════════════════════════════');
   console.log('[alibabaOrder] ★★★ 开始创建 1688 订单 ★★★');
   console.log('[alibabaOrder] 商品列表:', JSON.stringify(items));
 
-  const accessToken = await getValidAccessToken();
+  const accessToken = await getValidAccessToken({ alibabaAuthId: alibabaAuthId ?? null });
   if (!accessToken) {
     console.error('[alibabaOrder] ❌ 无有效 AccessToken');
     return { success: false, data: null, errorCode: 'NO_TOKEN', errorMessage: '1688 授权已过期，请重新绑定账号' };
   }
-  console.log('[alibabaOrder] ✅ AccessToken 有效 (前20位):', accessToken.slice(0, 20) + '...');
+  console.log('[alibabaOrder] ✅ AccessToken 已获取');
 
   // 1. 确定收货地址 ID
   const finalAddressId = addressId || DEFAULT_ADDRESS_ID;

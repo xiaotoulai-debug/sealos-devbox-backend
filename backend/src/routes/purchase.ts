@@ -12,6 +12,7 @@ import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { authenticate } from '../middleware/auth';
 import { createAlibabaOrder, isAlibabaSpecInvalidError } from '../services/alibabaOrder';
+import { resolveAlibabaAuthRecord } from '../services/alibabaAuthService';
 import { applyStockChange } from './inventory';
 import {
   syncOrderDetail,
@@ -484,6 +485,8 @@ router.post('/fix-in-transit', async (req: Request, res: Response) => {
 //   tabStatus       看板状态栏（优先）：ALL | PENDING | PURCHASING | COMPLETED
 //   status          精确状态（tabStatus 未传时兜底）：PENDING/PLACED/IN_TRANSIT/RECEIVED
 //   keyword         深度穿透搜索：匹配主单号 OR 1688 订单号 OR 关联产品 SKU
+//   alibabaAccountId / alibabaAuthId  按 1688 账号 ID 筛选
+//   alibabaAccountName                按 1688 账号名称模糊筛选
 // ─────────────────────────────────────────────────────────────────────
 router.get('/', async (req: Request, res: Response) => {
   try {
@@ -536,6 +539,12 @@ router.get('/', async (req: Request, res: Response) => {
       req.query.search  ?? req.body?.search  ?? '',
     ).trim();
 
+    const alibabaAccountIdRaw = req.query.alibabaAccountId ?? req.query.alibabaAuthId ?? req.body?.alibabaAccountId ?? req.body?.alibabaAuthId;
+    const alibabaAccountId = alibabaAccountIdRaw != null && String(alibabaAccountIdRaw).trim() !== ''
+      ? Number(alibabaAccountIdRaw)
+      : NaN;
+    const alibabaAccountName = String(req.query.alibabaAccountName ?? req.body?.alibabaAccountName ?? '').trim();
+
     // ── ② 预查：关键词可能是 SKU，先找到所有匹配的产品 ID ──────────
     //
     // ★ 背景：Product.purchaseOrderId 是单 FK，若同一产品被多次建单，
@@ -561,6 +570,18 @@ router.get('/', async (req: Request, res: Response) => {
 
     if (statusFilter !== undefined) {
       andClauses.push({ status: statusFilter });
+    }
+
+    if (Number.isInteger(alibabaAccountId) && alibabaAccountId > 0) {
+      andClauses.push({ alibabaAuthId: alibabaAccountId });
+    }
+
+    if (alibabaAccountName) {
+      andClauses.push({
+        alibabaAuth: {
+          accountName: { contains: alibabaAccountName, mode: 'insensitive' as const },
+        },
+      });
     }
 
     if (kw) {
@@ -625,6 +646,9 @@ router.get('/', async (req: Request, res: Response) => {
           },
           warehouse: { select: { id: true, name: true, type: true } },
           shop:      { select: { id: true, shopName: true, region: true } },
+          alibabaAuth: {
+            select: { id: true, accountName: true, loginId: true, tokenType: true, isEnabled: true, isDefault: true },
+          },
         },
         // 新增字段直接从主单查（无需额外 join）
         // Prisma 默认已包含主表所有字段，此处仅记录用于文档自解释
@@ -818,6 +842,9 @@ router.get('/', async (req: Request, res: Response) => {
         remark:          (o as any).remark           ?? null,
         // ★ 新字段：1688 订单号、供应商、物流
         alibabaOrderId:  (o as any).alibabaOrderId   ?? null,
+        alibabaAuthId:   (o as any).alibabaAuthId    ?? (o as any).alibabaAuth?.id ?? null,
+        alibabaAccountName: (o as any).alibabaAuth?.accountName ?? null,
+        alibabaAccount: (o as any).alibabaAuth ?? null,
         supplierName:    (o as any).supplierName      ?? null,
         logisticsCompany:(o as any).logisticsCompany  ?? null,
         trackingNumber:  (o as any).trackingNumber    ?? null,
@@ -1020,6 +1047,7 @@ router.post('/:id/sync-1688', async (req: Request, res: Response) => {
       select: {
         id: true, orderNo: true, status: true,
         alibabaOrderId: true,
+        alibabaAuthId: true,
         items: { select: { id: true } },
       },
     });
@@ -1038,7 +1066,7 @@ router.post('/:id/sync-1688', async (req: Request, res: Response) => {
     const aliOrderId = order.alibabaOrderId;
 
     // ── ① alibaba.trade.get.buyerView（订单状态 + 供应商 + 基础物流） ──
-    const detail = await syncOrderDetail(aliOrderId);
+    const detail = await syncOrderDetail(aliOrderId, order.alibabaAuthId ?? null);
     if (isAliServiceError(detail)) {
       res.status(502).json({
         code: 502, data: null,
@@ -1144,7 +1172,7 @@ router.post('/:id/sync-logistics', async (req: Request, res: Response) => {
 
     const order = await prisma.purchaseOrder.findUnique({
       where:  { id },
-      select: { id: true, orderNo: true, alibabaOrderId: true },
+      select: { id: true, orderNo: true, alibabaOrderId: true, alibabaAuthId: true },
     });
     if (!order) {
       res.status(404).json({ code: 404, data: null, message: '采购单不存在' });
@@ -1159,7 +1187,7 @@ router.post('/:id/sync-logistics', async (req: Request, res: Response) => {
     }
 
     // 调用 alibaba.trade.getLogisticsInfos.buyerView
-    const infosResult = await syncLogisticsInfos(order.alibabaOrderId);
+    const infosResult = await syncLogisticsInfos(order.alibabaOrderId, order.alibabaAuthId ?? null);
     if (isAliServiceError(infosResult)) {
       res.status(502).json({ code: 502, data: null, message: infosResult.message, errorCode: infosResult.errorCode });
       return;
@@ -1233,6 +1261,7 @@ router.get('/:id/logistics-trace', async (req: Request, res: Response) => {
       select: {
         id: true, orderNo: true,
         alibabaOrderId: true,
+        alibabaAuthId: true,
         trackingNumber: true,
         logisticsCompany: true,
       },
@@ -1266,7 +1295,7 @@ router.get('/:id/logistics-trace', async (req: Request, res: Response) => {
 
     // ── ① 优先：alibaba.trade.getLogisticsTraceInfo.buyerView ────────
     //   namespace 必须为 com.alibaba.logistics（已修正，旧写法 com.alibaba.trade → gw.APIUnsupported）
-    const traceByOrder = await getLogisticsTraceByOrder(order.alibabaOrderId);
+    const traceByOrder = await getLogisticsTraceByOrder(order.alibabaOrderId, order.alibabaAuthId ?? null);
     if (!isAliServiceError(traceByOrder) && traceByOrder.nodes.length > 0) {
       // 顺手把运单号落库（防止下次再请求）
       if (traceByOrder.logisticsBillNo || traceByOrder.logisticsId) {
@@ -1309,7 +1338,7 @@ router.get('/:id/logistics-trace', async (req: Request, res: Response) => {
 
     // ── ③ 兜底的兜底：先调 buyerView 拿运单号 ──────────────────────
     if (!logisticsId) {
-      const detail = await syncOrderDetail(order.alibabaOrderId);
+      const detail = await syncOrderDetail(order.alibabaOrderId, order.alibabaAuthId ?? null);
       if (isAliServiceError(detail)) {
         // 三级均失败；若 gw.APIUnsupported 则友好提示，否则 502
         const errMsg = isAliServiceError(traceByOrder) ? traceByOrder.message : detail.message;
@@ -1343,7 +1372,7 @@ router.get('/:id/logistics-trace', async (req: Request, res: Response) => {
       }).catch(() => {});
     }
 
-    const trace = await getLogisticsTrace(logisticsId);
+    const trace = await getLogisticsTrace(logisticsId, '1688', order.alibabaAuthId ?? null);
     if (isAliServiceError(trace)) {
       // gw.APIUnsupported → 降级为友好提示
       if ((trace as any).errorCode === 'gw.APIUnsupported') {
@@ -1738,7 +1767,7 @@ router.post('/:id/place-1688-order', async (req: Request, res: Response) => {
       return;
     }
 
-    const { addressId } = req.body ?? {};
+    const { addressId, alibabaAuthId: bodyAlibabaAuthId, alibabaAccountId } = req.body ?? {};
 
     // ── 查采购单 + 关联产品 ────────────────────────────────────────
     const order = await prisma.purchaseOrder.findUnique({
@@ -1761,6 +1790,18 @@ router.post('/:id/place-1688-order', async (req: Request, res: Response) => {
 
     if (!order) {
       res.status(404).json({ code: 404, data: null, message: '采购单不存在' });
+      return;
+    }
+
+    const requestedAuthIdRaw = bodyAlibabaAuthId ?? alibabaAccountId;
+    const requestedAuthId = requestedAuthIdRaw != null && String(requestedAuthIdRaw).trim() !== ''
+      ? Number(requestedAuthIdRaw)
+      : order.alibabaAuthId ?? null;
+    const resolvedAuth = await resolveAlibabaAuthRecord(
+      Number.isInteger(requestedAuthId) && requestedAuthId! > 0 ? requestedAuthId : null,
+    );
+    if (!resolvedAuth) {
+      res.status(400).json({ code: 400, data: null, message: '未找到可用的 1688 采购账号，请先在系统设置中配置' });
       return;
     }
 
@@ -1841,7 +1882,7 @@ router.post('/:id/place-1688-order', async (req: Request, res: Response) => {
 
     // ── 调用 1688 阿里巴巴开放平台 API ────────────────────────────
     const addressIdStr = addressId ? String(addressId) : undefined;
-    const result = await createAlibabaOrder(cargoItems, addressIdStr);
+    const result = await createAlibabaOrder(cargoItems, addressIdStr, resolvedAuth.id);
 
     if (!result.success) {
       console.error(`[place-1688-order] 1688 下单失败 PO#${id}:`, result.errorMessage);
@@ -1922,6 +1963,7 @@ router.post('/:id/place-1688-order', async (req: Request, res: Response) => {
           status:          'PLACED',
           totalAmount:     aliTotalAmount > 0 ? aliTotalAmount : order.totalAmount,
           alibabaOrderId:  aliOrderId,
+          alibabaAuthId:   resolvedAuth.id,
           supplierName:    supplierName ?? undefined,
         },
       });

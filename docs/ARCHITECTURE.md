@@ -661,7 +661,19 @@ graph TD
 
 ---
 
-## 5. 1688 采购计划规格解析（万邦 API）
+## 5. 1688 多账号与企业自用 Token（2026-06-11）
+
+| 组件 | 说明 |
+|------|------|
+| `AlibabaAuth` / `alibaba_auth` | 支持多账号；`tokenType`: `oauth` / `enterprise_static` |
+| `enterprise_static` | 开放平台「授权配置」永久 token；`expiresAt=2099-12-31`；不走 refresh |
+| `getValidAccessToken({ alibabaAuthId? })` | 未传 ID 时取 `isDefault=true` 启用账号，否则最新启用账号 |
+| `PurchaseOrder.alibabaAuthId` | 采购单绑定使用的 1688 账号；下单/同步/物流按此账号取 token |
+| `GET /api/purchases?alibabaAccountId=` | 采购列表按 1688 账号筛选 |
+
+OAuth 旧链路保留兼容；企业自用 token 通过 `POST /api/alibaba/accounts` 手动录入。
+
+## 5.1 1688 采购计划规格解析（万邦 API）
 
 | 组件 | 说明 |
 |------|------|
@@ -920,7 +932,11 @@ RECEIVED（已全部入库）
 | `GET /api/shops/authorized` | `routes/shop.ts` | 仪表盘下拉专用（eMAG 活跃店铺） |
 | `GET /api/dashboard/*` | `routes/dashboard.ts` | 业绩看板数据 |
 | `GET/POST /api/orders` | `routes/order.ts` | 采购单/平台订单（**含图片富化链路**：订单 SKU → StoreProduct.mainImage → Product.imageUrl 兜底，列表/详情共用 `buildOrderImageMap`） |
-| `POST /api/alibaba/*` | `routes/alibaba.ts` | 1688 OAuth/解析/下单/子单同步 |
+| `POST /api/alibaba/*` | `routes/alibaba.ts` | 1688 多账号管理、企业自用 token、OAuth/解析/下单/子单同步 |
+| `GET /api/alibaba/accounts` | `routes/alibaba.ts` | 1688 账号列表（token 脱敏，不返回明文） |
+| `POST /api/alibaba/accounts` | `routes/alibaba.ts` | 新增企业自用永久 token 账号（需 `MENU_1688_CONFIG`） |
+| `PATCH/DELETE /api/alibaba/accounts/:id` | `routes/alibaba.ts` | 更新/软禁用 1688 账号 |
+| `POST /api/alibaba/accounts/:id/validate` | `routes/alibaba.ts` | 验证账号 token 是否可用 |
 | `POST /api/emag/*` | `routes/emag.ts` | eMAG 类目同步/产品发布 |
 | `POST /api/translate` | `routes/translate.ts` | 翻译代理（MyMemory API 转发，罗马尼亚语→中文等，需登录） |
 | `POST /api/fbe-shipments` | `routes/fbeShipment.ts` | 创建 FBE 发货单（**shopId 必填**，`items[].storeProductId` 优先；批量解析 `StoreProduct.mappedInventorySku → Product.sku → Product.id`，兼容旧前端只传 `sku` 时按 `StoreProduct.sku/vendorSku/pnk/mappedInventorySku` 降级匹配；shipmentNumber 可选自定义） |

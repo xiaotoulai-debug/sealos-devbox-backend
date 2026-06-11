@@ -60,8 +60,9 @@ export interface OrderDetailResult {
  */
 export async function syncOrderDetail(
   alibabaOrderId: string,
+  alibabaAuthId?: number | null,
 ): Promise<OrderDetailResult | AliServiceError> {
-  const accessToken = await getValidAccessToken();
+  const accessToken = await getValidAccessToken({ alibabaAuthId: alibabaAuthId ?? null });
   if (!accessToken) {
     return { error: true, message: '1688 授权已过期，请重新绑定账号', errorCode: 'NO_TOKEN' };
   }
@@ -183,8 +184,9 @@ export interface LogisticsInfosResult {
  */
 export async function syncLogisticsInfos(
   alibabaOrderId: string,
+  alibabaAuthId?: number | null,
 ): Promise<LogisticsInfosResult | AliServiceError> {
-  const accessToken = await getValidAccessToken();
+  const accessToken = await getValidAccessToken({ alibabaAuthId: alibabaAuthId ?? null });
   if (!accessToken) {
     return { error: true, message: '1688 授权已过期，请重新绑定账号', errorCode: 'NO_TOKEN' };
   }
@@ -257,8 +259,9 @@ export interface LogisticsTraceByOrderResult {
  */
 export async function getLogisticsTraceByOrder(
   alibabaOrderId: string,
+  alibabaAuthId?: number | null,
 ): Promise<LogisticsTraceByOrderResult | AliServiceError> {
-  const accessToken = await getValidAccessToken();
+  const accessToken = await getValidAccessToken({ alibabaAuthId: alibabaAuthId ?? null });
   if (!accessToken) {
     return { error: true, message: '1688 授权已过期，请重新绑定账号', errorCode: 'NO_TOKEN' };
   }
@@ -341,8 +344,9 @@ export async function getLogisticsTraceByOrder(
 export async function getLogisticsTrace(
   logisticsId: string,
   webSite = '1688',
+  alibabaAuthId?: number | null,
 ): Promise<LogisticsTraceResult | AliServiceError> {
-  const accessToken = await getValidAccessToken();
+  const accessToken = await getValidAccessToken({ alibabaAuthId: alibabaAuthId ?? null });
   if (!accessToken) {
     return { error: true, message: '1688 授权已过期，请重新绑定账号', errorCode: 'NO_TOKEN' };
   }
@@ -425,9 +429,9 @@ export async function syncPurchaseOrderFromAlibaba(
   orderId: number,
   alibabaOrderId: string,
   orderNo: string,
+  alibabaAuthId?: number | null,
 ): Promise<PurchaseSyncResult> {
-  // ① 调用 buyerView 获取状态 + nativeLogistics 物流
-  const detail = await syncOrderDetail(alibabaOrderId);
+  const detail = await syncOrderDetail(alibabaOrderId, alibabaAuthId ?? null);
   if (isAliServiceError(detail)) {
     return { orderId, orderNo, success: false, error: detail.message };
   }

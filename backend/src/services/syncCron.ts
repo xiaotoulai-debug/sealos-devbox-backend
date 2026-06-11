@@ -289,7 +289,7 @@ function runAlibabaPurchaseSync() {
           alibabaOrderId: { not: null },
           status: { in: ['PLACED', 'IN_TRANSIT'] },
         },
-        select: { id: true, orderNo: true, alibabaOrderId: true },
+        select: { id: true, orderNo: true, alibabaOrderId: true, alibabaAuthId: true },
       });
 
       console.log(`[1688采购同步] 开始：共 ${orders.length} 个活跃采购单待同步`);
@@ -305,6 +305,7 @@ function runAlibabaPurchaseSync() {
             order.id,
             order.alibabaOrderId!,
             order.orderNo,
+            order.alibabaAuthId ?? null,
           );
           if (result.success) {
             successCount++;

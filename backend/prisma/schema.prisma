@@ -168,6 +168,8 @@ model PurchaseOrder {
   shopId           Int?                  @map("shop_id")            // 采购单归属店铺（仓库收货物理区分用，老数据可为空）
   shopNameSnapshot String?               @map("shop_name_snapshot") // 建单时店铺名快照，避免店铺改名影响历史单据展示
   remark           String?
+  // ── 1688 采购账号（多账号支持）────────────────────────────────
+  alibabaAuthId    Int?                  @map("alibaba_auth_id")
   // ── 1688 订单信息（从子单提取上移，主单维度冗余存储便于列表展示）──
   alibabaOrderId   String?               @map("alibaba_order_id")   // 1688 主订单号
   supplierName     String?               @map("supplier_name")      // 供应商名称
@@ -179,6 +181,7 @@ model PurchaseOrder {
   updatedAt        DateTime              @default(now()) @updatedAt @map("updated_at")
   warehouse        Warehouse?            @relation(fields: [warehouseId], references: [id])
   shop             ShopAuthorization?    @relation(fields: [shopId], references: [id], onDelete: SetNull)
+  alibabaAuth      AlibabaAuth?          @relation(fields: [alibabaAuthId], references: [id], onDelete: SetNull)
   products         Product[]
   items            PurchaseOrderItem[]
 
@@ -187,6 +190,7 @@ model PurchaseOrder {
   @@index([status])
   @@index([warehouseId])
   @@index([shopId])
+  @@index([alibabaAuthId])
   @@index([alibabaOrderId])
   @@map("purchase_orders")
 }
@@ -681,21 +685,36 @@ model DailyReminderCheck {
   @@map("daily_reminder_checks")
 }
 
-/// 1688 授权令牌存储
-model AlibabaAuth {
-  id                    Int       @id @default(autoincrement())
-  appKey                String    @map("app_key")
-  appSecret             String    @map("app_secret")
-  accessToken           String    @map("access_token")
-  refreshToken          String    @map("refresh_token")
-  expiresAt             DateTime  @map("expires_at")
-  refreshTokenExpiresAt DateTime? @map("refresh_token_expires_at")
-  memberId              String?   @map("member_id")
-  aliId                 String?   @map("ali_id")
-  loginId               String?   @map("login_id")
-  createdAt             DateTime  @default(now()) @map("created_at")
-  updatedAt             DateTime  @updatedAt @map("updated_at")
+/// 1688 授权令牌类型
+enum AlibabaTokenType {
+  oauth
+  enterprise_static
+}
 
+/// 1688 授权令牌存储（支持多账号）
+model AlibabaAuth {
+  id                    Int               @id @default(autoincrement())
+  accountName           String            @map("account_name")
+  appKey                String            @map("app_key")
+  appSecret             String            @map("app_secret")
+  accessToken           String            @map("access_token")
+  refreshToken          String?           @map("refresh_token")
+  tokenType             AlibabaTokenType  @default(oauth) @map("token_type")
+  expiresAt             DateTime          @map("expires_at")
+  refreshTokenExpiresAt DateTime?         @map("refresh_token_expires_at")
+  memberId              String?           @map("member_id")
+  aliId                 String?           @map("ali_id")
+  loginId               String?           @map("login_id")
+  isEnabled             Boolean           @default(true) @map("is_enabled")
+  isDefault             Boolean           @default(false) @map("is_default")
+  remark                String?           @map("remark")
+  lastValidatedAt       DateTime?         @map("last_validated_at")
+  createdAt             DateTime          @default(now()) @map("created_at")
+  updatedAt             DateTime          @updatedAt @map("updated_at")
+  purchaseOrders        PurchaseOrder[]
+
+  @@index([isEnabled])
+  @@index([isDefault])
   @@map("alibaba_auth")
 }
 

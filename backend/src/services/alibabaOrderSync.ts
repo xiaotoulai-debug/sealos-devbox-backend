@@ -31,9 +31,10 @@ export function isFetch1688OrderError(r: Fetch1688OrderResult | Fetch1688OrderEr
  * 请求参数：orderId = externalOrderId（该采购项的 1688 订单号）
  */
 export async function fetch1688OrderDetail(
-  orderId: string
+  orderId: string,
+  alibabaAuthId?: number | null,
 ): Promise<Fetch1688OrderResult | Fetch1688OrderError> {
-  const accessToken = await getValidAccessToken();
+  const accessToken = await getValidAccessToken({ alibabaAuthId: alibabaAuthId ?? null });
   if (!accessToken) {
     return { error: true, message: '1688 授权已过期，请重新绑定账号' };
   }
@@ -102,9 +103,10 @@ export async function fetch1688OrderDetail(
  */
 export async function syncAndUpdatePurchaseOrderItem(
   purchaseOrderItemId: number,
-  alibabaOrderId: string
+  alibabaOrderId: string,
+  alibabaAuthId?: number | null,
 ): Promise<Fetch1688OrderResult | Fetch1688OrderError> {
-  const detail = await fetch1688OrderDetail(alibabaOrderId);
+  const detail = await fetch1688OrderDetail(alibabaOrderId, alibabaAuthId ?? null);
   if (isFetch1688OrderError(detail)) return detail;
 
   await prisma.purchaseOrderItem.update({

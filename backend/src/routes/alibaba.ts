@@ -1,14 +1,23 @@
 import { Router, Request, Response } from 'express';
-import { PrismaClient } from '@prisma/client';
-import { authenticate } from '../middleware/auth';
+import { PrismaClient, AlibabaTokenType } from '@prisma/client';
+import { authenticate, requireStrictPermission } from '../middleware/auth';
 import {
   callAlibabaAPI,
   APP_KEY,
+  APP_SECRET,
   buildAuthorizeUrl,
   exchangeCodeForToken,
   persistToken,
   getValidAccessToken,
 } from '../utils/alibaba';
+import {
+  formatAlibabaAccount,
+  createEnterpriseStaticAccount,
+  setDefaultAlibabaAccount,
+  disableAlibabaAccount,
+  resolveAlibabaAuthRecord,
+  ENTERPRISE_STATIC_FAR_EXPIRY,
+} from '../services/alibabaAuthService';
 import { createAlibabaOrder } from '../services/alibabaOrder';
 import { fetch1688OrderDetail, isFetch1688OrderError } from '../services/alibabaOrderSync';
 import { get1688Item, normalizeOneboundSkus, type Onebound1688Response } from '../adapters/onebound.adapter';
@@ -99,6 +108,189 @@ router.get('/callback', async (req: Request, res: Response) => {
 // ── 以下路由需要系统 JWT 认证 ────────────────────────────────
 router.use(authenticate);
 
+const require1688Config = requireStrictPermission('MENU_1688_CONFIG', '无 1688 配置权限');
+
+function parseOptionalAccountId(raw: unknown): number | undefined {
+  if (raw == null || raw === '') return undefined;
+  const n = Number(raw);
+  return Number.isInteger(n) && n > 0 ? n : undefined;
+}
+
+// ── GET /api/alibaba/accounts ──────────────────────────────────
+router.get('/accounts', async (_req: Request, res: Response) => {
+  try {
+    const rows = await prisma.alibabaAuth.findMany({ orderBy: [{ isDefault: 'desc' }, { updatedAt: 'desc' }] });
+    res.json({
+      code: 200,
+      data: rows.map(formatAlibabaAccount),
+      message: 'success',
+    });
+  } catch (err) {
+    console.error('[GET /api/alibaba/accounts]', err);
+    res.status(500).json({ code: 500, data: null, message: '获取 1688 账号列表失败' });
+  }
+});
+
+// ── POST /api/alibaba/accounts ─────────────────────────────────
+router.post('/accounts', require1688Config, async (req: Request, res: Response) => {
+  try {
+    const { accountName, accessToken, loginId, memberId, aliId, remark, isDefault } = req.body ?? {};
+    if (!accountName || !accessToken) {
+      res.status(400).json({ code: 400, data: null, message: 'accountName 与 accessToken 为必填项' });
+      return;
+    }
+
+    const created = await createEnterpriseStaticAccount({
+      accountName: String(accountName),
+      accessToken: String(accessToken),
+      loginId: loginId != null ? String(loginId) : null,
+      memberId: memberId != null ? String(memberId) : null,
+      aliId: aliId != null ? String(aliId) : null,
+      remark: remark != null ? String(remark) : null,
+      isDefault: isDefault === true,
+      appKey: APP_KEY,
+      appSecret: APP_SECRET,
+    });
+
+    console.log(`[1688 Accounts] 新增企业自用账号 accountName=${created.accountName} id=${created.id}`);
+    res.json({ code: 200, data: formatAlibabaAccount(created), message: '1688 企业自用账号已保存' });
+  } catch (err) {
+    console.error('[POST /api/alibaba/accounts]', err);
+    res.status(500).json({ code: 500, data: null, message: err instanceof Error ? err.message : '保存 1688 账号失败' });
+  }
+});
+
+// ── PATCH /api/alibaba/accounts/:id ────────────────────────────
+router.patch('/accounts/:id', require1688Config, async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      res.status(400).json({ code: 400, data: null, message: '无效的账号 ID' });
+      return;
+    }
+
+    const existing = await prisma.alibabaAuth.findUnique({ where: { id } });
+    if (!existing) {
+      res.status(404).json({ code: 404, data: null, message: '1688 账号不存在' });
+      return;
+    }
+
+    const { accountName, accessToken, loginId, memberId, aliId, remark, isEnabled, isDefault } = req.body ?? {};
+    const data: Record<string, unknown> = {};
+
+    if (accountName != null) data.accountName = String(accountName).trim();
+    if (loginId != null) data.loginId = String(loginId).trim() || null;
+    if (memberId != null) data.memberId = String(memberId).trim() || null;
+    if (aliId != null) data.aliId = String(aliId).trim() || null;
+    if (remark != null) data.remark = String(remark).trim() || null;
+    if (typeof isEnabled === 'boolean') data.isEnabled = isEnabled;
+
+    if (accessToken != null && String(accessToken).trim()) {
+      data.accessToken = String(accessToken).trim();
+      data.tokenType = AlibabaTokenType.enterprise_static;
+      data.refreshToken = null;
+      data.refreshTokenExpiresAt = null;
+      data.expiresAt = ENTERPRISE_STATIC_FAR_EXPIRY;
+    }
+
+    if (Object.keys(data).length === 0 && isDefault !== true) {
+      res.status(400).json({ code: 400, data: null, message: '没有可更新的字段' });
+      return;
+    }
+
+    let updated = existing;
+    if (Object.keys(data).length > 0) {
+      updated = await prisma.alibabaAuth.update({ where: { id }, data });
+    }
+    if (isDefault === true) {
+      updated = await setDefaultAlibabaAccount(id);
+    }
+
+    console.log(`[1688 Accounts] 更新账号 id=${id} accountName=${updated.accountName}`);
+    res.json({ code: 200, data: formatAlibabaAccount(updated), message: '1688 账号已更新' });
+  } catch (err) {
+    console.error('[PATCH /api/alibaba/accounts/:id]', err);
+    res.status(500).json({ code: 500, data: null, message: err instanceof Error ? err.message : '更新 1688 账号失败' });
+  }
+});
+
+// ── DELETE /api/alibaba/accounts/:id ───────────────────────────
+router.delete('/accounts/:id', require1688Config, async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      res.status(400).json({ code: 400, data: null, message: '无效的账号 ID' });
+      return;
+    }
+
+    const result = await disableAlibabaAccount(id);
+    console.log(`[1688 Accounts] 禁用账号 id=${id} accountName=${result.account.accountName}`);
+    res.json({
+      code: 200,
+      data: {
+        ...formatAlibabaAccount(result.account),
+        linkedPurchaseOrderCount: result.linkedPurchaseOrderCount,
+      },
+      message: '1688 账号已禁用（软删除）',
+    });
+  } catch (err) {
+    console.error('[DELETE /api/alibaba/accounts/:id]', err);
+    res.status(400).json({ code: 400, data: null, message: err instanceof Error ? err.message : '禁用 1688 账号失败' });
+  }
+});
+
+// ── POST /api/alibaba/accounts/:id/validate ──────────────────
+router.post('/accounts/:id/validate', require1688Config, async (req: Request, res: Response) => {
+  try {
+    const id = Number(req.params.id);
+    if (!Number.isInteger(id) || id <= 0) {
+      res.status(400).json({ code: 400, data: null, message: '无效的账号 ID' });
+      return;
+    }
+
+    const auth = await prisma.alibabaAuth.findUnique({ where: { id } });
+    if (!auth || !auth.isEnabled) {
+      res.status(404).json({ code: 404, data: null, message: '1688 账号不存在或已禁用' });
+      return;
+    }
+
+    const accessToken = await getValidAccessToken({ alibabaAuthId: id });
+    if (!accessToken) {
+      res.json({
+        code: 200,
+        data: { valid: false, accountId: id, accountName: auth.accountName },
+        message: 'Token 无效或已过期',
+      });
+      return;
+    }
+
+    const apiPath = 'param2/1/com.alibaba.trade/alibaba.trade.getBuyerOrderList';
+    const result = await callAlibabaAPI(apiPath, { page: '1', pageSize: '1', webSite: '1688' }, accessToken);
+
+    const valid = result.success;
+    await prisma.alibabaAuth.update({
+      where: { id },
+      data: { lastValidatedAt: new Date() },
+    });
+
+    console.log(`[1688 Accounts] 验证账号 id=${id} accountName=${auth.accountName} valid=${valid}`);
+    res.json({
+      code: 200,
+      data: {
+        valid,
+        accountId: id,
+        accountName: auth.accountName,
+        errorCode: valid ? undefined : result.errorCode,
+        errorMessage: valid ? undefined : result.errorMessage,
+      },
+      message: valid ? 'Token 验证通过' : `Token 验证失败: ${result.errorMessage ?? '未知错误'}`,
+    });
+  } catch (err) {
+    console.error('[POST /api/alibaba/accounts/:id/validate]', err);
+    res.status(500).json({ code: 500, data: null, message: '验证 1688 Token 失败' });
+  }
+});
+
 // ── GET /api/alibaba/test-connection ─────────────────────────
 router.get('/test-connection', async (_req: Request, res: Response) => {
   try {
@@ -131,35 +323,30 @@ router.get('/test-connection', async (_req: Request, res: Response) => {
 });
 
 // ── GET /api/alibaba/auth-status ─────────────────────────────
-router.get('/auth-status', async (_req: Request, res: Response) => {
+router.get('/auth-status', async (req: Request, res: Response) => {
   try {
-    const auth = await prisma.alibabaAuth.findFirst({ orderBy: { updatedAt: 'desc' } });
+    const accountId = parseOptionalAccountId(req.query.alibabaAuthId ?? req.query.accountId);
+    const auth = await resolveAlibabaAuthRecord(accountId ?? null);
     if (!auth) {
-      res.json({ code: 200, data: { authorized: false }, message: '未授权' });
+      res.json({ code: 200, data: { authorized: false, accounts: [] }, message: '未授权' });
       return;
     }
-    const now = new Date();
-    const tokenExpired = now >= auth.expiresAt;
-    const refreshExpired = auth.refreshTokenExpiresAt ? now >= auth.refreshTokenExpiresAt : false;
 
-    // refresh_token 过期则无法续期，与 getValidAccessToken 语义一致
-    const authorized = !refreshExpired;
-
+    const formatted = formatAlibabaAccount(auth);
     let statusText = '授权有效';
-    if (refreshExpired) statusText = 'Refresh Token 已过期，请重新绑定';
-    else if (tokenExpired) statusText = 'Token 已过期，将在下次调用时自动刷新';
+    if (auth.tokenType === AlibabaTokenType.enterprise_static) {
+      statusText = formatted.authorized ? '企业自用 Token 有效' : '企业自用 Token 已禁用';
+    } else if (formatted.refreshExpired) {
+      statusText = 'Refresh Token 已过期，请重新绑定';
+    } else if (formatted.tokenExpired) {
+      statusText = 'Token 已过期，将在下次调用时自动刷新';
+    }
 
     res.json({
       code: 200,
       data: {
-        authorized,
-        loginId:       auth.loginId,
-        memberId:      auth.memberId,
-        aliId:         auth.aliId,
-        expiresAt:     auth.expiresAt,
-        refreshExpiresAt: auth.refreshTokenExpiresAt,
-        tokenExpired,
-        refreshExpired,
+        ...formatted,
+        authorized: formatted.authorized,
       },
       message: statusText,
     });
@@ -170,9 +357,10 @@ router.get('/auth-status', async (_req: Request, res: Response) => {
 });
 
 // ── POST /api/alibaba/refresh-token ──────────────────────────
-router.post('/refresh-token', async (_req: Request, res: Response) => {
+router.post('/refresh-token', async (req: Request, res: Response) => {
   try {
-    const token = await getValidAccessToken();
+    const accountId = parseOptionalAccountId(req.body?.alibabaAuthId ?? req.body?.accountId);
+    const token = await getValidAccessToken({ alibabaAuthId: accountId ?? null });
     if (!token) {
       res.json({ code: 200, data: { refreshed: false }, message: 'Token 无法刷新，请重新授权' });
       return;
@@ -186,9 +374,10 @@ router.post('/refresh-token', async (_req: Request, res: Response) => {
 
 // ── GET /api/alibaba/addresses ───────────────────────────────
 // 获取 1688 买家收货地址列表
-router.get('/addresses', async (_req: Request, res: Response) => {
+router.get('/addresses', async (req: Request, res: Response) => {
   try {
-    const accessToken = await getValidAccessToken();
+    const accountId = parseOptionalAccountId(req.query.alibabaAuthId ?? req.query.accountId);
+    const accessToken = await getValidAccessToken({ alibabaAuthId: accountId ?? null });
     if (!accessToken) {
       res.status(401).json({ code: 401, data: null, message: '1688 授权已过期，请重新绑定账号' });
       return;
@@ -548,7 +737,9 @@ router.get('/product-specs', async (req: Request, res: Response) => {
     }
 
     // ── 策略 2：1688 官方 alibaba.product.get ────────────────
-    const accessToken = await getValidAccessToken();
+    const accessToken = await getValidAccessToken({
+      alibabaAuthId: parseOptionalAccountId(req.query.alibabaAuthId ?? req.query.accountId) ?? null,
+    });
     if (accessToken) {
       try {
         const officialResult = await callAlibabaAPI<Record<string, unknown>>(
@@ -667,7 +858,8 @@ router.patch('/quick-map', async (req: Request, res: Response) => {
 // ★ 正确时序：先确保有 PurchaseOrder + PurchaseOrderItem，再调 1688，最后用 orderId 精准 update 子单
 router.post('/create-order', async (req: Request, res: Response) => {
   try {
-    const { productIds, addressId } = req.body ?? {};
+    const { productIds, addressId, alibabaAuthId, alibabaAccountId } = req.body ?? {};
+    const resolvedAuthId = parseOptionalAccountId(alibabaAuthId ?? alibabaAccountId) ?? null;
     if (!Array.isArray(productIds) || productIds.length === 0) {
       res.status(400).json({ code: 400, data: null, message: '请提供需要下单的产品 ID' });
       return;
@@ -774,7 +966,7 @@ router.post('/create-order', async (req: Request, res: Response) => {
         quantity: item.quantity,
       }));
 
-      const result = await createAlibabaOrder(payload, addressIdStr);
+      const result = await createAlibabaOrder(payload, addressIdStr, resolvedAuthId);
 
       if (!result.success) {
         res.json({
@@ -997,6 +1189,8 @@ router.post('/sync-1688-order', async (req: Request, res: Response) => {
       alibabaOrderId: reqAliId,
       externalOrderId: reqExtId,
       purchaseOrderItemId,
+      alibabaAuthId,
+      alibabaAccountId,
     } = req.body ?? {};
 
     // externalOrderId / alibabaOrderId 是同一个 1688 订单号，统一为 resolvedAliId
@@ -1007,6 +1201,7 @@ router.post('/sync-1688-order', async (req: Request, res: Response) => {
     // ── 第一步：定位 PurchaseOrderItem ────────────────────────
     let item: {
       id: number;
+      purchaseOrderId: number;
       alibabaOrderId: string | null;
       alibabaOrderStatus: string | null;
       alibabaTotalAmount: unknown;
@@ -1016,14 +1211,20 @@ router.post('/sync-1688-order', async (req: Request, res: Response) => {
     if (purchaseOrderItemId) {
       item = await prisma.purchaseOrderItem.findUnique({
         where: { id: Number(purchaseOrderItemId) },
-        select: { id: true, alibabaOrderId: true, alibabaOrderStatus: true, alibabaTotalAmount: true, shippingFee: true },
+        select: {
+          id: true, purchaseOrderId: true, alibabaOrderId: true, alibabaOrderStatus: true,
+          alibabaTotalAmount: true, shippingFee: true,
+        },
       });
     }
 
     if (!item && resolvedAliId) {
       item = await prisma.purchaseOrderItem.findFirst({
         where: { alibabaOrderId: resolvedAliId },
-        select: { id: true, alibabaOrderId: true, alibabaOrderStatus: true, alibabaTotalAmount: true, shippingFee: true },
+        select: {
+          id: true, purchaseOrderId: true, alibabaOrderId: true, alibabaOrderStatus: true,
+          alibabaTotalAmount: true, shippingFee: true,
+        },
       });
     }
 
@@ -1056,8 +1257,19 @@ router.post('/sync-1688-order', async (req: Request, res: Response) => {
       });
     }
 
+    const purchaseOrder = item
+      ? await prisma.purchaseOrder.findUnique({
+        where: { id: item.purchaseOrderId },
+        select: { alibabaAuthId: true },
+      })
+      : null;
+    const resolvedAuthId =
+      parseOptionalAccountId(alibabaAuthId ?? alibabaAccountId) ??
+      purchaseOrder?.alibabaAuthId ??
+      null;
+
     // ── 第三步：调用共享函数获取 1688 订单详情（必须走 res.result.baseInfo）────────────────
-    const detail = await fetch1688OrderDetail(finalAliOrderId);
+    const detail = await fetch1688OrderDetail(finalAliOrderId, resolvedAuthId);
 
     if (isFetch1688OrderError(detail)) {
       res.json({
@@ -1115,7 +1327,9 @@ router.get('/1688-logistics', async (req: Request, res: Response) => {
       return;
     }
 
-    const accessToken = await getValidAccessToken();
+    const accessToken = await getValidAccessToken({
+      alibabaAuthId: parseOptionalAccountId(req.query.alibabaAuthId ?? req.query.accountId) ?? null,
+    });
     if (!accessToken) {
       res.status(401).json({ code: 401, data: null, message: '1688 授权已过期，请重新绑定账号' });
       return;
