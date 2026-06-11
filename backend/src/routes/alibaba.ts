@@ -16,10 +16,40 @@ import { get1688Item, normalizeOneboundSkus, type Onebound1688Response } from '.
 const router = Router();
 const prisma = new PrismaClient();
 
-// CORS_ORIGIN 为 * 时无法作为重定向目标，使用默认值
-const FRONTEND_URL = (process.env.CORS_ORIGIN && process.env.CORS_ORIGIN !== '*')
-  ? process.env.CORS_ORIGIN.split(',')[0].trim()
-  : 'http://localhost:5173';
+/** 前端地址：优先 FRONTEND_URL，其次 CORS_ORIGIN（非 *），最后本地默认 */
+function resolveFrontendUrl(): string {
+  const explicit = process.env.FRONTEND_URL?.trim();
+  if (explicit) return explicit;
+  const cors = process.env.CORS_ORIGIN?.trim();
+  if (cors && cors !== '*') return cors.split(',')[0].trim();
+  return 'http://localhost:5173';
+}
+
+const FRONTEND_URL = resolveFrontendUrl();
+
+/** OAuth 回调后跳回 1688 配置页（前端 AlibabaSettings 需 tab=alibaba-settings 才挂载） */
+function buildOAuthFrontendRedirect(extra: Record<string, string>): string {
+  const params = new URLSearchParams({ tab: 'alibaba-settings', ...extra });
+  return `${FRONTEND_URL}?${params.toString()}`;
+}
+
+// 启动时检查 redirect_uri 端口是否与 PORT 一致（仅 warn，不阻断）
+try {
+  const redirectUri = process.env.ALIBABA_REDIRECT_URI?.trim();
+  const servicePort = Number(process.env.PORT) || 3001;
+  if (redirectUri) {
+    const parsed = new URL(redirectUri);
+    const redirectPort = parsed.port ? Number(parsed.port) : (parsed.protocol === 'https:' ? 443 : 80);
+    if (redirectPort !== servicePort) {
+      console.warn(
+        `[1688 OAuth] ALIBABA_REDIRECT_URI 端口 (${redirectPort}) 与 PORT (${servicePort}) 不一致，` +
+        '1688 回调可能无法到达本服务，请核对开放平台登记地址与环境变量',
+      );
+    }
+  }
+} catch {
+  console.warn('[1688 OAuth] ALIBABA_REDIRECT_URI 格式无效，请检查环境变量');
+}
 
 // ── OAuth 2.0 路由（无需 JWT 认证）──────────────────────────
 
@@ -29,6 +59,7 @@ const FRONTEND_URL = (process.env.CORS_ORIGIN && process.env.CORS_ORIGIN !== '*'
  */
 router.get('/authorize', (_req: Request, res: Response) => {
   const url = buildAuthorizeUrl();
+  console.log('[1688 OAuth] 发起授权跳转，redirect_uri 已配置');
   res.redirect(url);
 });
 
@@ -39,7 +70,10 @@ router.get('/authorize', (_req: Request, res: Response) => {
 router.get('/callback', async (req: Request, res: Response) => {
   const code = req.query.code as string | undefined;
   if (!code) {
-    res.redirect(`${FRONTEND_URL}?alibaba_auth=error&msg=${encodeURIComponent('缺少授权码')}`);
+    res.redirect(buildOAuthFrontendRedirect({
+      alibaba_auth: 'error',
+      msg: '缺少授权码',
+    }));
     return;
   }
 
@@ -48,15 +82,17 @@ router.get('/callback', async (req: Request, res: Response) => {
     await persistToken(token);
     console.log('[1688 OAuth] 授权成功，memberId:', token.memberId, 'loginId:', token.resource_owner);
 
-    const params = new URLSearchParams({
-      alibaba_auth:  'success',
-      login_id:      token.resource_owner ?? '',
-    });
-    res.redirect(`${FRONTEND_URL}?${params.toString()}`);
+    res.redirect(buildOAuthFrontendRedirect({
+      alibaba_auth: 'success',
+      login_id: token.resource_owner ?? '',
+    }));
   } catch (err) {
     console.error('[1688 OAuth callback]', err);
     const msg = err instanceof Error ? err.message : '未知错误';
-    res.redirect(`${FRONTEND_URL}?alibaba_auth=error&msg=${encodeURIComponent(msg)}`);
+    res.redirect(buildOAuthFrontendRedirect({
+      alibaba_auth: 'error',
+      msg,
+    }));
   }
 });
 
@@ -106,14 +142,17 @@ router.get('/auth-status', async (_req: Request, res: Response) => {
     const tokenExpired = now >= auth.expiresAt;
     const refreshExpired = auth.refreshTokenExpiresAt ? now >= auth.refreshTokenExpiresAt : false;
 
+    // refresh_token 过期则无法续期，与 getValidAccessToken 语义一致
+    const authorized = !refreshExpired;
+
     let statusText = '授权有效';
-    if (tokenExpired && refreshExpired) statusText = '授权已完全过期，请重新绑定';
+    if (refreshExpired) statusText = 'Refresh Token 已过期，请重新绑定';
     else if (tokenExpired) statusText = 'Token 已过期，将在下次调用时自动刷新';
 
     res.json({
       code: 200,
       data: {
-        authorized:    !tokenExpired || !refreshExpired,
+        authorized,
         loginId:       auth.loginId,
         memberId:      auth.memberId,
         aliId:         auth.aliId,
