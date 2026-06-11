@@ -798,6 +798,86 @@ router.get('/counts', async (req: Request, res: Response) => {
   }
 });
 
+type FbeItemStoreProductMeta = {
+  storeProductId: number | null;
+  pnk: string | null;
+  ean: string | null;
+  emagOfferId: string | null;
+  productUrl: string | null;
+};
+
+/** 为 FBE 明细批量解析同店铺 StoreProduct（sourceStoreProductId 优先，其次 mappedInventorySku） */
+async function resolveStoreProductMetaForShipmentItems(
+  shopId: number | null,
+  items: Array<{
+    product: {
+      id: number;
+      sku: string | null;
+      pnk: string | null;
+      sourceStoreProductId: number | null;
+    };
+  }>,
+): Promise<Map<number, FbeItemStoreProductMeta>> {
+  const empty: FbeItemStoreProductMeta = {
+    storeProductId: null,
+    pnk: null,
+    ean: null,
+    emagOfferId: null,
+    productUrl: null,
+  };
+  const result = new Map<number, FbeItemStoreProductMeta>();
+  if (!shopId) {
+    for (const item of items) result.set(item.product.id, { ...empty, pnk: item.product.pnk ?? null });
+    return result;
+  }
+
+  const sourceIds = [...new Set(
+    items.map((i) => i.product.sourceStoreProductId).filter((id): id is number => id != null && id > 0),
+  )];
+  const skus = [...new Set(
+    items.map((i) => String(i.product.sku ?? '').trim()).filter(Boolean),
+  )];
+
+  const orClauses: Array<Record<string, unknown>> = [];
+  if (sourceIds.length > 0) orClauses.push({ id: { in: sourceIds } });
+  if (skus.length > 0) orClauses.push({ mappedInventorySku: { in: skus } });
+
+  const storeProducts = orClauses.length > 0
+    ? await prisma.storeProduct.findMany({
+        where: { shopId, isArchived: false, OR: orClauses },
+        select: {
+          id: true, pnk: true, ean: true, emagOfferId: true, productUrl: true, mappedInventorySku: true,
+        },
+      })
+    : [];
+
+  const byId = new Map(storeProducts.map((sp) => [sp.id, sp]));
+  const byMappedSku = new Map<string, (typeof storeProducts)[number]>();
+  for (const sp of storeProducts) {
+    const mapped = String(sp.mappedInventorySku ?? '').trim();
+    if (mapped && !byMappedSku.has(mapped)) byMappedSku.set(mapped, sp);
+  }
+
+  for (const item of items) {
+    const p = item.product;
+    let sp = p.sourceStoreProductId ? byId.get(p.sourceStoreProductId) : undefined;
+    if (!sp) {
+      const sku = String(p.sku ?? '').trim();
+      if (sku) sp = byMappedSku.get(sku);
+    }
+    result.set(p.id, sp
+      ? {
+          storeProductId: sp.id,
+          pnk: sp.pnk ?? null,
+          ean: sp.ean ?? null,
+          emagOfferId: sp.emagOfferId ?? null,
+          productUrl: sp.productUrl ?? null,
+        }
+      : { ...empty, pnk: p.pnk ?? null });
+  }
+  return result;
+}
+
 // ─────────────────────────────────────────────────────────────────────
 // GET /api/fbe-shipments/:id   发货单详情
 // ─────────────────────────────────────────────────────────────────────
@@ -820,6 +900,7 @@ router.get('/:id', async (req: Request, res: Response) => {
                 id: true, pnk: true, sku: true, title: true, chineseName: true,
                 imageUrl: true, brand: true, category: true,
                 purchasePrice: true, stockActual: true, inTransitQuantity: true,
+                sourceStoreProductId: true,
                 // 带出各仓库存，前端详情页可计算实时剩余库存
                 warehouseStocks: {
                   select: {
@@ -843,10 +924,35 @@ router.get('/:id', async (req: Request, res: Response) => {
       return;
     }
 
+    const storeMetaByProductId = await resolveStoreProductMetaForShipmentItems(raw.shopId, raw.items);
+    const enrichedItems = raw.items.map((item) => {
+      const meta = storeMetaByProductId.get(item.product.id) ?? {
+        storeProductId: null,
+        pnk: item.product.pnk ?? null,
+        ean: null,
+        emagOfferId: null,
+        productUrl: null,
+      };
+      return {
+        ...item,
+        productId: item.product.id,
+        sku: item.product.sku ?? null,
+        chineseName: item.product.chineseName ?? null,
+        productName: item.product.chineseName ?? item.product.title ?? null,
+        imageUrl: item.product.imageUrl ?? null,
+        storeProductId: meta.storeProductId,
+        pnk: meta.pnk,
+        ean: meta.ean,
+        emagOfferId: meta.emagOfferId,
+        productUrl: meta.productUrl,
+      };
+    });
+
     const shipment = {
       ...raw,
-      productCount:  raw.items.length,
-      totalQuantity: raw.items.reduce((sum, i) => sum + i.quantity, 0),
+      items: enrichedItems,
+      productCount:  enrichedItems.length,
+      totalQuantity: enrichedItems.reduce((sum, i) => sum + i.quantity, 0),
     };
     res.json({ code: 200, data: shipment, message: 'success' });
   } catch (err: any) {
