@@ -202,7 +202,7 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
         const linkTypeResult = inferEmagLinkType({
           shopId: creds.shopId,
           pnk: np.pnk,
-          rawApiData: { ownership: np.ownership },
+          rawApiData: { ownership: np.ownership, brand: np.brand },
           publishLog: null,
         });
         const contentPermission = inferContentPermission(linkTypeResult.linkType);
@@ -220,6 +220,8 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
         });
         const compactOfferMeta = {
           ownership: np.ownership,
+          brand: np.brand,
+          linkTypeReason: linkTypeResult.linkTypeReason,
           numberOfOffers: np.numberOfOffers,
           bestOfferSalePrice: np.bestOfferSalePrice,
           mainOfferPrice: np.mainOfferPrice,

@@ -50,7 +50,11 @@ import {
   inferOfferCompetition,
   LINK_TYPE_LABELS,
   OFFER_COMPETITION_LABELS,
+  normalizeOwnershipDisplay,
+  resolveBrandFromOfferMeta,
+  resolveLinkTypeReasonFromOfferMeta,
   type EmagLinkType,
+  type LinkTypeReason,
   type OfferCompetitionType,
 } from '../services/emagLinkType';
 import {
@@ -73,7 +77,9 @@ function normalizeNullableDate(value: Date | string | null | undefined): Date | 
 }
 
 function normalizeStoredLinkType(value: string | null | undefined): EmagLinkType {
-  return value === 'SELF_BUILT' || value === 'RESELL' || value === 'UNKNOWN' ? value : 'UNKNOWN';
+  return value === 'SELF_BUILT' || value === 'RESELL' || value === 'OWN_BRAND_RESELL' || value === 'UNKNOWN'
+    ? value
+    : 'UNKNOWN';
 }
 
 function normalizeStoredCompetitionType(value: string | null | undefined): OfferCompetitionType {
@@ -102,7 +108,7 @@ function normalizeStoredBuyBoxConfidence(value: string | null | undefined): BuyB
 }
 
 type BuyBoxGroupFilter = 'ALL' | 'WON' | 'NOT_WON' | 'UNKNOWN';
-type LinkTypeFilter = 'ALL' | 'SELF_BUILT' | 'RESELL' | 'UNKNOWN';
+type LinkTypeFilter = 'ALL' | 'SELF_BUILT' | 'RESELL' | 'OWN_BRAND_RESELL' | 'UNKNOWN';
 
 function normalizeBuyBoxGroupFilter(value: unknown): BuyBoxGroupFilter {
   const raw = Array.isArray(value) ? value[0] : value;
@@ -115,7 +121,11 @@ function normalizeBuyBoxGroupFilter(value: unknown): BuyBoxGroupFilter {
 function normalizeLinkTypeFilter(value: unknown): LinkTypeFilter {
   const raw = Array.isArray(value) ? value[0] : value;
   const normalized = String(raw ?? 'ALL').trim().toUpperCase();
-  return normalized === 'SELF_BUILT' || normalized === 'RESELL' || normalized === 'UNKNOWN' || normalized === 'ALL'
+  return normalized === 'SELF_BUILT'
+    || normalized === 'RESELL'
+    || normalized === 'OWN_BRAND_RESELL'
+    || normalized === 'UNKNOWN'
+    || normalized === 'ALL'
     ? normalized
     : 'ALL';
 }
@@ -780,6 +790,8 @@ router.get('/', async (req: Request, res: Response) => {
       appendStoreProductAnd(where, { emagLinkType: 'SELF_BUILT' });
     } else if (linkTypeFilter === 'RESELL') {
       appendStoreProductAnd(where, { emagLinkType: 'RESELL' });
+    } else if (linkTypeFilter === 'OWN_BRAND_RESELL') {
+      appendStoreProductAnd(where, { emagLinkType: 'OWN_BRAND_RESELL' });
     } else if (linkTypeFilter === 'UNKNOWN') {
       appendStoreProductAnd(where, {
         OR: [
@@ -956,10 +968,12 @@ router.get('/', async (req: Request, res: Response) => {
       }
     }
 
-    // ── 按当前店铺隔离计算 FBE 在途库存 ─────────────────────────────
+    // ── 按当前店铺隔离计算 FBE 在途库存（SKU / Product.id 维度，非 PNK 维度）──
     // Product.inTransitQuantity 是全局累积值，跨店污染；此处实时聚合：
     //   条件：发货单 shopId === 当前 shopId，状态为 SHIPPED（已发但未入仓）
-    // 结果 key = productId（本地 Product 主键）
+    //   聚合 key = 本地 Product.id（通过 mappedInventorySku / sku 映射）
+    // 如果多个 StoreProduct / PNK 绑定同一个本地 Product.id，它们会共享同一在途数量。
+    // 这不是 PNK 维度；API 返回 inTransitScope=SKU 标明口径。
     const allProductIds = [...inventoryMap.values()]
       .map((e) => e.localProductId)
       .filter((id): id is number => id !== null);
@@ -1241,6 +1255,9 @@ router.get('/', async (req: Request, res: Response) => {
         return `https://www.${domain}/${slug}/pd/${p.pnk}/`;
       })();
       const linkType = normalizeStoredLinkType(p.emagLinkType);
+      const platformBrand = resolveBrandFromOfferMeta(p.emagOfferMeta);
+      const linkTypeReason: LinkTypeReason | null = resolveLinkTypeReasonFromOfferMeta(p.emagOfferMeta);
+      const ownershipDisplay = normalizeOwnershipDisplay(p.emagOwnership);
       const competition = inferOfferCompetition({ numberOfOffers: p.numberOfOffers });
       const offerCompetitionType = p.offerCompetitionType
         ? normalizeStoredCompetitionType(p.offerCompetitionType)
@@ -1304,6 +1321,11 @@ router.get('/', async (req: Request, res: Response) => {
         local_product_id:    inv?.localProductId    ?? null,
         local_chinese_name:  inv?.localChineseName  ?? null,
         in_transit_quantity: fbeInTransitQuantity,
+        inTransitQuantity: fbeInTransitQuantity,
+        sku_in_transit_quantity: fbeInTransitQuantity,
+        skuInTransitQuantity: fbeInTransitQuantity,
+        in_transit_scope: 'SKU',
+        inTransitScope: 'SKU',
         purchaseSuggestion: {
           ...purchaseSuggestion,
           platformInTransit: fbeInTransitQuantity,
@@ -1355,9 +1377,18 @@ router.get('/', async (req: Request, res: Response) => {
         risk_tags: riskTags,
         riskTags,
         linkType,
+        link_type: linkType,
         linkTypeLabel: LINK_TYPE_LABELS[linkType],
+        link_type_label: LINK_TYPE_LABELS[linkType],
         linkTypeSource: p.emagLinkTypeSource ?? 'UNKNOWN',
+        link_type_source: p.emagLinkTypeSource ?? 'UNKNOWN',
         linkTypeConfidence: p.emagLinkTypeConfidence ?? 'LOW',
+        link_type_confidence: p.emagLinkTypeConfidence ?? 'LOW',
+        linkTypeReason: linkTypeReason,
+        link_type_reason: linkTypeReason,
+        brand: platformBrand,
+        platform_brand: platformBrand,
+        ownership: ownershipDisplay,
         contentPermission: p.contentPermission ?? contentPermissionResult.contentPermission,
         contentPermissionLabel: contentPermissionResult.contentPermissionLabel,
         numberOfOffers: p.numberOfOffers ?? competition.numberOfOffers,

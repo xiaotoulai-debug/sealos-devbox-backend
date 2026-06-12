@@ -34,26 +34,57 @@ async function main() {
   }
   const raw = res.results as any;
   const items = Array.isArray(raw) ? raw : (raw?.items ?? raw?.results ?? []);
-  const first = items[0];
-  if (!first) {
+  if (items.length === 0) {
     console.log('无产品数据');
     process.exit(0);
   }
-  const pnk = first.part_number_key ?? first.pnk ?? first.part_number ?? '?';
-  console.log('\n=== eMAG product_offer/read 首条产品完整响应 ===');
-  console.log('PNK:', pnk);
-  console.log('\n顶层键:', Object.keys(first));
-  console.log('\n可能含 URL 的字段:');
-  for (const k of Object.keys(first)) {
-    const v = first[k];
-    if (typeof v === 'string' && v.startsWith('http')) console.log(`  ${k}: ${v}`);
-    else if (v && typeof v === 'object' && !Array.isArray(v)) {
-      const str = JSON.stringify(v);
-      if (str.includes('http')) console.log(`  ${k}:`, JSON.stringify(v).slice(0, 300));
+
+  const FIELD_KEYS = [
+    'brand', 'Brand', 'product_brand', 'productBrand',
+    'ownership', 'number_of_offers', 'numberOfOffers',
+    'buy_button_rank', 'buyButtonRank',
+    'part_number_key', 'pnk', 'part_number',
+    'ean', 'ext_part_number',
+  ] as const;
+
+  const pickField = (row: Record<string, unknown>, keys: readonly string[]): unknown => {
+    for (const k of keys) {
+      if (row[k] !== undefined && row[k] !== null && row[k] !== '') return row[k];
     }
+    return null;
+  };
+
+  console.log(`\n=== eMAG product_offer/read 字段抽样（共 ${Math.min(5, items.length)} 条，不含密钥）===`);
+  console.log(`shopId=${shopId}`);
+
+  for (let i = 0; i < Math.min(5, items.length); i++) {
+    const row = items[i] as Record<string, unknown>;
+    const pnk = pickField(row, ['part_number_key', 'pnk', 'part_number']);
+    const brand = pickField(row, ['brand', 'Brand', 'product_brand', 'productBrand']);
+    const ownership = row.ownership ?? null;
+    const numberOfOffers = pickField(row, ['number_of_offers', 'numberOfOffers']);
+    const buyButtonRank = pickField(row, ['buy_button_rank', 'buyButtonRank']);
+    const partNumberKey = pickField(row, ['part_number_key', 'pnk']);
+    const partNumber = row.part_number ?? null;
+    const ean = row.ean ?? null;
+
+    console.log(`\n--- 样本 #${i + 1} ---`);
+    console.log('顶层键:', Object.keys(row).sort().join(', '));
+    console.log('brand (brand|Brand|product_brand|productBrand):', brand);
+    console.log('ownership:', ownership);
+    console.log('number_of_offers:', numberOfOffers);
+    console.log('buy_button_rank:', buyButtonRank);
+    console.log('part_number_key:', partNumberKey);
+    console.log('part_number:', partNumber);
+    console.log('ean:', ean);
+    console.log('pnk 别名存在:', row.pnk != null ? 'yes' : 'no');
   }
-  console.log('\n完整 JSON (首条):');
-  console.log(JSON.stringify(first, null, 2));
+
+  const brandKeyPresence = FIELD_KEYS.filter((k) =>
+    items.slice(0, 5).some((row: Record<string, unknown>) => row[k] !== undefined && row[k] !== null && row[k] !== ''),
+  );
+  console.log('\n=== 5 条样本中出现 brand 相关 key 出现情况 ===');
+  console.log('出现的 key:', brandKeyPresence.join(', ') || '(无)');
   process.exit(0);
 }
 

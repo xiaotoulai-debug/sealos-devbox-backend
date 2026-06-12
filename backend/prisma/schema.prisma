@@ -326,7 +326,7 @@ model StoreProduct {
   classificationMetrics Json?     @map("classification_metrics")    // 分类计算指标快照（不伪造 90 天有货数据）
   classifiedAt         DateTime?  @map("classified_at")             // 上次分类计算时间
   // ── eMAG 店铺维度链接身份（shopId + PNK + ownership），不保存完整 raw response ──
-  emagLinkType           String?   @map("emag_link_type")            // SELF_BUILT / RESELL / UNKNOWN
+  emagLinkType           String?   @map("emag_link_type")            // SELF_BUILT / RESELL / OWN_BRAND_RESELL / UNKNOWN
   emagLinkTypeSource     String?   @map("emag_link_type_source")     // PUBLISH_LOG / OWNERSHIP / MANUAL / UNKNOWN
   emagLinkTypeConfidence String?   @map("emag_link_type_confidence") // HIGH / MEDIUM / LOW
   emagOwnership          Json?     @map("emag_ownership")            // eMAG 原始 ownership，可能为 boolean/number/string/null

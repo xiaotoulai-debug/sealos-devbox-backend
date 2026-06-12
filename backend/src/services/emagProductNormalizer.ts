@@ -165,6 +165,17 @@ export interface NormalizedProduct {
   mainOfferPrice: number | null;
   buyButtonRank: number | null;
   offerValidationStatus: unknown | null;
+  brand: string | null;
+}
+
+function extractBrand(raw: Record<string, unknown>): string | null {
+  const candidates = [raw.brand, raw.Brand, raw.product_brand, raw.productBrand];
+  for (const value of candidates) {
+    if (value == null || value === '') continue;
+    const normalized = String(value).trim();
+    if (normalized) return normalized;
+  }
+  return null;
 }
 
 // ─── 统一解析器 ───────────────────────────────────────────────────
@@ -404,6 +415,7 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
   const bestOfferSalePrice = toNullableNumber(raw?.best_offer_sale_price, raw?.bestOfferSalePrice);
   const mainOfferPrice = toNullableNumber(raw?.main_offer_price, raw?.mainOfferPrice);
   const buyButtonRank = toNullableNumber(raw?.buy_button_rank, raw?.buyButtonRank);
+  const brand = extractBrand(raw);
   const skuDisplay = sku ?? vendorSku ?? pnk;
 
   if (options?.logOutput !== false) {
@@ -434,5 +446,6 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
     mainOfferPrice,
     buyButtonRank,
     offerValidationStatus: compactOfferValidationStatus,
+    brand,
   };
 }

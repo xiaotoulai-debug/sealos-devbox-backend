@@ -9,6 +9,9 @@ import {
   inferEmagLinkType,
   inferLinkActionTips,
   inferOfferCompetition,
+  normalizeOwnershipDisplay,
+  type EmagLinkType,
+  type LinkTypeReason,
 } from '../src/services/emagLinkType';
 
 const PAGE_SIZE = 20;
@@ -21,19 +24,92 @@ const fixMode = process.argv.includes('--fix');
 const shopId = shopArg ? Number(shopArg.split('=')[1]) : undefined;
 const dryRun = dryRunArg ? dryRunArg.split('=')[1] !== 'false' : !fixMode;
 
+type ChangeSample = {
+  pnk: string;
+  sku: string | null;
+  brand: string | null;
+  ownership: 1 | 2 | null;
+  oldLinkType: string | null;
+  newLinkType: EmagLinkType;
+  reason: LinkTypeReason | null;
+};
+
+type TransitionStats = {
+  selfBuiltToResell: number;
+  selfBuiltToOwnBrandResell: number;
+  selfBuiltToUnknown: number;
+  selfBuiltToSelfBuilt: number;
+  resellToOwnBrandResell: number;
+  resellToResell: number;
+  resellToSelfBuilt: number;
+  resellToUnknown: number;
+  unknownToResell: number;
+  unknownToOwnBrandResell: number;
+  unknownToSelfBuilt: number;
+  unknownToUnknown: number;
+  toUnknown: number;
+  anyChange: number;
+};
+
 type BackfillSummary = {
   shopId: number;
   scanned: number;
   updated: number;
   errors: string[];
+  transitions: TransitionStats;
+  changeSamples: ChangeSample[];
   samples: Array<{
     pnk: string;
     linkType: string;
+    linkTypeReason: LinkTypeReason | null;
+    brand: string | null;
     numberOfOffers: number | null;
     offerCompetitionType: string;
     tips: string[];
   }>;
 };
+
+function emptyTransitionStats(): TransitionStats {
+  return {
+    selfBuiltToResell: 0,
+    selfBuiltToOwnBrandResell: 0,
+    selfBuiltToUnknown: 0,
+    selfBuiltToSelfBuilt: 0,
+    resellToOwnBrandResell: 0,
+    resellToResell: 0,
+    resellToSelfBuilt: 0,
+    resellToUnknown: 0,
+    unknownToResell: 0,
+    unknownToOwnBrandResell: 0,
+    unknownToSelfBuilt: 0,
+    unknownToUnknown: 0,
+    toUnknown: 0,
+    anyChange: 0,
+  };
+}
+
+function normalizeOldLinkType(value: string | null | undefined): string {
+  if (value === 'SELF_BUILT' || value === 'RESELL' || value === 'OWN_BRAND_RESELL' || value === 'UNKNOWN') return value;
+  return value ?? 'NULL';
+}
+
+function recordTransition(stats: TransitionStats, oldRaw: string | null | undefined, newType: EmagLinkType): void {
+  const oldType = normalizeOldLinkType(oldRaw);
+  if (oldType === newType) return;
+  stats.anyChange++;
+
+  if (newType === 'UNKNOWN') stats.toUnknown++;
+
+  if (oldType === 'SELF_BUILT' && newType === 'RESELL') stats.selfBuiltToResell++;
+  else if (oldType === 'SELF_BUILT' && newType === 'OWN_BRAND_RESELL') stats.selfBuiltToOwnBrandResell++;
+  else if (oldType === 'SELF_BUILT' && newType === 'UNKNOWN') stats.selfBuiltToUnknown++;
+  else if (oldType === 'RESELL' && newType === 'OWN_BRAND_RESELL') stats.resellToOwnBrandResell++;
+  else if (oldType === 'RESELL' && newType === 'SELF_BUILT') stats.resellToSelfBuilt++;
+  else if (oldType === 'RESELL' && newType === 'UNKNOWN') stats.resellToUnknown++;
+  else if (oldType === 'UNKNOWN' && newType === 'RESELL') stats.unknownToResell++;
+  else if (oldType === 'UNKNOWN' && newType === 'OWN_BRAND_RESELL') stats.unknownToOwnBrandResell++;
+  else if (oldType === 'UNKNOWN' && newType === 'SELF_BUILT') stats.unknownToSelfBuilt++;
+}
 
 function toJsonOwnership(value: unknown): Prisma.InputJsonValue {
   return value == null ? Prisma.JsonNull : value as Prisma.InputJsonValue;
@@ -46,7 +122,7 @@ function buildUpdateData(shopId: number, region: EmagRegion, raw: Record<string,
   const linkTypeResult = inferEmagLinkType({
     shopId,
     pnk: np.pnk,
-    rawApiData: { ownership: np.ownership },
+    rawApiData: { ownership: np.ownership, brand: np.brand },
     publishLog: null,
   });
   const contentPermission = inferContentPermission(linkTypeResult.linkType);
@@ -54,6 +130,8 @@ function buildUpdateData(shopId: number, region: EmagRegion, raw: Record<string,
   const linkActionTips = inferLinkActionTips(linkTypeResult.linkType, offerCompetition.offerCompetitionType);
   const compactOfferMeta = {
     ownership: np.ownership,
+    brand: np.brand,
+    linkTypeReason: linkTypeResult.linkTypeReason,
     numberOfOffers: np.numberOfOffers,
     bestOfferSalePrice: np.bestOfferSalePrice,
     mainOfferPrice: np.mainOfferPrice,
@@ -63,6 +141,9 @@ function buildUpdateData(shopId: number, region: EmagRegion, raw: Record<string,
 
   return {
     pnk: np.pnk,
+    sku: np.sku ?? np.vendorSku ?? null,
+    brand: np.brand,
+    ownership: normalizeOwnershipDisplay(np.ownership),
     data: {
       emagLinkType: linkTypeResult.linkType,
       emagLinkTypeSource: linkTypeResult.linkTypeSource,
@@ -80,20 +161,31 @@ function buildUpdateData(shopId: number, region: EmagRegion, raw: Record<string,
     sample: {
       pnk: np.pnk,
       linkType: linkTypeResult.linkType,
+      linkTypeReason: linkTypeResult.linkTypeReason,
+      brand: np.brand,
       numberOfOffers: offerCompetition.numberOfOffers,
       offerCompetitionType: offerCompetition.offerCompetitionType,
       tips: linkActionTips,
     },
+    linkTypeResult,
   };
 }
 
 async function backfillShop(targetShopId: number): Promise<BackfillSummary> {
   const creds = await getEmagCredentials(targetShopId);
+  const existingRows = await prisma.storeProduct.findMany({
+    where: { shopId: targetShopId, isArchived: false },
+    select: { pnk: true, emagLinkType: true, sku: true, vendorSku: true },
+  });
+  const existingByPnk = new Map(existingRows.map((row) => [row.pnk, row]));
+
   const summary: BackfillSummary = {
     shopId: targetShopId,
     scanned: 0,
     updated: 0,
     errors: [],
+    transitions: emptyTransitionStats(),
+    changeSamples: [],
     samples: [],
   };
 
@@ -118,13 +210,34 @@ async function backfillShop(targetShopId: number): Promise<BackfillSummary> {
         const update = buildUpdateData(targetShopId, creds.region, item);
         if (!update) continue;
         summary.scanned++;
+
+        const existing = existingByPnk.get(update.pnk);
+        const oldLinkType = existing?.emagLinkType ?? null;
+        recordTransition(summary.transitions, oldLinkType, update.linkTypeResult.linkType);
+
+        if (
+          summary.changeSamples.length < 5
+          && oldLinkType !== update.linkTypeResult.linkType
+        ) {
+          summary.changeSamples.push({
+            pnk: update.pnk,
+            sku: update.sku ?? existing?.sku ?? existing?.vendorSku ?? null,
+            brand: update.brand,
+            ownership: update.ownership,
+            oldLinkType,
+            newLinkType: update.linkTypeResult.linkType,
+            reason: update.linkTypeResult.linkTypeReason,
+          });
+        }
+
         if (summary.samples.length < 8) summary.samples.push(update.sample);
+
         if (!dryRun) {
-          await prisma.storeProduct.updateMany({
+          const result = await prisma.storeProduct.updateMany({
             where: { shopId: targetShopId, pnk: update.pnk, isArchived: false },
             data: update.data,
           });
-          summary.updated++;
+          summary.updated += result.count;
         }
       } catch (err) {
         summary.errors.push(`page=${page}: ${err instanceof Error ? err.message : String(err)}`);
@@ -136,6 +249,18 @@ async function backfillShop(targetShopId: number): Promise<BackfillSummary> {
   }
 
   return summary;
+}
+
+function printDryRunReport(summary: BackfillSummary): void {
+  const t = summary.transitions;
+  console.log('\n=== EmagLinkType Backfill DRY-RUN 报告 ===');
+  console.log(`shopId=${summary.shopId} scanned=${summary.scanned} errors=${summary.errors.length}`);
+  console.log(`SELF_BUILT → RESELL: ${t.selfBuiltToResell}`);
+  console.log(`RESELL → OWN_BRAND_RESELL: ${t.resellToOwnBrandResell}`);
+  console.log(`→ UNKNOWN（任意旧值）: ${t.toUnknown}`);
+  console.log(`任意 linkType 变化总数: ${t.anyChange}`);
+  console.log('\n--- 变化抽样（最多 5 条）---');
+  console.log(JSON.stringify(summary.changeSamples, null, 2));
 }
 
 async function main() {
@@ -155,6 +280,9 @@ async function main() {
   for (const shop of shops) {
     const summary = await backfillShop(shop.id);
     console.log(`[EmagLinkType] shopId=${summary.shopId} scanned=${summary.scanned} updated=${summary.updated} errors=${summary.errors.length}`);
+    if (dryRun) {
+      printDryRunReport(summary);
+    }
     console.log('[EmagLinkType] samples:', JSON.stringify(summary.samples, null, 2));
     if (summary.errors.length > 0) {
       console.warn('[EmagLinkType] errors:', summary.errors.slice(0, 10).join(' | '));
