@@ -20,8 +20,10 @@ const PRODUCT_OFFER_TIMEOUT = 180_000;
 
 const shopArg = process.argv.find((arg) => arg.startsWith('--shopId='));
 const dryRunArg = process.argv.find((arg) => arg.startsWith('--dryRun='));
+const allEmagShopsArg = process.argv.find((arg) => arg.startsWith('--allEmagShops='));
 const fixMode = process.argv.includes('--fix');
 const shopId = shopArg ? Number(shopArg.split('=')[1]) : undefined;
+const allEmagShops = allEmagShopsArg ? allEmagShopsArg.split('=')[1] === 'true' : false;
 const dryRun = dryRunArg ? dryRunArg.split('=')[1] !== 'false' : !fixMode;
 
 type ChangeSample = {
@@ -53,6 +55,8 @@ type TransitionStats = {
 
 type BackfillSummary = {
   shopId: number;
+  shopName: string;
+  region: string;
   scanned: number;
   updated: number;
   errors: string[];
@@ -131,6 +135,7 @@ function buildUpdateData(shopId: number, region: EmagRegion, raw: Record<string,
   const compactOfferMeta = {
     ownership: np.ownership,
     brand: np.brand,
+    brandSource: np.brand ? 'API' as const : 'EMPTY' as const,
     linkTypeReason: linkTypeResult.linkTypeReason,
     numberOfOffers: np.numberOfOffers,
     bestOfferSalePrice: np.bestOfferSalePrice,
@@ -171,7 +176,10 @@ function buildUpdateData(shopId: number, region: EmagRegion, raw: Record<string,
   };
 }
 
-async function backfillShop(targetShopId: number): Promise<BackfillSummary> {
+async function backfillShop(
+  targetShopId: number,
+  shopMeta: { shopName: string; region: string },
+): Promise<BackfillSummary> {
   const creds = await getEmagCredentials(targetShopId);
   const existingRows = await prisma.storeProduct.findMany({
     where: { shopId: targetShopId, isArchived: false },
@@ -181,6 +189,8 @@ async function backfillShop(targetShopId: number): Promise<BackfillSummary> {
 
   const summary: BackfillSummary = {
     shopId: targetShopId,
+    shopName: shopMeta.shopName,
+    region: shopMeta.region,
     scanned: 0,
     updated: 0,
     errors: [],
@@ -254,7 +264,10 @@ async function backfillShop(targetShopId: number): Promise<BackfillSummary> {
 function printDryRunReport(summary: BackfillSummary): void {
   const t = summary.transitions;
   console.log('\n=== EmagLinkType Backfill DRY-RUN 报告 ===');
-  console.log(`shopId=${summary.shopId} scanned=${summary.scanned} errors=${summary.errors.length}`);
+  console.log(
+    `shopId=${summary.shopId} shopName=${summary.shopName} region=${summary.region} ` +
+    `scanned=${summary.scanned} errors=${summary.errors.length}`,
+  );
   console.log(`SELF_BUILT → RESELL: ${t.selfBuiltToResell}`);
   console.log(`RESELL → OWN_BRAND_RESELL: ${t.resellToOwnBrandResell}`);
   console.log(`→ UNKNOWN（任意旧值）: ${t.toUnknown}`);
@@ -267,26 +280,93 @@ async function main() {
   if (shopArg && (!Number.isInteger(shopId) || shopId! <= 0)) {
     throw new Error(`shopId 无效：${shopArg}`);
   }
+  if (shopId && allEmagShops) {
+    throw new Error('不能同时指定 --shopId 与 --allEmagShops=true');
+  }
+  if (!shopId && !allEmagShops) {
+    throw new Error('请指定 --shopId=xxx 或 --allEmagShops=true');
+  }
 
   const shops = shopId
-    ? [{ id: shopId }]
+    ? await prisma.shopAuthorization.findMany({
+        where: { id: shopId },
+        select: { id: true, shopName: true, region: true },
+      })
     : await prisma.shopAuthorization.findMany({
         where: { platform: { equals: 'emag', mode: 'insensitive' }, status: 'active' },
-        select: { id: true },
+        select: { id: true, shopName: true, region: true },
         orderBy: { id: 'asc' },
       });
 
-  console.log(`[EmagLinkType] mode=${dryRun ? 'DRY_RUN' : 'FIX'} shops=${shops.map((s) => s.id).join(',')}`);
+  if (shops.length === 0) {
+    throw new Error(shopId ? `shopId=${shopId} 不存在` : '无 active eMAG 店铺');
+  }
+
+  console.log(
+    `[EmagLinkType] mode=${dryRun ? 'DRY_RUN' : 'FIX'} shops=${shops.map((s) => s.id).join(',')}`,
+  );
+
+  const allSummaries: BackfillSummary[] = [];
   for (const shop of shops) {
-    const summary = await backfillShop(shop.id);
-    console.log(`[EmagLinkType] shopId=${summary.shopId} scanned=${summary.scanned} updated=${summary.updated} errors=${summary.errors.length}`);
-    if (dryRun) {
-      printDryRunReport(summary);
+    try {
+      const summary = await backfillShop(shop.id, {
+        shopName: shop.shopName,
+        region: shop.region,
+      });
+      allSummaries.push(summary);
+      console.log(
+        `[EmagLinkType] shopId=${summary.shopId} shopName=${summary.shopName} region=${summary.region} ` +
+        `scanned=${summary.scanned} updated=${summary.updated} errors=${summary.errors.length}`,
+      );
+      if (dryRun) {
+        printDryRunReport(summary);
+      }
+      if (summary.errors.length > 0) {
+        console.warn('[EmagLinkType] errors:', summary.errors.slice(0, 10).join(' | '));
+      }
+    } catch (err) {
+      console.error(
+        `[EmagLinkType] shopId=${shop.id} shopName=${shop.shopName} FAILED:`,
+        err instanceof Error ? err.message : err,
+      );
+      allSummaries.push({
+        shopId: shop.id,
+        shopName: shop.shopName,
+        region: shop.region,
+        scanned: 0,
+        updated: 0,
+        errors: [err instanceof Error ? err.message : String(err)],
+        transitions: emptyTransitionStats(),
+        changeSamples: [],
+        samples: [],
+      });
     }
-    console.log('[EmagLinkType] samples:', JSON.stringify(summary.samples, null, 2));
-    if (summary.errors.length > 0) {
-      console.warn('[EmagLinkType] errors:', summary.errors.slice(0, 10).join(' | '));
-    }
+  }
+
+  console.log('\n=== EmagLinkType Backfill 汇总 ===');
+  for (const s of allSummaries) {
+    const t = s.transitions;
+    console.log(
+      JSON.stringify({
+        shopId: s.shopId,
+        shopName: s.shopName,
+        region: s.region,
+        scanned: s.scanned,
+        updated: s.updated,
+        selfBuiltToResell: t.selfBuiltToResell,
+        resellToOwnBrandResell: t.resellToOwnBrandResell,
+        toUnknown: t.toUnknown,
+        anyChange: t.anyChange,
+        errors: s.errors.length,
+      }),
+    );
+  }
+
+  const shopsWithErrors = allSummaries.filter((s) => s.errors.length > 0);
+  if (!dryRun && shopsWithErrors.length > 0) {
+    console.warn(
+      `[EmagLinkType] 以下店铺存在错误: ${shopsWithErrors.map((s) => s.shopId).join(', ')}`,
+    );
   }
 }
 

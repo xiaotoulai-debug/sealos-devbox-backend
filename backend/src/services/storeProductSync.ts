@@ -37,6 +37,9 @@ const EAN_BATCH_SIZE = 100;
 const EAN_DELAY_MS = 200;
 const CATALOG_BATCH_SIZE = 50; // 第二阶段每批 SKU 数
 const CATALOG_DELAY_MS = 300;
+const BRAND_REPAIR_LIMIT = 200; // 同步后补偿：最多处理 brand 为空的产品数
+const BRAND_REPAIR_BATCH = 20;
+const BRAND_REPAIR_DELAY_MS = 1000;
 
 function normalizeBusinessKey(value: string | null | undefined): string | null {
   const trimmed = String(value ?? '').trim();
@@ -576,7 +579,132 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
   }
   console.log('');
 
+  try {
+    await repairMissingBrandAfterSync(creds);
+  } catch (repairErr) {
+    console.warn(
+      `[BrandRepair] shop=${creds.shopId} 补偿失败（不阻塞主同步）:`,
+      repairErr instanceof Error ? repairErr.message : repairErr,
+    );
+  }
+
   return result;
+}
+
+/**
+ * 同步后轻量补偿：仅处理当前店铺最近同步且 brand 为空的产品（limit 200），
+ * 通过 product_offer/read 按 PNK 批量补抓 brand，失败不阻塞主同步。
+ */
+async function repairMissingBrandAfterSync(creds: EmagCredentials): Promise<void> {
+  type MissingRow = {
+    id: number;
+    pnk: string;
+    emag_ownership: unknown;
+    emag_offer_meta: unknown;
+  };
+
+  const missingRows = await prisma.$queryRaw<MissingRow[]>`
+    SELECT id, pnk, emag_ownership, emag_offer_meta
+    FROM store_products
+    WHERE shop_id = ${creds.shopId}
+      AND is_archived = false
+      AND (
+        emag_offer_meta IS NULL
+        OR nullif(trim(emag_offer_meta->>'brand'), '') IS NULL
+      )
+    ORDER BY synced_at DESC
+    LIMIT ${BRAND_REPAIR_LIMIT}
+  `;
+
+  if (missingRows.length === 0) {
+    console.log(`[BrandRepair] shop=${creds.shopId} 无需补偿（无 brand 为空产品）`);
+    return;
+  }
+
+  let repaired = 0;
+  const errors: string[] = [];
+  const existingByPnk = new Map(missingRows.map((row) => [row.pnk, row]));
+
+  for (let i = 0; i < missingRows.length; i += BRAND_REPAIR_BATCH) {
+    const batchPnks = missingRows.slice(i, i + BRAND_REPAIR_BATCH).map((row) => row.pnk);
+    await new Promise((resolve) => setTimeout(resolve, BRAND_REPAIR_DELAY_MS));
+
+    try {
+      const res = await readProductOffers(
+        creds,
+        { part_number_key: batchPnks, itemsPerPage: batchPnks.length, currentPage: 1 },
+        { timeout: PRODUCT_OFFER_TIMEOUT },
+      );
+      if (res.isError) {
+        errors.push(`${batchPnks.join(',')}: ${res.messages?.join('; ') ?? 'eMAG API error'}`);
+        continue;
+      }
+
+      const raw = res.results as Record<string, unknown> | unknown[] | null;
+      const items = Array.isArray(raw) ? raw : ((raw as Record<string, unknown>)?.items ?? (raw as Record<string, unknown>)?.results ?? []);
+      if (!Array.isArray(items)) continue;
+
+      for (const item of items) {
+        const np = normalizeEmagProduct(item as Record<string, unknown>, creds.region, { logOutput: false });
+        if (!np.pnk) continue;
+
+        const existing = existingByPnk.get(np.pnk);
+        if (!existing) continue;
+
+        const { effectiveBrand, brandSource } = resolveEffectiveBrandForSync(np.brand, existing.emag_offer_meta);
+        if (!effectiveBrand) continue;
+
+        const effectiveOwnership = resolveEffectiveOwnershipForSync(np.ownership, existing.emag_ownership);
+        const linkTypeResult = inferEmagLinkType({
+          shopId: creds.shopId,
+          pnk: np.pnk,
+          rawApiData: { ownership: effectiveOwnership, brand: effectiveBrand },
+          publishLog: null,
+        });
+        const contentPermission = inferContentPermission(linkTypeResult.linkType);
+        const offerCompetition = inferOfferCompetition({ numberOfOffers: np.numberOfOffers });
+        const linkActionTips = inferLinkActionTips(linkTypeResult.linkType, offerCompetition.offerCompetitionType);
+        const compactOfferMeta = {
+          ownership: effectiveOwnership,
+          brand: effectiveBrand,
+          brandSource,
+          linkTypeReason: linkTypeResult.linkTypeReason,
+          numberOfOffers: np.numberOfOffers,
+          bestOfferSalePrice: np.bestOfferSalePrice,
+          mainOfferPrice: np.mainOfferPrice,
+          buyButtonRank: np.buyButtonRank,
+          partNumberKey: np.pnk,
+        };
+
+        await prisma.storeProduct.update({
+          where: { id: existing.id },
+          data: {
+            emagLinkType: linkTypeResult.linkType,
+            emagLinkTypeSource: linkTypeResult.linkTypeSource,
+            emagLinkTypeConfidence: linkTypeResult.linkTypeConfidence,
+            emagOwnership: effectiveOwnership === undefined || effectiveOwnership === null
+              ? Prisma.JsonNull
+              : effectiveOwnership as Prisma.InputJsonValue,
+            contentPermission: contentPermission.contentPermission,
+            numberOfOffers: offerCompetition.numberOfOffers,
+            offerCompetitionType: offerCompetition.offerCompetitionType,
+            linkActionTips: linkActionTips as Prisma.InputJsonValue,
+            emagOfferMeta: compactOfferMeta as Prisma.InputJsonValue,
+          },
+        });
+        repaired++;
+      }
+    } catch (err) {
+      errors.push(err instanceof Error ? err.message : String(err));
+    }
+  }
+
+  console.log(
+    `[BrandRepair] shop=${creds.shopId} candidates=${missingRows.length} repaired=${repaired} errors=${errors.length}`,
+  );
+  if (errors.length > 0) {
+    console.warn('[BrandRepair] sample errors:', errors.slice(0, 5).join(' | '));
+  }
 }
 
 /**
