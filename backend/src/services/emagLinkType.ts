@@ -330,9 +330,48 @@ export function inferLinkActionTips(linkType: EmagLinkType, offerCompetitionType
   return ['确认链接来源', '检查资料权限'];
 }
 
+export type BrandSource = 'API' | 'EXISTING_META' | 'EMPTY';
+
 export function resolveBrandFromOfferMeta(meta: unknown): string | null {
   if (!meta || typeof meta !== 'object' || Array.isArray(meta)) return null;
   return normalizeBrand((meta as Record<string, unknown>).brand);
+}
+
+/** 只读已有 emagOfferMeta.brand，兼容 null / 非对象 / 数组 */
+export function getExistingOfferMetaBrand(meta: unknown): string | null {
+  return resolveBrandFromOfferMeta(meta);
+}
+
+/** 只读已有 emagOfferMeta.linkTypeReason，兼容 null / 非对象 / 数组 */
+export function getExistingLinkTypeReason(meta: unknown): LinkTypeReason | null {
+  return resolveLinkTypeReasonFromOfferMeta(meta);
+}
+
+/**
+ * 同步时合并 brand：API 有值优先；API 为空则保留 DB 已有 brand，禁止写 null 覆盖。
+ */
+export function resolveEffectiveBrandForSync(
+  apiBrand: unknown,
+  existingMeta: unknown,
+): { effectiveBrand: string | null; brandSource: BrandSource } {
+  const normalizedApi = normalizeBrand(apiBrand);
+  if (normalizedApi) {
+    return { effectiveBrand: normalizedApi, brandSource: 'API' };
+  }
+  const existingBrand = getExistingOfferMetaBrand(existingMeta);
+  if (existingBrand) {
+    return { effectiveBrand: existingBrand, brandSource: 'EXISTING_META' };
+  }
+  return { effectiveBrand: null, brandSource: 'EMPTY' };
+}
+
+/** 同步时合并 ownership：本次 API 有值优先，否则回退 DB 已有 emagOwnership */
+export function resolveEffectiveOwnershipForSync(
+  apiOwnership: unknown,
+  existingOwnership: unknown,
+): unknown {
+  if (apiOwnership !== undefined && apiOwnership !== null) return apiOwnership;
+  return existingOwnership ?? null;
 }
 
 export function resolveLinkTypeReasonFromOfferMeta(meta: unknown): LinkTypeReason | null {

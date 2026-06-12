@@ -20,6 +20,8 @@ import {
   inferEmagLinkType,
   inferLinkActionTips,
   inferOfferCompetition,
+  resolveEffectiveBrandForSync,
+  resolveEffectiveOwnershipForSync,
 } from './emagLinkType';
 import { inferBuyBoxStatus } from './emagBuyBox';
 
@@ -183,14 +185,54 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
       }
     }
 
-    // 逐条规范化 + upsert
+    // 批量预取本页已有记录，避免逐条查 DB（brand/ownership merge 用）
+    const normalizedBatch: Array<{ raw: Record<string, unknown>; np: ReturnType<typeof normalizeEmagProduct> }> = [];
     for (const o of batch) {
+      const np = normalizeEmagProduct(o as Record<string, unknown>, creds.region, {
+        logOutput: pipelineLogCount < PIPELINE_LOG_LIMIT,
+      });
+      if (pipelineLogCount < PIPELINE_LOG_LIMIT) pipelineLogCount++;
+      if (!np.pnk) continue;
+      normalizedBatch.push({ raw: o as Record<string, unknown>, np });
+    }
+
+    const existingByPnk = new Map<string, {
+      id: number;
+      pnk: string;
+      shopId: number;
+      emagLinkType: string | null;
+      emagLinkTypeConfidence: string | null;
+      emagOwnership: unknown;
+      emagOfferMeta: unknown;
+    }>();
+    if (normalizedBatch.length > 0) {
+      const existingRows = await prisma.storeProduct.findMany({
+        where: {
+          shopId: creds.shopId,
+          isArchived: false,
+          pnk: { in: normalizedBatch.map(({ np }) => np.pnk) },
+        },
+        select: {
+          id: true,
+          pnk: true,
+          shopId: true,
+          emagLinkType: true,
+          emagLinkTypeConfidence: true,
+          emagOwnership: true,
+          emagOfferMeta: true,
+        },
+      });
+      for (const row of existingRows) {
+        existingByPnk.set(row.pnk, row);
+      }
+    }
+
+    // 逐条 upsert（brand/ownership 已与 DB 合并）
+    for (const { np } of normalizedBatch) {
       try {
-        const np = normalizeEmagProduct(o as Record<string, unknown>, creds.region, {
-          logOutput: pipelineLogCount < PIPELINE_LOG_LIMIT,
-        });
-        if (pipelineLogCount < PIPELINE_LOG_LIMIT) pipelineLogCount++;
-        if (!np.pnk) continue;
+        const existing = existingByPnk.get(np.pnk);
+        const { effectiveBrand, brandSource } = resolveEffectiveBrandForSync(np.brand, existing?.emagOfferMeta);
+        const effectiveOwnership = resolveEffectiveOwnershipForSync(np.ownership, existing?.emagOwnership);
 
         // 引擎一（JSON）+ 引擎二（EAN API）合并
         const firstEan = np.ean ? String(np.ean).split(/[,\s]+/)[0]?.trim() : null;
@@ -202,7 +244,7 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
         const linkTypeResult = inferEmagLinkType({
           shopId: creds.shopId,
           pnk: np.pnk,
-          rawApiData: { ownership: np.ownership, brand: np.brand },
+          rawApiData: { ownership: effectiveOwnership, brand: effectiveBrand },
           publishLog: null,
         });
         const contentPermission = inferContentPermission(linkTypeResult.linkType);
@@ -219,8 +261,9 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
           numberOfOffers: np.numberOfOffers,
         });
         const compactOfferMeta = {
-          ownership: np.ownership,
-          brand: np.brand,
+          ownership: effectiveOwnership,
+          brand: effectiveBrand,
+          brandSource,
           linkTypeReason: linkTypeResult.linkTypeReason,
           numberOfOffers: np.numberOfOffers,
           bestOfferSalePrice: np.bestOfferSalePrice,
@@ -279,7 +322,9 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
           emagLinkType: linkTypeResult.linkType,
           emagLinkTypeSource: linkTypeResult.linkTypeSource,
           emagLinkTypeConfidence: linkTypeResult.linkTypeConfidence,
-          emagOwnership: np.ownership === undefined ? Prisma.JsonNull : np.ownership as Prisma.InputJsonValue,
+          emagOwnership: effectiveOwnership === undefined || effectiveOwnership === null
+            ? Prisma.JsonNull
+            : effectiveOwnership as Prisma.InputJsonValue,
           contentPermission: contentPermission.contentPermission,
           numberOfOffers: offerCompetition.numberOfOffers,
           offerCompetitionType: offerCompetition.offerCompetitionType,
@@ -318,7 +363,7 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
         }
         result.upserted++;
       } catch (e) {
-        const pnk = o?.part_number_key ?? o?.part_number ?? o?.pnk ?? '(unknown)';
+        const pnk = np.pnk ?? '(unknown)';
         const errMsg = e instanceof Error ? e.message : String(e);
         result.errors.push(`${pnk}: ${errMsg}`);
         console.error(`[storeProductSync] Skip broken item PNK=${pnk}:`, e);
