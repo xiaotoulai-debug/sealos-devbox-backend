@@ -32,6 +32,7 @@ model User {
   dailyReminderChecks DailyReminderCheck[]
   updatedWorkdayCalendars WorkdayCalendar[] @relation("WorkdayCalendarUpdatedBy")
   employeeWeeklyAiSummaries EmployeeWeeklyAiSummary[]
+  employeeWeeklyPlans       EmployeeWeeklyPlan[]
   role           Role       @relation(fields: [roleId], references: [id])
 
   @@map("users")
@@ -601,6 +602,25 @@ model EmployeeWeeklyAiSummary {
   @@index([userId, weekStart, status])
   @@index([status, weekStart])
   @@map("employee_weekly_ai_summaries")
+}
+
+/// 员工每周自填：下周计划与问题（供 AI 周报参考）
+model EmployeeWeeklyPlan {
+  id            Int       @id @default(autoincrement())
+  userId        Int       @map("user_id")
+  weekStart     DateTime  @map("week_start") @db.Date
+  nextWeekPlan  String    @default("") @map("next_week_plan") @db.Text
+  problems      String    @default("") @map("problems") @db.Text
+  supportNeeded String    @default("") @map("support_needed") @db.Text
+  submittedAt   DateTime? @map("submitted_at")
+  createdAt     DateTime  @default(now()) @map("created_at")
+  updatedAt     DateTime  @updatedAt @map("updated_at")
+
+  user User @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, weekStart])
+  @@index([weekStart])
+  @@map("employee_weekly_plans")
 }
 
 /// 全年工作日日历：管理员维护工作日/休息日/待定，用于日报缺失统计

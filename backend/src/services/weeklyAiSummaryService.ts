@@ -4,6 +4,10 @@ import { EmployeeWeeklyAiSummaryStatus, Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
 import { JwtPayload } from '../middleware/auth';
 import { buildRuleWeeklySummary, normalizeWeekStartInput, RuleWeeklySummary } from './employeeTaskService';
+import {
+  loadEmployeeWeeklyPlanForSourcePayload,
+  type EmployeeWeeklyPlanSourceSlice,
+} from './employeeWeeklyPlanService';
 
 function createConcurrencyLimiter(maxConcurrency: number) {
   let activeCount = 0;
@@ -33,13 +37,63 @@ function createConcurrencyLimiter(maxConcurrency: number) {
 
 const globalLimit = createConcurrencyLimiter(Number(process.env.WEEKLY_AI_CONCURRENCY ?? 2));
 
+const AI_TASK_LIMIT = 5;
+const AI_NOTE_LIMIT = 10;
+const RAW_TEXT_MAX = 8000;
+/** 仅防异常超长 AI 响应撑爆接口，不用于业务展示截断；正常内容不应触达 */
+const AI_WEEKLY_TECHNICAL_MAX_ITEMS = 20;
+const AI_WEEKLY_TECHNICAL_MAX_TEXT_LENGTH = 2000;
+const NO_DATA_TEXT = '暂无有效数据';
+
+const FORBIDDEN_AI_FIELDS = [
+  'review', 'nextActions', 'suggestionText', 'content', 'markdown',
+  'overview', 'highlights', 'risks', 'completionAnalysis', 'nextWeekSuggestions', 'managerNote',
+];
+
+const inflight = new Map<string, Promise<WeeklySummaryWithAi>>();
+
+const SYSTEM_PROMPT = `你是员工周报助手。输入 JSON 为 sourcePayload，含：日报登记、收到任务、发起/指派任务、协同任务、员工自填的 employeeWeeklyPlan（下周计划/问题/需协助）。
+禁止编造销售/GMV/利润数据（meta.hasSalesData=false）。无相关数据时 summary 写「暂无有效数据」，items 为 []。
+
+只输出 JSON 对象，且 ONLY 3 个顶层字段：
+{
+  "completed":  { "summary": string, "items": string[] },
+  "unfinished": { "summary": string, "items": string[] },
+  "nextFocus":  { "summary": string, "items": string[] }
+}
+
+规则：
+- completed：上周已完成事项（已完成任务、已提交日报、已推进协同/指派任务）
+- unfinished：上周未完成事项（未完成任务、延期任务、日报缺失、阻塞项）；若 employeeWeeklyPlan.problems 或 supportNeeded 有内容，须结合任务数据体现，不要忽略
+- nextFocus：基于 unfinished 与 employeeWeeklyPlan.nextWeekPlan 推导本周优先动作；结合 problems/supportNeeded 转为可执行建议，不要只复述员工原文；若计划不合理可温和指出重点
+- 若 employeeWeeklyPlan 有内容，必须结合员工自填的下周计划、问题、需协助事项，并与任务完成情况交叉验证
+- summary：用 1-2 句话完整概括，不要写成长篇作文，第一人称「我」
+- items：用编号要点表达，建议 3-5 条；每条表达完整，不要为了压缩而省略关键信息，必须是可核对事实
+- 禁止空话：「继续努力」「保持沟通」「加强协作」等
+- 三块之间禁止重复表达
+- 禁止 Markdown、禁止解释文字、禁止额外字段
+- 使用简体中文`;
+
+export type AiSummarySection = {
+  summary: string;
+  items: string[];
+};
+
 export type AiSummaryJson = {
-  overview: string;
-  highlights: string[];
-  risks: string[];
-  completionAnalysis: string;
-  nextWeekSuggestions: string[];
-  managerNote: string;
+  completed: AiSummarySection;
+  unfinished: AiSummarySection;
+  nextFocus: AiSummarySection;
+};
+
+export type AiReportSource = 'AI' | 'RULE_FALLBACK' | null;
+
+export type AiReportView = {
+  id: number | null;
+  employee: { id: number; name: string };
+  period: { start: string; end: string };
+  generatedAt: string | null;
+  sections: AiSummaryJson | null;
+  source: AiReportSource;
 };
 
 export type WeeklySummaryWithAi = RuleWeeklySummary & {
@@ -47,39 +101,67 @@ export type WeeklySummaryWithAi = RuleWeeklySummary & {
   aiGeneratedAt: string | null;
   aiSummary: AiSummaryJson | null;
   aiErrorMessage: string | null;
+  aiReport: AiReportView;
 };
-
-const AI_TASK_LIMIT = 5;
-const AI_NOTE_LIMIT = 10;
-const RAW_TEXT_MAX = 8000;
-const FORBIDDEN_AI_FIELDS = ['review', 'nextActions', 'suggestionText', 'content', 'markdown'];
-
-const inflight = new Map<string, Promise<WeeklySummaryWithAi>>();
-
-const SYSTEM_PROMPT = `你是「员工本人周报助手」，帮助员工基于结构化工作数据撰写上周个人复盘周报。
-输入 JSON 中的 sourcePayload 仅包含：每日日报登记、我收到的任务、我发起/指派的任务、我参与的协同任务。不包含任何销售额、订单量、利润、GMV、转化率等销售或平台业绩数据（meta.hasSalesData=false）。
-严禁推测、编造或引用任何销售表现；若数据中没有某项，不要提及。
-
-写作视角：
-- overview、highlights、risks、completionAnalysis、nextWeekSuggestions 必须使用第一人称「我」，以员工本人口吻复盘。
-- 禁止使用「该员工」「他/她」「员工表现」等第三人称表述。
-- 仅 managerNote 可使用克制的主管视角，给主管简短管理提醒。
-
-字段含义：
-- overview：我上周整体复盘，覆盖日报、收到任务、协同任务、指派任务。
-- highlights：自我表扬；若无明显亮点，如实写「本周暂未形成明显完成亮点，需要下周补齐基础动作」，不要硬夸。
-- risks：自我批评与风险，含日报缺失、任务逾期、未完成、协同停滞、指派任务未推进等。
-- completionAnalysis：明确判断我本周完成情况（完成较好/一般/较差），并给出数据依据。
-- nextWeekSuggestions：下周可执行的具体动作，如每天几点前提交日报、优先完成哪些任务、跟进协同、检查指派任务推进。
-- managerNote：给主管的简短提醒，可提示是否需要介入、一对一沟通或拆解任务。
-
-必须严格返回 JSON 对象，且只包含以下 6 个字段：
-overview(string)、highlights(string[])、risks(string[])、completionAnalysis(string)、nextWeekSuggestions(string[])、managerNote(string)。
-禁止返回 review、nextActions、suggestionText、content、markdown 或其他字段。
-使用简体中文，语气专业简洁。`;
 
 function dateStringToDbDate(date: string): Date {
   return new Date(`${date}T00:00:00.000Z`);
+}
+
+/** trim + 极端超长安全兜底（silent slice，不加省略号） */
+function sanitizeText(text: string): string {
+  const trimmed = String(text ?? '').trim();
+  if (!trimmed) return '';
+  if (trimmed.length > AI_WEEKLY_TECHNICAL_MAX_TEXT_LENGTH) {
+    return trimmed.slice(0, AI_WEEKLY_TECHNICAL_MAX_TEXT_LENGTH);
+  }
+  return trimmed;
+}
+
+export function isV3SummaryJson(json: unknown): json is AiSummaryJson {
+  if (!json || typeof json !== 'object' || Array.isArray(json)) return false;
+  const obj = json as Record<string, unknown>;
+  return ['completed', 'unfinished', 'nextFocus'].every((key) => {
+    const section = obj[key];
+    if (!section || typeof section !== 'object' || Array.isArray(section)) return false;
+    const s = section as Record<string, unknown>;
+    return typeof s.summary === 'string' && Array.isArray(s.items) && s.items.every((i) => typeof i === 'string');
+  });
+}
+
+function normalizeSection(raw: unknown): AiSummarySection {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return { summary: NO_DATA_TEXT, items: [] };
+  }
+  const obj = raw as Record<string, unknown>;
+  let summary = typeof obj.summary === 'string' ? obj.summary.trim() : '';
+  if (!summary) summary = NO_DATA_TEXT;
+  else summary = sanitizeText(summary) || NO_DATA_TEXT;
+
+  const items = Array.isArray(obj.items)
+    ? obj.items
+      .map((item) => sanitizeText(typeof item === 'string' ? item : String(item ?? '')))
+      .filter(Boolean)
+      .slice(0, AI_WEEKLY_TECHNICAL_MAX_ITEMS)
+    : [];
+
+  return { summary, items };
+}
+
+export function normalizeAiSummaryJson(raw: unknown): AiSummaryJson {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) {
+    return {
+      completed: { summary: NO_DATA_TEXT, items: [] },
+      unfinished: { summary: NO_DATA_TEXT, items: [] },
+      nextFocus: { summary: NO_DATA_TEXT, items: [] },
+    };
+  }
+  const obj = raw as Record<string, unknown>;
+  return {
+    completed: normalizeSection(obj.completed),
+    unfinished: normalizeSection(obj.unfinished),
+    nextFocus: normalizeSection(obj.nextFocus),
+  };
 }
 
 export function isWeeklyAiEnabled(): boolean {
@@ -90,7 +172,7 @@ function getAiConfig() {
   return {
     provider: process.env.WEEKLY_AI_PROVIDER ?? 'deepseek',
     model: process.env.DEEPSEEK_MODEL ?? 'deepseek-chat',
-    promptVersion: process.env.WEEKLY_AI_PROMPT_VERSION ?? 'v2',
+    promptVersion: process.env.WEEKLY_AI_PROMPT_VERSION ?? 'v3.3',
     timeoutMs: Number(process.env.WEEKLY_AI_TIMEOUT_MS ?? 25000),
     baseUrl: (process.env.DEEPSEEK_BASE_URL ?? 'https://api.deepseek.com').replace(/\/$/, ''),
   };
@@ -168,6 +250,7 @@ export async function buildAiSourcePayload(user: JwtPayload, ruleSummary: RuleWe
 
   const daily = ruleSummary.dailyReportSummary;
   const cfg = getAiConfig();
+  const employeeWeeklyPlan = await loadEmployeeWeeklyPlanForSourcePayload(user.userId, ruleSummary.weekStart);
   return {
     user: {
       userId: user.userId,
@@ -192,6 +275,7 @@ export async function buildAiSourcePayload(user: JwtPayload, ruleSummary: RuleWe
       ...slimTaskSummary(ruleSummary.collaborationTaskSummary),
       sampleTasks: ruleSummary.collaborationSampleTasks,
     },
+    employeeWeeklyPlan,
     meta: {
       promptVersion: cfg.promptVersion,
       hasSalesData: false,
@@ -215,40 +299,17 @@ function parseAiSummaryJson(raw: string): AiSummaryJson {
       throw new Error(`AI 返回禁止字段: ${key}`);
     }
   }
-  const overview = obj.overview;
-  const highlights = obj.highlights;
-  const risks = obj.risks;
-  const completionAnalysis = obj.completionAnalysis;
-  const nextWeekSuggestions = obj.nextWeekSuggestions;
-  const managerNote = obj.managerNote;
-
-  if (typeof overview !== 'string' || !overview.trim()) {
-    throw new Error('AI 返回 overview 无效');
+  for (const key of ['completed', 'unfinished', 'nextFocus']) {
+    if (!(key in obj)) {
+      throw new Error(`AI 返回缺少字段: ${key}`);
+    }
   }
-  if (typeof completionAnalysis !== 'string' || !completionAnalysis.trim()) {
-    throw new Error('AI 返回 completionAnalysis 无效');
-  }
-  if (typeof managerNote !== 'string') {
-    throw new Error('AI 返回 managerNote 无效');
-  }
-  if (!Array.isArray(highlights) || !highlights.every((item) => typeof item === 'string')) {
-    throw new Error('AI 返回 highlights 无效');
-  }
-  if (!Array.isArray(risks) || !risks.every((item) => typeof item === 'string')) {
-    throw new Error('AI 返回 risks 无效');
-  }
-  if (!Array.isArray(nextWeekSuggestions) || !nextWeekSuggestions.every((item) => typeof item === 'string')) {
-    throw new Error('AI 返回 nextWeekSuggestions 无效');
+  const extraKeys = Object.keys(obj).filter((k) => !['completed', 'unfinished', 'nextFocus'].includes(k));
+  if (extraKeys.length > 0) {
+    throw new Error(`AI 返回额外字段: ${extraKeys.join(',')}`);
   }
 
-  return {
-    overview: overview.trim(),
-    highlights,
-    risks,
-    completionAnalysis: completionAnalysis.trim(),
-    nextWeekSuggestions,
-    managerNote: managerNote.trim(),
-  };
+  return normalizeAiSummaryJson(parsed);
 }
 
 function sanitizeRawText(raw: string): string {
@@ -268,6 +329,136 @@ function safeErrorMessage(err: unknown): string {
   return 'AI 生成失败';
 }
 
+function collectTaskTitles(
+  summaries: TaskSummarySlice[],
+  kind: 'done' | 'pending' | 'overdue',
+): string[] {
+  const items: string[] = [];
+  for (const summary of summaries) {
+    const list = kind === 'done'
+      ? summary.doneTasks
+      : kind === 'overdue'
+        ? summary.overdueTasks
+        : summary.pendingTasks;
+    for (const task of list ?? []) {
+      const title = sanitizeText(String(task?.title ?? ''));
+      if (title && !items.includes(title)) items.push(title);
+      if (items.length >= AI_WEEKLY_TECHNICAL_MAX_ITEMS) return items;
+    }
+  }
+  return items;
+}
+
+export function buildRuleFallbackSections(
+  ruleSummary: RuleWeeklySummary,
+  employeeWeeklyPlan?: EmployeeWeeklyPlanSourceSlice,
+): AiSummaryJson {
+  const received = ruleSummary.receivedTaskSummary;
+  const created = ruleSummary.createdTaskSummary;
+  const collaboration = ruleSummary.collaborationTaskSummary;
+  const daily = ruleSummary.dailyReportSummary;
+
+  const doneItems = collectTaskTitles([received, created, collaboration], 'done');
+  if (daily.submittedDays > 0) {
+    const note = sanitizeText(`已提交日报${daily.submittedDays}天`);
+    if (note && !doneItems.includes(note) && doneItems.length < AI_WEEKLY_TECHNICAL_MAX_ITEMS) {
+      doneItems.push(note);
+    }
+  }
+
+  let completedSummary = NO_DATA_TEXT;
+  if (doneItems.length > 0 || received.doneCount + created.doneCount + collaboration.doneCount > 0) {
+    const totalDone = received.doneCount + created.doneCount + collaboration.doneCount;
+    completedSummary = sanitizeText(`上周共完成${totalDone}项任务`) || NO_DATA_TEXT;
+  }
+
+  const unfinishedItems: string[] = [];
+  if (daily.missingDays > 0) {
+    unfinishedItems.push(sanitizeText(`日报缺失${daily.missingDays}天`));
+  }
+  for (const title of collectTaskTitles([received, created, collaboration], 'overdue')) {
+    if (unfinishedItems.length >= AI_WEEKLY_TECHNICAL_MAX_ITEMS) break;
+    if (!unfinishedItems.includes(title)) unfinishedItems.push(title);
+  }
+  for (const title of collectTaskTitles([received, created, collaboration], 'pending')) {
+    if (unfinishedItems.length >= AI_WEEKLY_TECHNICAL_MAX_ITEMS) break;
+    if (!unfinishedItems.includes(title)) unfinishedItems.push(title);
+  }
+
+  let unfinishedSummary = NO_DATA_TEXT;
+  const totalPending = received.pendingCount + created.pendingCount + collaboration.pendingCount;
+  const totalOverdue = received.overdueCount + created.overdueCount + collaboration.overdueCount;
+  if (unfinishedItems.length > 0 || totalPending > 0 || totalOverdue > 0) {
+    unfinishedSummary = sanitizeText(
+      totalOverdue > 0
+        ? `仍有${totalPending}项待办、${totalOverdue}项逾期`
+        : `仍有${totalPending}项待办`,
+    ) || NO_DATA_TEXT;
+  }
+
+  const nextItems = (ruleSummary.planSuggestions ?? [])
+    .map((s) => sanitizeText(s))
+    .filter(Boolean);
+
+  const plan = employeeWeeklyPlan ?? {
+    nextWeekPlan: '',
+    problems: '',
+    supportNeeded: '',
+    submittedAt: null,
+  };
+  if (plan.problems) {
+    const t = sanitizeText(`本周问题：${plan.problems}`);
+    if (t && !unfinishedItems.includes(t)) unfinishedItems.push(t);
+  }
+  if (plan.supportNeeded) {
+    const t = sanitizeText(`需主管协助：${plan.supportNeeded}`);
+    if (t && !unfinishedItems.includes(t)) unfinishedItems.push(t);
+  }
+
+  const nextFromPlan = [
+    plan.nextWeekPlan ? sanitizeText(`员工计划：${plan.nextWeekPlan}`) : '',
+    ...nextItems,
+  ].filter(Boolean).slice(0, AI_WEEKLY_TECHNICAL_MAX_ITEMS);
+
+  let nextFocusSummary = NO_DATA_TEXT;
+  if (nextFromPlan.length > 0) {
+    nextFocusSummary = sanitizeText('本周按以下重点推进') || NO_DATA_TEXT;
+  }
+
+  return normalizeAiSummaryJson({
+    completed: { summary: completedSummary, items: doneItems },
+    unfinished: { summary: unfinishedSummary, items: unfinishedItems.slice(0, AI_WEEKLY_TECHNICAL_MAX_ITEMS) },
+    nextFocus: { summary: nextFocusSummary, items: nextFromPlan },
+  });
+}
+
+function buildAiReportView(params: {
+  user: JwtPayload;
+  employeeName: string;
+  ruleSummary: RuleWeeklySummary;
+  cacheId: number | null;
+  sections: AiSummaryJson | null;
+  generatedAt: string | null;
+  source: AiReportSource;
+}): AiReportView {
+  return {
+    id: params.cacheId,
+    employee: { id: params.user.userId, name: params.employeeName },
+    period: { start: params.ruleSummary.weekStart, end: params.ruleSummary.weekEnd },
+    generatedAt: params.generatedAt,
+    sections: params.sections,
+    source: params.source,
+  };
+}
+
+async function resolveEmployeeName(user: JwtPayload): Promise<string> {
+  const dbUser = await prisma.user.findUnique({
+    where: { id: user.userId },
+    select: { name: true },
+  });
+  return dbUser?.name ?? user.username;
+}
+
 function isReusableCache(
   cache: { status: EmployeeWeeklyAiSummaryStatus; sourceHash: string; summaryJson: unknown } | null,
   sourceHash: string,
@@ -275,13 +466,16 @@ function isReusableCache(
   if (!cache) return false;
   return (
     cache.status === EmployeeWeeklyAiSummaryStatus.READY &&
-    cache.sourceHash === sourceHash
+    cache.sourceHash === sourceHash &&
+    isV3SummaryJson(cache.summaryJson)
   );
 }
 
-function attachCacheToSummary(
+async function attachCacheToSummary(
+  user: JwtPayload,
   ruleSummary: RuleWeeklySummary,
   cache: {
+    id?: number;
     status: EmployeeWeeklyAiSummaryStatus;
     sourceHash: string;
     summaryJson: unknown;
@@ -289,58 +483,106 @@ function attachCacheToSummary(
     errorMessage: string | null;
   } | null,
   sourceHash: string,
-): WeeklySummaryWithAi {
-  const base = {
-    ...ruleSummary,
+  employeeName?: string,
+): Promise<WeeklySummaryWithAi> {
+  const name = employeeName ?? await resolveEmployeeName(user);
+  const employeeWeeklyPlan = await loadEmployeeWeeklyPlanForSourcePayload(user.userId, ruleSummary.weekStart);
+  const fallbackSections = buildRuleFallbackSections(ruleSummary, employeeWeeklyPlan);
+
+  const baseReport = (sections: AiSummaryJson | null, source: AiReportSource, generatedAt: string | null) =>
+    buildAiReportView({
+      user,
+      employeeName: name,
+      ruleSummary,
+      cacheId: cache?.id ?? null,
+      sections,
+      generatedAt,
+      source,
+    });
+
+  const empty = {
     aiGeneratedAt: null as string | null,
     aiSummary: null as AiSummaryJson | null,
     aiErrorMessage: null as string | null,
+    aiReport: baseReport(null, null, null),
   };
 
   if (!cache) {
-    return { ...base, aiStatus: 'RULE_ONLY' };
+    return { ...ruleSummary, ...empty, aiStatus: 'RULE_ONLY' };
   }
 
   if (cache.status === EmployeeWeeklyAiSummaryStatus.READY && cache.sourceHash === sourceHash) {
+    if (isV3SummaryJson(cache.summaryJson)) {
+      const sections = normalizeAiSummaryJson(cache.summaryJson);
+      const generatedAt = cache.generatedAt?.toISOString() ?? null;
+      return {
+        ...ruleSummary,
+        aiStatus: 'READY',
+        aiGeneratedAt: generatedAt,
+        aiSummary: sections,
+        aiErrorMessage: null,
+        aiReport: baseReport(sections, 'AI', generatedAt),
+      };
+    }
     return {
-      ...base,
-      aiStatus: 'READY',
+      ...ruleSummary,
+      aiStatus: 'STALE',
       aiGeneratedAt: cache.generatedAt?.toISOString() ?? null,
-      aiSummary: cache.summaryJson as AiSummaryJson,
+      aiSummary: null,
+      aiErrorMessage: 'AI 周报格式已过期，请重新生成',
+      aiReport: baseReport(fallbackSections, 'RULE_FALLBACK', cache.generatedAt?.toISOString() ?? null),
     };
   }
 
   if (cache.status === EmployeeWeeklyAiSummaryStatus.READY && cache.sourceHash !== sourceHash) {
-    return { ...base, aiStatus: 'RULE_ONLY' };
+    return { ...ruleSummary, ...empty, aiStatus: 'RULE_ONLY' };
   }
 
   if (cache.status === EmployeeWeeklyAiSummaryStatus.PENDING) {
-    return { ...base, aiStatus: 'PENDING' };
+    return { ...ruleSummary, ...empty, aiStatus: 'PENDING' };
   }
 
   if (cache.status === EmployeeWeeklyAiSummaryStatus.FAILED) {
     return {
-      ...base,
+      ...ruleSummary,
       aiStatus: 'FAILED',
+      aiGeneratedAt: null,
+      aiSummary: null,
       aiErrorMessage: cache.errorMessage ?? 'AI 生成失败',
+      aiReport: baseReport(fallbackSections, 'RULE_FALLBACK', null),
     };
   }
 
-  return { ...base, aiStatus: 'RULE_ONLY' };
+  return { ...ruleSummary, ...empty, aiStatus: 'RULE_ONLY' };
+}
+
+function buildDisabledSummary(ruleSummary: RuleWeeklySummary, user: JwtPayload, employeeName: string): WeeklySummaryWithAi {
+  return {
+    ...ruleSummary,
+    aiStatus: 'NOT_ENABLED',
+    aiGeneratedAt: null,
+    aiSummary: null,
+    aiErrorMessage: null,
+    aiReport: buildAiReportView({
+      user,
+      employeeName,
+      ruleSummary,
+      cacheId: null,
+      sections: null,
+      generatedAt: null,
+      source: null,
+    }),
+  };
 }
 
 export async function mergeWeeklySummaryWithAiCache(
   user: JwtPayload,
   ruleSummary: RuleWeeklySummary,
 ): Promise<WeeklySummaryWithAi> {
+  const employeeName = await resolveEmployeeName(user);
+
   if (!isWeeklyAiEnabled()) {
-    return {
-      ...ruleSummary,
-      aiStatus: 'NOT_ENABLED',
-      aiGeneratedAt: null,
-      aiSummary: null,
-      aiErrorMessage: null,
-    };
+    return buildDisabledSummary(ruleSummary, user, employeeName);
   }
 
   const source = await buildAiSourcePayload(user, ruleSummary);
@@ -356,7 +598,7 @@ export async function mergeWeeklySummaryWithAiCache(
     },
   });
 
-  return attachCacheToSummary(ruleSummary, cache, sourceHash);
+  return attachCacheToSummary(user, ruleSummary, cache, sourceHash, employeeName);
 }
 
 async function callDeepSeek(source: unknown): Promise<{ content: string; inputTokens?: number; outputTokens?: number }> {
@@ -376,7 +618,7 @@ async function callDeepSeek(source: unknown): Promise<{ content: string; inputTo
         { role: 'user', content: JSON.stringify(source) },
       ],
       temperature: 0.3,
-      max_tokens: 1200,
+      max_tokens: 1000,
     },
     {
       headers: {
@@ -397,6 +639,33 @@ async function callDeepSeek(source: unknown): Promise<{ content: string; inputTo
     inputTokens: response.data?.usage?.prompt_tokens,
     outputTokens: response.data?.usage?.completion_tokens,
   };
+}
+
+async function callDeepSeekAndParse(source: unknown): Promise<{
+  parsed: AiSummaryJson;
+  rawText: string;
+  inputTokens?: number;
+  outputTokens?: number;
+}> {
+  let lastErr: unknown;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      const result = await callDeepSeek(source);
+      const parsed = parseAiSummaryJson(result.content);
+      return {
+        parsed,
+        rawText: sanitizeRawText(result.content),
+        inputTokens: result.inputTokens,
+        outputTokens: result.outputTokens,
+      };
+    } catch (err) {
+      lastErr = err;
+      if (attempt === 0) {
+        console.warn('[weekly-ai] parse failed, retry once:', err instanceof Error ? err.message : err);
+      }
+    }
+  }
+  throw lastErr;
 }
 
 async function upsertPendingRecord(params: {
@@ -555,9 +824,12 @@ async function runGenerateJob(
   ruleSummary: RuleWeeklySummary,
   force: boolean,
 ): Promise<WeeklySummaryWithAi> {
+  const employeeName = await resolveEmployeeName(user);
+  const employeeWeeklyPlan = await loadEmployeeWeeklyPlanForSourcePayload(user.userId, ruleSummary.weekStart);
   const source = await buildAiSourcePayload(user, ruleSummary);
   const sourceHash = computeSourceHash(source);
   const weekStartDate = dateStringToDbDate(ruleSummary.weekStart);
+  const fallbackSections = buildRuleFallbackSections(ruleSummary, employeeWeeklyPlan);
 
   const existing = await prisma.employeeWeeklyAiSummary.findUnique({
     where: {
@@ -569,7 +841,7 @@ async function runGenerateJob(
   });
 
   if (!force && isReusableCache(existing, sourceHash)) {
-    return attachCacheToSummary(ruleSummary, existing, sourceHash);
+    return attachCacheToSummary(user, ruleSummary, existing, sourceHash, employeeName);
   }
 
   await upsertPendingRecord({
@@ -580,17 +852,15 @@ async function runGenerateJob(
   });
 
   try {
-    const result = await callDeepSeek(source);
-    const parsed = parseAiSummaryJson(result.content);
-    const rawText = sanitizeRawText(result.content);
+    const result = await callDeepSeekAndParse(source);
 
     await upsertReadyRecord({
       userId: user.userId,
       weekStart: ruleSummary.weekStart,
       weekEnd: ruleSummary.weekEnd,
       sourceHash,
-      summaryJson: parsed,
-      rawText,
+      summaryJson: result.parsed,
+      rawText: result.rawText,
       inputTokens: result.inputTokens,
       outputTokens: result.outputTokens,
     });
@@ -604,7 +874,7 @@ async function runGenerateJob(
       },
     });
 
-    return attachCacheToSummary(ruleSummary, cache, sourceHash);
+    return attachCacheToSummary(user, ruleSummary, cache, sourceHash, employeeName);
   } catch (err) {
     const errorMessage = safeErrorMessage(err);
     await upsertFailedRecord({
@@ -621,6 +891,15 @@ async function runGenerateJob(
       aiGeneratedAt: null,
       aiSummary: null,
       aiErrorMessage: errorMessage,
+      aiReport: buildAiReportView({
+        user,
+        employeeName,
+        ruleSummary,
+        cacheId: existing?.id ?? null,
+        sections: fallbackSections,
+        generatedAt: null,
+        source: 'RULE_FALLBACK',
+      }),
     };
   }
 }
@@ -633,13 +912,8 @@ export async function generateWeeklyAiSummary(
   const ruleSummary = await buildRuleWeeklySummary(user, normalizedWeekStart);
 
   if (!isWeeklyAiEnabled()) {
-    return {
-      ...ruleSummary,
-      aiStatus: 'NOT_ENABLED',
-      aiGeneratedAt: null,
-      aiSummary: null,
-      aiErrorMessage: null,
-    };
+    const employeeName = await resolveEmployeeName(user);
+    return buildDisabledSummary(ruleSummary, user, employeeName);
   }
 
   const lockKey = `${user.userId}:${ruleSummary.weekStart}`;
@@ -656,4 +930,44 @@ export async function generateWeeklyAiSummary(
   } finally {
     inflight.delete(lockKey);
   }
+}
+
+/** 将 v3 sections 映射为管理端旧扁平字段（兼容未同步前端） */
+export function mapV3SectionsToLegacyAdminFields(sections: AiSummaryJson | null) {
+  if (!sections) {
+    return {
+      summaryPreview: null,
+      summaryText: null,
+      completedSummary: null,
+      pendingSummary: null,
+      problemSummary: null,
+      suggestionSummary: null,
+      nextWeekPlan: null,
+    };
+  }
+
+  const joinParts = (parts: Array<string | null | undefined>, separator = '；') => {
+    const text = parts.map((p) => String(p ?? '').trim()).filter(Boolean).join(separator);
+    return text || null;
+  };
+
+  const completedText = joinParts([sections.completed.summary, ...sections.completed.items]);
+  const unfinishedText = joinParts([sections.unfinished.summary, ...sections.unfinished.items]);
+  const nextFocusText = joinParts([sections.nextFocus.summary, ...sections.nextFocus.items]);
+  const summaryText = joinParts(
+    [sections.completed.summary, sections.unfinished.summary, sections.nextFocus.summary],
+    '\n\n',
+  );
+
+  return {
+    summaryPreview: sections.completed.summary || null,
+    summaryText,
+    completedSummary: completedText,
+    pendingSummary: unfinishedText,
+    problemSummary: unfinishedText,
+    suggestionSummary: nextFocusText,
+    nextWeekPlan: sections.nextFocus.items.length > 0
+      ? sections.nextFocus.items.join('；')
+      : sections.nextFocus.summary || null,
+  };
 }

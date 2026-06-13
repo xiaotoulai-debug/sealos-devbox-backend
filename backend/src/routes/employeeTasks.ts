@@ -1,4 +1,4 @@
-import { Router, Request, Response } from 'express';
+import { Router, Request, Response, NextFunction } from 'express';
 import {
   authenticate,
   DASHBOARD_PERMISSION,
@@ -30,6 +30,10 @@ import {
   enqueueAdminWeeklySummaryGeneration,
   listAdminWeeklySummaries,
 } from '../services/adminWeeklySummaryService';
+import {
+  getEmployeeWeeklyPlan,
+  saveEmployeeWeeklyPlan,
+} from '../services/employeeWeeklyPlanService';
 import { generateWeeklyAiSummary } from '../services/weeklyAiSummaryService';
 
 const router = Router();
@@ -55,6 +59,16 @@ function sendError(res: Response, err: unknown, fallback = '服务器内部错�
   res.status(status).json({ code: status, data: null, message: status === 500 ? fallback : message });
 }
 
+/** 防止固定路径（如 weekly-plan）被 /:id 动态路由误匹配后触发「id 必须是正整数」 */
+function rejectNonNumericTaskIdParam(req: Request, res: Response, next: NextFunction): void {
+  const rawId = req.params.id;
+  if (typeof rawId !== 'string' || !/^\d+$/.test(rawId)) {
+    res.status(404).json({ code: 404, data: null, message: '接口不存在' });
+    return;
+  }
+  next();
+}
+
 router.post('/', async (req: Request, res: Response) => {
   try {
     const data = await createEmployeeTask(req.user!, req.body ?? {});
@@ -74,6 +88,39 @@ router.get('/my-dashboard', async (req: Request, res: Response) => {
   } catch (err) {
     console.error('[GET /api/employee-tasks/my-dashboard]', err);
     sendError(res, err, '查询我的任务中心失败');
+  }
+});
+
+// ── 固定路径：必须在所有 /:id 动态路由之前注册 ──
+router.get('/weekly-plan', async (req: Request, res: Response) => {
+  try {
+    if (req.query.userId != null) {
+      res.status(400).json({ code: 400, data: null, message: 'weekly-plan 不允许传 userId' });
+      return;
+    }
+    const data = await getEmployeeWeeklyPlan(req.user!, firstQueryValue(req.query.weekStart));
+    res.json({ code: 200, data, message: 'success' });
+  } catch (err) {
+    console.error('[GET /api/employee-tasks/weekly-plan]', err);
+    sendError(res, err, '查询下周计划失败');
+  }
+});
+
+router.post('/weekly-plan', async (req: Request, res: Response) => {
+  try {
+    if (req.body?.userId != null) {
+      res.status(400).json({ code: 400, data: null, message: 'weekly-plan 不允许传 userId' });
+      return;
+    }
+    if (req.body?.id != null) {
+      res.status(400).json({ code: 400, data: null, message: 'weekly-plan 不允许传 id' });
+      return;
+    }
+    const data = await saveEmployeeWeeklyPlan(req.user!, req.body ?? {});
+    res.json({ code: 200, data, message: 'success' });
+  } catch (err) {
+    console.error('[POST /api/employee-tasks/weekly-plan]', err);
+    sendError(res, err, '保存下周计划失败');
   }
 });
 
@@ -249,7 +296,7 @@ router.get(
   }
 });
 
-router.get('/:id/comments', async (req: Request, res: Response) => {
+router.get('/:id/comments', rejectNonNumericTaskIdParam, async (req: Request, res: Response) => {
   try {
     const id = Number(req.params.id);
     const data = await listEmployeeTaskComments(req.user!, id);
@@ -260,7 +307,7 @@ router.get('/:id/comments', async (req: Request, res: Response) => {
   }
 });
 
-router.post('/:id/comments', async (req: Request, res: Response) => {
+router.post('/:id/comments', rejectNonNumericTaskIdParam, async (req: Request, res: Response) => {
   try {
     const id = Number(req.params.id);
     const data = await createEmployeeTaskComment(req.user!, id, req.body ?? {});
@@ -271,7 +318,7 @@ router.post('/:id/comments', async (req: Request, res: Response) => {
   }
 });
 
-router.patch('/:id/due-date', async (req: Request, res: Response) => {
+router.patch('/:id/due-date', rejectNonNumericTaskIdParam, async (req: Request, res: Response) => {
   try {
     const id = Number(req.params.id);
     const data = await updateEmployeeTaskDueDate(req.user!, id, req.body ?? {});
@@ -282,7 +329,7 @@ router.patch('/:id/due-date', async (req: Request, res: Response) => {
   }
 });
 
-router.post('/:id/start', async (req: Request, res: Response) => {
+router.post('/:id/start', rejectNonNumericTaskIdParam, async (req: Request, res: Response) => {
   try {
     const id = Number(req.params.id);
     const data = await startEmployeeTask(req.user!, id);
@@ -293,7 +340,7 @@ router.post('/:id/start', async (req: Request, res: Response) => {
   }
 });
 
-router.get('/:id', async (req: Request, res: Response) => {
+router.get('/:id', rejectNonNumericTaskIdParam, async (req: Request, res: Response) => {
   try {
     const id = Number(req.params.id);
     const data = await getEmployeeTaskDetail(req.user!, id);
@@ -304,7 +351,7 @@ router.get('/:id', async (req: Request, res: Response) => {
   }
 });
 
-router.patch('/:id/status', async (req: Request, res: Response) => {
+router.patch('/:id/status', rejectNonNumericTaskIdParam, async (req: Request, res: Response) => {
   try {
     const id = Number(req.params.id);
     const data = await updateEmployeeTaskStatus(req.user!, id, req.body ?? {});
@@ -315,7 +362,7 @@ router.patch('/:id/status', async (req: Request, res: Response) => {
   }
 });
 
-router.patch('/:id', async (req: Request, res: Response) => {
+router.patch('/:id', rejectNonNumericTaskIdParam, async (req: Request, res: Response) => {
   try {
     const id = Number(req.params.id);
     const data = await updateEmployeeTask(req.user!, id, req.body ?? {});

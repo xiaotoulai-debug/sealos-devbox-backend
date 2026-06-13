@@ -5,10 +5,11 @@ import { normalizeWeekStartInput } from './employeeTaskService';
 import {
   AiSummaryJson,
   generateWeeklyAiSummary,
+  isV3SummaryJson,
   isWeeklyAiEnabled,
+  mapV3SectionsToLegacyAdminFields,
+  normalizeAiSummaryJson,
 } from './weeklyAiSummaryService';
-
-const PREVIEW_MAX = 120;
 
 export type AdminWeeklySummaryStatus = 'NONE' | 'GENERATING' | 'SUCCESS' | 'FAILED';
 
@@ -21,6 +22,7 @@ export type AdminWeeklySummaryListItem = {
   weekStart: string;
   weekEnd: string;
   status: AdminWeeklySummaryStatus;
+  sections: AiSummaryJson | null;
   summaryPreview: string | null;
   summaryText: string | null;
   completedSummary: string | null;
@@ -65,9 +67,11 @@ function joinTextParts(parts: Array<string | null | undefined>, separator = '；
   return text || null;
 }
 
+/** v3 优先；兼容旧 v2 六字段缓存 */
 function mapSummaryJsonToAdminFields(summaryJson: unknown) {
   if (!summaryJson || typeof summaryJson !== 'object' || Array.isArray(summaryJson)) {
     return {
+      sections: null as AiSummaryJson | null,
       summaryPreview: null,
       summaryText: null,
       completedSummary: null,
@@ -78,7 +82,15 @@ function mapSummaryJsonToAdminFields(summaryJson: unknown) {
     };
   }
 
-  const summary = summaryJson as Partial<AiSummaryJson>;
+  if (isV3SummaryJson(summaryJson)) {
+    const sections = normalizeAiSummaryJson(summaryJson);
+    return {
+      sections,
+      ...mapV3SectionsToLegacyAdminFields(sections),
+    };
+  }
+
+  const summary = summaryJson as Record<string, unknown>;
   const overview = String(summary.overview ?? '').trim();
   const completionAnalysis = String(summary.completionAnalysis ?? '').trim();
   const highlights = Array.isArray(summary.highlights)
@@ -95,7 +107,8 @@ function mapSummaryJsonToAdminFields(summaryJson: unknown) {
   const suggestionText = nextWeekSuggestions.length > 0 ? nextWeekSuggestions.join('；') : null;
 
   return {
-    summaryPreview: overview ? overview.slice(0, PREVIEW_MAX) : null,
+    sections: null,
+    summaryPreview: overview ? overview.slice(0, 120) : null,
     summaryText,
     completedSummary: joinTextParts([...highlights, completionAnalysis]),
     pendingSummary: risks.length > 0 ? risks.join('；') : null,
@@ -119,6 +132,7 @@ function buildNonePlaceholder(
     weekStart,
     weekEnd,
     status: 'NONE',
+    sections: null,
     summaryPreview: null,
     summaryText: null,
     completedSummary: null,
