@@ -17,7 +17,14 @@ import { backfillProductUrls, backfillProductImages, syncStoreProducts, backfill
 import { recalcProfitForShop, recalcProfitForAllShops } from '../services/profitCalculator';
 import { syncExchangeRates } from '../services/exchangeRateSync';
 import { resolveEffectiveStockSignals, scheduleStockSignalBackfill } from '../services/firstAvailableAt';
-import { buildOperationAdvice } from '../services/operationAdvice';
+import { generateOperationAdvices } from '../services/operationAdvice';
+import {
+  buildOperationActionStats,
+  matchesOperationAction,
+  normalizeOperationActionQuery,
+  type OperationAction,
+  type OperationAdvice,
+} from '../services/operationAdviceEngine';
 import {
   buildPurchaseSuggestion,
   getMatchedStoreProductIdsByProductClass,
@@ -155,6 +162,168 @@ function normalizeStoredTips(value: unknown, fallback: string[]): string[] {
     if (tips.length > 0) return tips;
   }
   return fallback;
+}
+
+const STORE_PRODUCT_LIST_INCLUDE = {
+  shop: { select: { shopName: true, region: true } },
+} as const;
+
+type StoreProductListRow = Prisma.StoreProductGetPayload<{ include: typeof STORE_PRODUCT_LIST_INCLUDE }>;
+
+type StoreProductInvEntry = {
+  localImage: string | null;
+  purchaseCost: number;
+  weight: number | null;
+  localProductId: number | null;
+  localChineseName: string | null;
+  inTransitQuantity: number;
+};
+
+type OperationAdviceBatchContext = {
+  salesMap: Awaited<ReturnType<typeof getSalesStatsByShop>>['map'];
+  inventoryMap: Map<string, StoreProductInvEntry>;
+  pnkMap: Map<string, StoreProductInvEntry>;
+  warehouseStockMap: Map<number, { localStock: number }>;
+  purchasingInTransitMap: Map<number, number>;
+  planningStockMap: Map<string, number>;
+  stockSignalMap: Map<number, import('../services/firstAvailableAt').EffectiveStockSignals>;
+  normalizeSkuKey: (value: string | null | undefined) => string;
+  nowMs: number;
+  dayMs: number;
+};
+
+function buildListRowOperationAdvices(
+  p: StoreProductListRow,
+  ctx: OperationAdviceBatchContext,
+): OperationAdvice[] {
+  const salePriceNum = Number(p.salePrice);
+  const stockNum = p.stock;
+  const skuKey = (p.mappedInventorySku ?? '').trim() || (p.sku ?? p.vendorSku ?? '').trim();
+  const inv = (skuKey ? ctx.inventoryMap.get(ctx.normalizeSkuKey(skuKey)) : undefined) ?? ctx.pnkMap.get(p.pnk);
+  const salesStats = getSalesForProduct(ctx.salesMap, p.sku, p.vendorSku, p.pnk);
+  const compSales = calculateComprehensiveSales(salesStats, stockNum);
+  const stockAgg = inv?.localProductId != null ? ctx.warehouseStockMap.get(inv.localProductId) : undefined;
+  const fbeInTransitQuantity = Number(inv?.inTransitQuantity ?? 0);
+  const effectiveSignals = ctx.stockSignalMap.get(p.id)!;
+  const fallbackClassification = classifyStoreProduct({
+    stock: stockNum,
+    inTransitStock: fbeInTransitQuantity,
+    firstAvailableAt: effectiveSignals.firstAvailableAt,
+    firstStockSignalAt: effectiveSignals.firstStockSignalAt,
+    firstInboundAt: effectiveSignals.firstInboundAt,
+    syncedAt: p.syncedAt,
+    mappedInventorySku: p.mappedInventorySku,
+    mainImage: p.mainImage,
+    imageUrl: p.imageUrl,
+    estimatedProfit: p.estimatedProfit != null ? Number(p.estimatedProfit) : null,
+  }, salesStats);
+  const productClass = fallbackClassification.productClass;
+  const stockStatusResult = calculateStockStatus(stockNum, compSales, salesStats.d30);
+  const platformStock = stockNum;
+  const platformInTransit = fbeInTransitQuantity;
+  const localStock = stockAgg?.localStock ?? 0;
+  const purchasingInTransit = inv?.localProductId != null
+    ? ctx.purchasingInTransitMap.get(inv.localProductId) ?? 0
+    : 0;
+  const planningStock = ctx.planningStockMap.get(ctx.normalizeSkuKey(skuKey)) ?? 0;
+  const daysSinceSynced = Math.floor((ctx.nowMs - p.syncedAt.getTime()) / ctx.dayMs);
+  const lastOrderAt = normalizeNullableDate(salesStats.lastOrderAt);
+  const purchaseSuggestion = buildPurchaseSuggestion({
+    productClass,
+    newProductStage: fallbackClassification.newProductStage,
+    stockStatus: stockStatusResult.stockStatus,
+    platformStock,
+    platformInTransit,
+    localStock,
+    purchasingInTransit,
+    planningStock,
+    comprehensiveSales: compSales,
+    sales7: salesStats.d7,
+    sales14: salesStats.d14,
+    sales30: salesStats.d30,
+    sales60: salesStats.d60,
+    sales90: salesStats.d90,
+    sales180: salesStats.d180 ?? 0,
+    estimatedProfit: p.estimatedProfit != null ? Number(p.estimatedProfit) : null,
+    firstAvailableAt: effectiveSignals.firstAvailableAt,
+    firstStockSignalAt: effectiveSignals.firstStockSignalAt,
+    firstInboundAt: effectiveSignals.firstInboundAt,
+    lastOrderAt,
+    daysSinceSynced,
+  });
+  const linkType = normalizeStoredLinkType(p.emagLinkType);
+  const storedBuyBoxMeta = p.buyBoxMeta && typeof p.buyBoxMeta === 'object' && !Array.isArray(p.buyBoxMeta)
+    ? p.buyBoxMeta as Record<string, unknown>
+    : null;
+  const inferredBuyBox = inferBuyBoxStatus({
+    buyButtonRank: p.buyBoxRank ?? p.buyButtonRank,
+    salePrice: salePriceNum,
+    bestOfferSalePrice: p.bestOfferSalePrice != null ? Number(p.bestOfferSalePrice) : null,
+    mainOfferPrice: p.mainOfferPrice != null ? Number(p.mainOfferPrice) : null,
+    stock: stockNum,
+    status: p.status,
+    offerValidationStatus: storedBuyBoxMeta?.offerValidationStatus ?? p.validationStatus,
+    numberOfOffers: p.numberOfOffers,
+  });
+  const buyBoxStatus = p.buyBoxStatus
+    ? normalizeStoredBuyBoxStatus(p.buyBoxStatus)
+    : inferredBuyBox.buyBoxStatus;
+
+  return generateOperationAdvices({
+    productClass,
+    newProductStage: fallbackClassification.newProductStage,
+    replenishmentStage: purchaseSuggestion.replenishmentStage ?? null,
+    stockStatus: stockStatusResult.stockStatus,
+    stock: platformStock,
+    stockDays: stockStatusResult.stockDays,
+    platformInTransit,
+    localStock,
+    purchasingInTransit,
+    planningStock,
+    sales7: salesStats.d7,
+    sales14: salesStats.d14,
+    sales30: salesStats.d30,
+    comprehensiveSales: compSales,
+    replenishReferenceDailySales: purchaseSuggestion.replenishReferenceDailySales,
+    targetStock: purchaseSuggestion.targetStock,
+    coverageStock: purchaseSuggestion.coverageStock,
+    suggestAmount: purchaseSuggestion.suggestAmount,
+    estimatedProfit: p.estimatedProfit != null ? Number(p.estimatedProfit) : null,
+    profitMarginPct: p.profitMarginPct ?? null,
+    price: Number.isFinite(salePriceNum) ? salePriceNum : null,
+    linkType,
+    buyBoxStatus,
+    numberOfOffers: p.numberOfOffers,
+    daysSinceSynced,
+  });
+}
+
+function sortStoreProductListRows(
+  rows: StoreProductListRow[],
+  salesMap: Awaited<ReturnType<typeof getSalesStatsByShop>>['map'],
+  sortByField: string,
+  sortDescending: boolean,
+  hasValidSort: boolean,
+): StoreProductListRow[] {
+  const dir = sortDescending ? -1 : 1;
+  const field = hasValidSort ? sortByField : 'syncedAt';
+  return [...rows].sort((a, b) => {
+    let cmp = 0;
+    if (field === 'stock') {
+      cmp = a.stock - b.stock;
+    } else if (field === 'salePrice') {
+      cmp = Number(a.salePrice) - Number(b.salePrice);
+    } else if (field === 'name') {
+      cmp = String(a.name ?? '').localeCompare(String(b.name ?? ''), 'zh-CN');
+    } else if (field === 'comprehensiveSales') {
+      const salesA = getSalesForProduct(salesMap, a.sku, a.vendorSku, a.pnk);
+      const salesB = getSalesForProduct(salesMap, b.sku, b.vendorSku, b.pnk);
+      cmp = calculateComprehensiveSales(salesA, a.stock) - calculateComprehensiveSales(salesB, b.stock);
+    } else {
+      cmp = a.syncedAt.getTime() - b.syncedAt.getTime();
+    }
+    return cmp * dir;
+  });
 }
 
 function buildStoreProductListWhere(shopId: number, mappingStatus: string, search: string): Prisma.StoreProductWhereInput {
@@ -696,6 +865,12 @@ router.get('/', async (req: Request, res: Response) => {
     const purchaseActionFilter: PurchaseActionKey | undefined = normalizedPurchaseAction && isPurchaseActionFilter(normalizedPurchaseAction)
       ? normalizedPurchaseAction
       : undefined;
+    const operationActionParsed = normalizeOperationActionQuery(req.query.operationAction ?? req.query.operation_action);
+    if (operationActionParsed === null) {
+      res.status(400).json({ code: 400, data: null, message: 'operationAction 无效' });
+      return;
+    }
+    const operationActionFilter: OperationAction | undefined = operationActionParsed;
     const rawStockGroup = req.query.stockGroup ?? req.query.stock_group;
     const normalizedStockGroup = rawStockGroup == null
       ? undefined
@@ -822,20 +997,37 @@ router.get('/', async (req: Request, res: Response) => {
     }
 
     // 分页必须分离查数据与查总数；mappedInventorySku 已改为纯字符串，不再 include Inventory
-    const [list, total] = await Promise.all([
-      prisma.storeProduct.findMany({
-        where,
-        orderBy,
-        skip,
-        take: limit,
-        include: {
-          shop: { select: { shopName: true, region: true } },
-        },
-      }),
-      prisma.storeProduct.count({ where }), // 仅 where，无 skip/take，返回符合条件的绝对总条数
-    ]);
+    let list: StoreProductListRow[];
+    let total: number;
 
-    console.log(`[StoreProducts] DB actual count: ${total}, page size: ${list.length}`);
+    const statsCandidates = await prisma.storeProduct.findMany({
+      where,
+      include: STORE_PRODUCT_LIST_INCLUDE,
+      orderBy: { id: 'asc' },
+    });
+    if (statsCandidates.length > 3000) {
+      console.warn(
+        `[GET /api/store-products] operationActionStats 候选集 ${statsCandidates.length} 条 (>3000)，shopId=${shopId}`,
+      );
+    }
+
+    if (operationActionFilter) {
+      list = statsCandidates;
+      total = 0;
+    } else {
+      [list, total] = await Promise.all([
+        prisma.storeProduct.findMany({
+          where,
+          orderBy,
+          skip,
+          take: limit,
+          include: STORE_PRODUCT_LIST_INCLUDE,
+        }),
+        prisma.storeProduct.count({ where }),
+      ]);
+    }
+
+    console.log(`[StoreProducts] DB actual count: ${total}, page size: ${list.length}, statsCandidates=${statsCandidates.length}${operationActionFilter ? ' (operationAction pending)' : ''}`);
 
     if (search) {
       console.log(`[Search Debug] Keyword: ${search}, Found Records: ${total}`);
@@ -850,9 +1042,9 @@ router.get('/', async (req: Request, res: Response) => {
     }
     const { map: salesMap, skusWithSales } = await getSalesStatsByShop(shopId, forceRefresh);
 
-    // 收集所有需要查询成本/图片的 SKU 字符串
+    // 收集所有需要查询成本/图片的 SKU 字符串（stats 候选全集，覆盖当前页）
     const skusToFetch = new Set<string>();
-    for (const p of list) {
+    for (const p of statsCandidates) {
       const mapped = (p.mappedInventorySku ?? '').trim();
       if (mapped) {
         skusToFetch.add(mapped);
@@ -866,14 +1058,7 @@ router.get('/', async (req: Request, res: Response) => {
     //   路径①  按 mappedInventorySku / sku / vendorSku 查 Product 表（主路径，key = Product.sku）
     //   路径②  按同一 SKU 列表查旧 Inventory 表（历史数据兜底，key = Inventory.sku）
     //   路径③  按 pnk 查 Product 表（防 mappedInventorySku 为空或 SKU 对不上时的最终兜底，key = Product.pnk）
-    type InvEntry = {
-      localImage:         string | null;
-      purchaseCost:       number;
-      weight:             number | null;
-      localProductId:     number | null;
-      localChineseName:   string | null;
-      inTransitQuantity:  number;
-    };
+    type InvEntry = StoreProductInvEntry;
     const inventoryMap = new Map<string, InvEntry>();
     const normalizeSkuKey = (value: string | null | undefined) => String(value ?? '').trim().toLowerCase();
     // 路径③ 的 pnk → InvEntry 索引（在下方单独查询后填充）
@@ -940,7 +1125,7 @@ router.get('/', async (req: Request, res: Response) => {
 
     // ── 路径③：按 pnk 查 Product（兜底 SKU 路径全部失败的情况）────
     // 只查路径①②均未命中 SKU 的那批 pnk，减少无效 DB 查询
-    const pnksToFetch = list
+    const pnksToFetch = statsCandidates
       .filter((p) => {
         const skuKey = (p.mappedInventorySku ?? '').trim() || (p.sku ?? p.vendorSku ?? '').trim();
         return !skuKey || !inventoryMap.has(normalizeSkuKey(skuKey));
@@ -1079,7 +1264,7 @@ router.get('/', async (req: Request, res: Response) => {
 
     const stockSignalPatches = new Map<number, import('../services/firstAvailableAt').StockSignalDbPatch>();
     const stockSignalMap = new Map<number, import('../services/firstAvailableAt').EffectiveStockSignals>();
-    for (const p of list) {
+    for (const p of statsCandidates) {
       const skuKey = (p.mappedInventorySku ?? '').trim() || (p.sku ?? p.vendorSku ?? '').trim();
       const inv = (skuKey ? inventoryMap.get(normalizeSkuKey(skuKey)) : undefined) ?? pnkMap.get(p.pnk);
       const inTransit = Number(inv?.inTransitQuantity ?? 0);
@@ -1103,6 +1288,39 @@ router.get('/', async (req: Request, res: Response) => {
     if (stockSignalPatches.size > 0) {
       scheduleStockSignalBackfill(stockSignalPatches);
     }
+
+    const nowMs = Date.now();
+    const DAY_MS = 24 * 60 * 60 * 1000;
+
+    const adviceCtx: OperationAdviceBatchContext = {
+      salesMap,
+      inventoryMap,
+      pnkMap,
+      warehouseStockMap,
+      purchasingInTransitMap,
+      planningStockMap,
+      stockSignalMap,
+      normalizeSkuKey,
+      nowMs,
+      dayMs: DAY_MS,
+    };
+    const adviceCache = new Map<number, OperationAdvice[]>();
+    for (const p of statsCandidates) {
+      adviceCache.set(p.id, buildListRowOperationAdvices(p, adviceCtx));
+    }
+    const operationActionStats = buildOperationActionStats(
+      statsCandidates.map((p) => adviceCache.get(p.id)!),
+    );
+
+    if (operationActionFilter) {
+      const matched = statsCandidates.filter((p) =>
+        matchesOperationAction(adviceCache.get(p.id)!, operationActionFilter),
+      );
+      const sorted = sortStoreProductListRows(matched, salesMap, sortByField, sortOrderPrisma === 'desc', hasValidSort);
+      total = sorted.length;
+      list = sorted.slice(skip, skip + limit);
+      console.log(`[StoreProducts] operationAction=${operationActionFilter} matched=${total}, page size=${list.length}`);
+    }
     // ─────────────────────────────────────────────────────────────────
 
     const shopName = list[0]?.shop?.shopName ?? '';
@@ -1111,8 +1329,6 @@ router.get('/', async (req: Request, res: Response) => {
     const defaultCurrency = (region && REGION_CURRENCY[region as keyof typeof REGION_CURRENCY]) ?? 'RON';
 
     let zeroSalesDiagnosticCount = 0;
-    const nowMs = Date.now();
-    const DAY_MS = 24 * 60 * 60 * 1000;
     const data = list.map((p) => {
       const v = p.validationStatus ?? (p.status === 1 ? 'active' : 'rejected');
       const validationStatusDisplay = v === 'rejected' || v === 'inactive' ? '已驳回' : '已通过';
@@ -1217,53 +1433,8 @@ router.get('/', async (req: Request, res: Response) => {
       });
       const estimatedProfit = p.estimatedProfit != null ? Number(p.estimatedProfit) : null;
       const profitMarginPct = p.profitMarginPct ?? null;
-      const operationAdvice = buildOperationAdvice({
-        productClass,
-        stockStatus: stockStatusResult.stockStatus,
-        stock: platformStock,
-        stockDays: stockStatusResult.stockDays,
-        platformInTransit,
-        localStock,
-        purchasingInTransit,
-        planningStock,
-        sales7: sales_stats.d7,
-        sales14: sales_stats.d14,
-        sales30: sales_stats.d30,
-        sales60: sales_stats.d60,
-        sales90: sales_stats.d90,
-        sales180: sales_stats.d180 ?? 0,
-        lastOrderAt,
-        daysSinceLastOrder,
-        comprehensiveSales: compSales,
-        replenishReferenceDailySales: purchaseSuggestion.replenishReferenceDailySales,
-        targetStock: purchaseSuggestion.targetStock,
-        coverageStock: purchaseSuggestion.coverageStock,
-        suggestAmount: purchaseSuggestion.suggestAmount,
-        replenishmentStage: purchaseSuggestion.replenishmentStage ?? null,
-        newProductStage,
-        estimatedProfit,
-        profitMarginPct,
-        price: Number.isFinite(salePriceNum) ? salePriceNum : null,
-        daysSinceSynced,
-      });
-      const productUrl = p.productUrl ?? (() => {
-        const domain = (region && REGION_DOMAIN[region as keyof typeof REGION_DOMAIN]) ?? 'emag.ro';
-        const name = (p.name ?? '').trim();
-        const slug = name
-          ? name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 150)
-          : 'product';
-        return `https://www.${domain}/${slug}/pd/${p.pnk}/`;
-      })();
+
       const linkType = normalizeStoredLinkType(p.emagLinkType);
-      const platformBrand = resolveBrandFromOfferMeta(p.emagOfferMeta);
-      const linkTypeReason: LinkTypeReason | null = resolveLinkTypeReasonFromOfferMeta(p.emagOfferMeta);
-      const ownershipDisplay = normalizeOwnershipDisplay(p.emagOwnership);
-      const competition = inferOfferCompetition({ numberOfOffers: p.numberOfOffers });
-      const offerCompetitionType = p.offerCompetitionType
-        ? normalizeStoredCompetitionType(p.offerCompetitionType)
-        : competition.offerCompetitionType;
-      const contentPermissionResult = inferContentPermission(linkType);
-      const linkActionTips = normalizeActionTips(p.linkActionTips, linkType, offerCompetitionType);
       const storedBuyBoxMeta = p.buyBoxMeta && typeof p.buyBoxMeta === 'object' && !Array.isArray(p.buyBoxMeta)
         ? p.buyBoxMeta as Record<string, unknown>
         : null;
@@ -1280,6 +1451,53 @@ router.get('/', async (req: Request, res: Response) => {
       const buyBoxStatus = p.buyBoxStatus
         ? normalizeStoredBuyBoxStatus(p.buyBoxStatus)
         : inferredBuyBox.buyBoxStatus;
+
+      const operationAdvices = adviceCache.get(p.id) ?? generateOperationAdvices({
+        productClass,
+        newProductStage,
+        replenishmentStage: purchaseSuggestion.replenishmentStage ?? null,
+        stockStatus: stockStatusResult.stockStatus,
+        stock: platformStock,
+        stockDays: stockStatusResult.stockDays,
+        platformInTransit,
+        localStock,
+        purchasingInTransit,
+        planningStock,
+        sales7: sales_stats.d7,
+        sales14: sales_stats.d14,
+        sales30: sales_stats.d30,
+        comprehensiveSales: compSales,
+        replenishReferenceDailySales: purchaseSuggestion.replenishReferenceDailySales,
+        targetStock: purchaseSuggestion.targetStock,
+        coverageStock: purchaseSuggestion.coverageStock,
+        suggestAmount: purchaseSuggestion.suggestAmount,
+        estimatedProfit,
+        profitMarginPct,
+        price: Number.isFinite(salePriceNum) ? salePriceNum : null,
+        linkType,
+        buyBoxStatus,
+        numberOfOffers: p.numberOfOffers,
+        daysSinceSynced,
+      });
+      const operationAdvice = operationAdvices[0] ?? null;
+
+      const productUrl = p.productUrl ?? (() => {
+        const domain = (region && REGION_DOMAIN[region as keyof typeof REGION_DOMAIN]) ?? 'emag.ro';
+        const name = (p.name ?? '').trim();
+        const slug = name
+          ? name.toLowerCase().normalize('NFD').replace(/[\u0300-\u036f]/g, '').replace(/[^a-z0-9\s-]/g, '').replace(/\s+/g, '-').replace(/-+/g, '-').replace(/^-|-$/g, '').slice(0, 150)
+          : 'product';
+        return `https://www.${domain}/${slug}/pd/${p.pnk}/`;
+      })();
+      const platformBrand = resolveBrandFromOfferMeta(p.emagOfferMeta);
+      const linkTypeReason: LinkTypeReason | null = resolveLinkTypeReasonFromOfferMeta(p.emagOfferMeta);
+      const ownershipDisplay = normalizeOwnershipDisplay(p.emagOwnership);
+      const competition = inferOfferCompetition({ numberOfOffers: p.numberOfOffers });
+      const offerCompetitionType = p.offerCompetitionType
+        ? normalizeStoredCompetitionType(p.offerCompetitionType)
+        : competition.offerCompetitionType;
+      const contentPermissionResult = inferContentPermission(linkType);
+      const linkActionTips = normalizeActionTips(p.linkActionTips, linkType, offerCompetitionType);
       const buyBoxStatusSource = p.buyBoxStatusSource
         ? normalizeStoredBuyBoxSource(p.buyBoxStatusSource)
         : inferredBuyBox.buyBoxStatusSource;
@@ -1330,6 +1548,8 @@ router.get('/', async (req: Request, res: Response) => {
           ...purchaseSuggestion,
           platformInTransit: fbeInTransitQuantity,
         },
+        operationAdvices,
+        operation_advices: operationAdvices,
         operation_advice: operationAdvice,
         operationAdvice,
         estimated_profit:     estimatedProfit,
@@ -1450,8 +1670,19 @@ router.get('/', async (req: Request, res: Response) => {
       });
     }
 
-    console.log('=== PAGING DEBUG ===', { listLength: list.length, actualTotal: total, page, limit, shopId });
-    res.json({ code: 200, data: { list: data, total, page, limit }, message: 'success' });
+    console.log('=== PAGING DEBUG ===', { listLength: list.length, actualTotal: total, page, limit, shopId, statsCount: operationActionStats.length });
+    res.json({
+      code: 200,
+      data: {
+        list: data,
+        total,
+        page,
+        limit,
+        operationActionStats,
+        operation_action_stats: operationActionStats,
+      },
+      message: 'success',
+    });
   } catch (err) {
     console.error('[GET /api/store-products]', err);
     res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });
