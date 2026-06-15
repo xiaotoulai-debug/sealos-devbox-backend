@@ -14,6 +14,18 @@ import { InventoryLogType } from '@prisma/client';
 const router = Router();
 router.use(authenticate);
 
+function parseProductIdsJson(raw: string | null | undefined): number[] {
+  try {
+    const parsed: unknown = JSON.parse(raw ?? '[]');
+    if (!Array.isArray(parsed)) return [];
+    return parsed
+      .map((id) => parseInt(String(id), 10))
+      .filter((id) => !Number.isNaN(id) && id > 0);
+  } catch {
+    return [];
+  }
+}
+
 // ────────────────────────────────────────────────────────────────────
 // 工具：在事务中写一条库存流水并更新 Product.stockActual
 //       warehouseId 可选——传入时记录到流水，不影响主逻辑
@@ -66,6 +78,36 @@ export async function applyStockChange(
   });
 
   return { before, after };
+}
+
+/** 仅写库存流水，不修改 Product.stockActual（多仓模式：库存已由 WarehouseStock 汇总同步） */
+export async function writeInventoryLogOnly(
+  tx: Parameters<Parameters<typeof prisma.$transaction>[0]>[0],
+  opts: {
+    productId: number;
+    changeQuantity: number;
+    beforeQuantity: number;
+    afterQuantity: number;
+    type: InventoryLogType;
+    warehouseId?: number | null;
+    referenceId?: string | null;
+    remark?: string | null;
+    createdBy?: number | null;
+  },
+): Promise<void> {
+  await tx.inventoryLog.create({
+    data: {
+      productId:      opts.productId,
+      warehouseId:    opts.warehouseId ?? null,
+      type:           opts.type,
+      changeQuantity: opts.changeQuantity,
+      beforeQuantity: opts.beforeQuantity,
+      afterQuantity:  opts.afterQuantity,
+      referenceId:    opts.referenceId ?? null,
+      remark:         opts.remark ?? null,
+      createdBy:      opts.createdBy ?? null,
+    },
+  });
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -211,7 +253,7 @@ router.post('/batch-adjust', async (req: Request, res: Response) => {
 // ────────────────────────────────────────────────────────────────────
 // PUT /api/inventory/purchase-orders/:id/receive   采购单确认入库（支持分批到货）
 //
-// Body（均可选，不传则向后兼容使用 purchaseQuantity）：
+// Body（均可选，不传 items 则默认入库当前采购子单剩余数量）：
 //   warehouseId?  number   指定入库仓（未传则使用采购单绑定仓）
 //   items?        Array<{ productId: number; receivedQuantity: number }>
 //
@@ -225,7 +267,8 @@ router.post('/batch-adjust', async (req: Request, res: Response) => {
 //   ① 累加 PurchaseOrderItem.receivedQuantity（按 productIds JSON 映射）
 //   ② WarehouseStock upsert：stockQuantity += 本次实盘量
 //   ③ GREATEST(0, inTransitQuantity - 本次实盘量)（在途库存扣减）
-//   ④ applyStockChange → stockActual 重聚合 + PURCHASE_IN 库存流水
+//   ④ 多仓：WarehouseStock 汇总同步 stockActual + 仅写 PURCHASE_IN 流水
+//      无仓：applyStockChange 增量更新 stockActual + 写流水（兼容模式）
 //   ⑤ 状态判断：totalReceived >= totalPlan → RECEIVED，否则 → PARTIAL
 //   ⑥ 全部到货时：产品 status → SELECTED
 // ────────────────────────────────────────────────────────────────────
@@ -248,7 +291,7 @@ router.put('/purchase-orders/:id/receive', async (req: Request, res: Response) =
       where: { id },
       include: {
         items:    { select: { id: true, productIds: true, quantity: true, receivedQuantity: true } },
-        products: { select: { id: true, sku: true, purchaseQuantity: true } },
+        products: { select: { id: true, sku: true } },
         warehouse: { select: { id: true, name: true } },
       },
     });
@@ -291,13 +334,26 @@ router.put('/purchase-orders/:id/receive', async (req: Request, res: Response) =
     if (missingIds.length > 0) {
       const fallback = await prisma.product.findMany({
         where:  { id: { in: missingIds } },
-        select: { id: true, sku: true, purchaseQuantity: true },
+        select: { id: true, sku: true },
       });
       for (const p of fallback) knownProdMap.set(p.id, p);
     }
     const allProducts = Array.from(knownProdMap.values());
 
-    // ── 本次实盘量 Map（未传则兜底用 purchaseQuantity）────────────
+    // ── productId → PurchaseOrderItem 映射（含计划量和已收量） ──
+    const productToItemMap = new Map<number, number>();          // productId → itemId
+    const productToItemData = new Map<number, { quantity: number; receivedQuantity: number }>(); // 用于防超收
+    for (const item of order.items) {
+      const pids = parseProductIdsJson(item.productIds);
+      for (const pid of pids) {
+        if (!productToItemMap.has(pid)) {
+          productToItemMap.set(pid, item.id);
+          productToItemData.set(pid, { quantity: item.quantity, receivedQuantity: item.receivedQuantity });
+        }
+      }
+    }
+
+    // ── 本次实盘量 Map（未传则默认使用 item 剩余未入库数量）────────
     const receivedMap = new Map<number, number>();
     if (Array.isArray(receivedItems) && receivedItems.length > 0) {
       for (const ri of receivedItems) {
@@ -308,24 +364,10 @@ router.put('/purchase-orders/:id/receive', async (req: Request, res: Response) =
         receivedMap.set(ri.productId, ri.receivedQuantity);
       }
     } else {
-      for (const prod of allProducts) {
-        receivedMap.set(prod.id, Math.max(1, prod.purchaseQuantity ?? 1));
+      for (const [productId, itemData] of productToItemData.entries()) {
+        const remainingQty = Math.max(0, itemData.quantity - itemData.receivedQuantity);
+        if (remainingQty > 0) receivedMap.set(productId, remainingQty);
       }
-    }
-
-    // ── productId → PurchaseOrderItem 映射（含计划量和已收量） ──
-    const productToItemMap = new Map<number, number>();          // productId → itemId
-    const productToItemData = new Map<number, { quantity: number; receivedQuantity: number }>(); // 用于防超收
-    for (const item of order.items) {
-      try {
-        const pids: number[] = JSON.parse(item.productIds ?? '[]');
-        for (const pid of pids) {
-          if (!productToItemMap.has(pid)) {
-            productToItemMap.set(pid, item.id);
-            productToItemData.set(pid, { quantity: item.quantity, receivedQuantity: item.receivedQuantity });
-          }
-        }
-      } catch { /* ignore */ }
     }
 
     // ★★★ 防超收硬拦截：本次入库量 + 已入库量 不可超过计划采购量 ★★★
@@ -384,19 +426,46 @@ router.put('/purchase-orders/:id/receive', async (req: Request, res: Response) =
           `;
         }
 
-        // ④ stockActual 重聚合 + 写 PURCHASE_IN 流水
-        const planQty  = prod.purchaseQuantity ?? 1;
+        // ④ 写 PURCHASE_IN 流水并同步 stockActual（多仓汇总口径，避免 applyStockChange 二次累加）
+        const planQty  = productToItemData.get(prod.id)?.quantity ?? receivedQty;
         const diffNote = receivedQty !== planQty ? `（计划 ${planQty} 件，本次实收 ${receivedQty} 件）` : '';
-        const { before, after } = await applyStockChange(tx, {
-          productId:      prod.id,
-          warehouseId:    whId ?? null,
-          changeQuantity: receivedQty,
-          type:           'PURCHASE_IN',
-          referenceId:    order.orderNo,
-          remark:         `采购单 ${order.orderNo} 入库${diffNote}${wh ? `（仓库: ${wh.name}）` : ''}`,
-          createdBy:      userId,
-        });
-        stockChanges.push({ productId: prod.id, sku: prod.sku, receivedQty, before, after });
+        const remark   = `采购单 ${order.orderNo} 入库${diffNote}${wh ? `（仓库: ${wh.name}）` : ''}`;
+
+        if (whId) {
+          const allWs = await tx.warehouseStock.findMany({
+            where:  { productId: prod.id },
+            select: { stockQuantity: true },
+          });
+          const after  = allWs.reduce((s, w) => s + w.stockQuantity, 0);
+          const before = after - receivedQty;
+          await tx.product.update({
+            where: { id: prod.id },
+            data:  { stockActual: after },
+          });
+          await writeInventoryLogOnly(tx, {
+            productId:      prod.id,
+            warehouseId:    whId,
+            changeQuantity: receivedQty,
+            beforeQuantity: before,
+            afterQuantity:  after,
+            type:           'PURCHASE_IN',
+            referenceId:    order.orderNo,
+            remark,
+            createdBy:      userId,
+          });
+          stockChanges.push({ productId: prod.id, sku: prod.sku, receivedQty, before, after });
+        } else {
+          const { before, after } = await applyStockChange(tx, {
+            productId:      prod.id,
+            warehouseId:    null,
+            changeQuantity: receivedQty,
+            type:           'PURCHASE_IN',
+            referenceId:    order.orderNo,
+            remark,
+            createdBy:      userId,
+          });
+          stockChanges.push({ productId: prod.id, sku: prod.sku, receivedQty, before, after });
+        }
       }
 
       // ⑤ 读取所有子单最新累计量，判断 PARTIAL 还是 RECEIVED
