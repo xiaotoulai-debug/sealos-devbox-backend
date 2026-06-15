@@ -330,7 +330,7 @@ req.query.sortOrder = 'descend'
 - `WarehouseStock.findMany(productId in ...)`：聚合 `stockQuantity` 为本地可用。
 - `PurchaseOrderItem.findMany(purchaseOrder.status in 活跃状态, purchaseOrder.shopId=当前店铺 OR null)`：按 `productIds` JSON 汇总未入库剩余量为采购在途，兼容老采购单/通用备货。
 - `Product.findMany(sku in ..., status=PURCHASING, purchaseOrderId=null, shopId=当前店铺 OR null)`：按 SKU 汇总采购计划中数量，兼容通用备货计划。
-- `FbeShipmentItem.findMany(productId in ..., shipment.shopId=当前店铺, shipment.status=SHIPPED)`：沿用店铺隔离的 FBE 在途汇总。
+- `FbeShipmentItem.findMany(storeProductId in 当前页 StoreProduct.id, shipment.shopId=当前店铺, shipment.status=SHIPPED)`：按 **StoreProduct 维度**聚合 FBE 在途；历史 `store_product_id IS NULL` 明细仅在 `Product.id` 于该店铺唯一映射一个 StoreProduct 时 fallback，多映射禁止复制到多条 EAN。服务封装见 `services/fbeInTransitQuery.ts`；API 返回 `inTransitScope=STORE_PRODUCT`。
 
 计算公式（2026-06-06 升级）：
 
@@ -939,13 +939,13 @@ RECEIVED（已全部入库）
 | `POST /api/alibaba/accounts/:id/validate` | `routes/alibaba.ts` | 验证账号 token 是否可用 |
 | `POST /api/emag/*` | `routes/emag.ts` | eMAG 类目同步/产品发布 |
 | `POST /api/translate` | `routes/translate.ts` | 翻译代理（MyMemory API 转发，罗马尼亚语→中文等，需登录） |
-| `POST /api/fbe-shipments` | `routes/fbeShipment.ts` | 创建 FBE 发货单（**shopId 必填**，`items[].storeProductId` 优先；批量解析 `StoreProduct.mappedInventorySku → Product.sku → Product.id`，兼容旧前端只传 `sku` 时按 `StoreProduct.sku/vendorSku/pnk/mappedInventorySku` 降级匹配；shipmentNumber 可选自定义） |
-| `POST /api/fbe-shipments/from-purchase-plans` | `routes/fbeShipment.ts` | **采购计划批量创建 FBE 发货单**：入参 `purchasePlanItemIds/productIds` + `shopId` + 可选 `site/warehouseId/items[]`；校验同店铺/同站点、平台产品关联、防重复（`Product.fbeShipmentId`）；成功回写 `sourceStoreProductId/fbeShipmentId/fbeCreatedAt/fbeStatus` |
+| `POST /api/fbe-shipments` | `routes/fbeShipment.ts` | 创建 FBE 发货单（**shopId 必填**，`items[].storeProductId` 主路径；批量解析 `StoreProduct.mappedInventorySku → Product.sku → Product.id`，**明细同时写入 `productId + storeProductId`**；兼容旧前端只传 `sku` 时降级匹配并打 deprecated 日志） |
+| `POST /api/fbe-shipments/from-purchase-plans` | `routes/fbeShipment.ts` | **采购计划批量创建 FBE 发货单**：入参 `purchasePlanItemIds/productIds` + `shopId` + 可选 `site/warehouseId/items[]`；校验同店铺/同站点、平台产品关联、防重复（`Product.fbeShipmentId`）；创建明细写入 `productId + storeProductId`；成功回写 `sourceStoreProductId/fbeShipmentId/fbeCreatedAt/fbeStatus` |
 | `PATCH /api/products/:id/link-store-product` | `routes/product.ts` | 采购计划产品关联 `StoreProduct`（写 `Product.sourceStoreProductId`，同步 `productUrl/mainImage`） |
 | `GET /api/fbe-shipments` | `routes/fbeShipment.ts` | 发货单列表（分页 + 明细 + `productCount`/`totalQuantity` 聚合字段）|
 | `GET /api/fbe-shipments/counts` | `routes/fbeShipment.ts` | 各状态发货单数量（`groupBy status`）；**必须注册在 `GET /:id` 之前**，否则 `counts` 会被误匹配为 `:id` |
 | `PUT /api/fbe-shipments/:id` | `routes/fbeShipment.ts` | 编辑发货单（改单号/备注/明细数量；**支持追加新SKU行**；仅 PENDING/ALLOCATING 可编辑）。`items` 数组两种元素：`{id, quantity}` 更新已有行；`{storeProductId, quantity}` 追加新行（同一事务内执行锁仓）。**无合法 `id` 且无合法 `storeProductId` 的元素 → 400，禁止静默跳过**。 |
-| `GET /api/fbe-shipments/:id` | `routes/fbeShipment.ts` | 发货单详情；`items[]` 顶层 enriched 字段含 `ean/pnk/emagOfferId/productUrl/storeProductId/linkType/linkTypeLabel`（后两者来自同店铺 `StoreProduct.emagLinkType`，DTO 将 DB 值 `RESELL` 映射为 API `FOLLOW_SELL`） |
+| `GET /api/fbe-shipments/:id` | `routes/fbeShipment.ts` | 发货单详情；**优先按 `FbeShipmentItem.storeProductId` 精确关联 StoreProduct**；历史无 `storeProductId` 时仅唯一命中 fallback，多映射返回 `storeProductAmbiguous=true` + `storeProductId=null`；enriched 字段含 `ean/pnk/platformSku/vendorSku/storeProductName/imageUrl/mappedInventorySku/localProductId/linkType/linkTypeLabel` |
 | `PUT /api/fbe-shipments/:id/status` | `routes/fbeShipment.ts` | **4阶段状态机（核心）**：PENDING→ALLOCATING(仅改状态)，ALLOCATING→SHIPPED(**★强校验 stockActual≥qty 否则400回滚**，-stockActual+FBE_OUT流水,+inTransitQty)，SHIPPED→ARRIVED(-inTransitQty+receivedQty)，PENDING/ALLOCATING→CANCELLED(无库存变动)，SHIPPED→CANCELLED(-inTransitQty,+stockActual归还) |
 | `PATCH /api/fbe-shipments/:id/costs` | `routes/fbeShipment.ts` | 登记/更新运费：接收 `overseasFreight`（海外头程）和 `domesticFreight`（国内运费），任意状态可更新；返回含 `totalCost = totalProductValue + overseasFreight + domesticFreight` 的汇总 |
 | `DELETE /api/fbe-shipments/:id` | `routes/fbeShipment.ts` | **超管专属删除**（`requireSuperAdmin`，非超管→403）；$transaction 内按状态回滚库存：PENDING/ALLOCATING→释放 lockedQuantity；SHIPPED→归还 stockQuantity + 扣减 inTransitQuantity + 写 MANUAL_ADJUST 流水；ARRIVED/CANCELLED→无库存操作；最后级联删除 items + 主单 |
@@ -1542,13 +1542,17 @@ page, pageSize, sortBy（SORT_WHITELIST 白名单防注入）, sortOrder, keywor
 
 FBE 发货单支持“无库存预建单，延迟锁库”：
 
-- `POST /api/fbe-shipments`：只创建 `PENDING` 单据和明细，不校验库存、不增加 `lockedQuantity`。新建入参以 `items[].storeProductId` 为主路径，后端批量查询 `store_products` 并通过 `mapped_inventory_sku` 定位本地 `products.sku`；仅传 `sku` 的旧前端请求作为降级路径，按同店铺 `StoreProduct.sku/vendorSku/pnk/mappedInventorySku` 批量匹配，禁止逐行查库。
+- `POST /api/fbe-shipments`：只创建 `PENDING` 单据和明细，不校验库存、不增加 `lockedQuantity`。新建入参以 `items[].storeProductId` 为主路径，后端批量查询 `store_products` 并通过 `mapped_inventory_sku` 定位本地 `products.sku`，**明细表同时持久化 `product_id`（库存扣减）与 `store_product_id`（平台产品溯源）**；仅传 `sku` 的旧前端请求作为降级路径并打 deprecated 日志。
 - `PENDING → ALLOCATING`：唯一锁库点。在 Prisma `$transaction` 内校验 `warehouse_stocks.stock_quantity >= quantity`，满足后执行 `stockQuantity -= quantity`、`lockedQuantity += quantity`，再更新状态。
 - `ALLOCATING → SHIPPED`：只释放 `lockedQuantity` 并增加 `Product.inTransitQuantity`，禁止再次扣减 `stockQuantity`。
 - `PENDING → CANCELLED`：无库存动作。
 - `ALLOCATING → CANCELLED` / 强删：`lockedQuantity` 退回 `stockQuantity`，并同步 `Product.stockActual`。
 
-### 14.2 并发红线
+### 14.2 FBE 明细平台产品溯源（2026-06-15）
+
+`fbe_shipment_items.store_product_id` 记录本次发货对应的 `StoreProduct.id`；`product_id` 继续用于锁仓/扣减/到仓。详情接口优先读 `store_product_id`；平台产品列表在途通过 `services/fbeInTransitQuery.ts` 按 `storeProductId` 聚合。历史无 `store_product_id` 的数据仅当同店铺下 `Product.sku` 唯一映射一个 StoreProduct 时才 fallback；多 EAN 共享同一库存 SKU 时禁止随机取第一条。历史回填 dry-run：`scripts/dry-run-backfill-fbe-shipment-store-product-id.ts`（默认只读）。
+
+### 14.3 并发红线
 
 延迟锁库的实际扣减必须使用条件更新：
 

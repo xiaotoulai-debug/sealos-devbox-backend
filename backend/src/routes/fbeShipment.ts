@@ -20,24 +20,24 @@ import { prisma } from '../lib/prisma';
 import { authenticate, requireSuperAdmin } from '../middleware/auth';
 import { FbeShipmentStatus } from '@prisma/client';
 import { applyStockChange } from './inventory';
+import {
+  LINK_TYPE_LABELS,
+  resolveBrandFromOfferMeta,
+  type EmagLinkType,
+} from '../services/emagLinkType';
 
-/** FBE 详情对外 linkType（DB 存 RESELL，API 统一为 FOLLOW_SELL） */
-type FbeLinkType = 'SELF_BUILT' | 'FOLLOW_SELL' | 'UNKNOWN';
+function normalizeStoredLinkType(value: string | null | undefined): EmagLinkType {
+  return value === 'SELF_BUILT' || value === 'RESELL' || value === 'OWN_BRAND_RESELL' || value === 'UNKNOWN'
+    ? value
+    : 'UNKNOWN';
+}
 
-const FBE_LINK_TYPE_LABELS: Record<FbeLinkType, string> = {
-  SELF_BUILT: '自建链接',
-  FOLLOW_SELL: '跟卖链接',
-  UNKNOWN: '未知',
-};
-
-function toFbeLinkType(emagLinkType: string | null | undefined): { linkType: FbeLinkType; linkTypeLabel: string } {
-  if (emagLinkType === 'SELF_BUILT') {
-    return { linkType: 'SELF_BUILT', linkTypeLabel: FBE_LINK_TYPE_LABELS.SELF_BUILT };
-  }
-  if (emagLinkType === 'RESELL') {
-    return { linkType: 'FOLLOW_SELL', linkTypeLabel: FBE_LINK_TYPE_LABELS.FOLLOW_SELL };
-  }
-  return { linkType: 'UNKNOWN', linkTypeLabel: FBE_LINK_TYPE_LABELS.UNKNOWN };
+function toStoreProductLinkMeta(emagLinkType: string | null | undefined): {
+  linkType: EmagLinkType;
+  linkTypeLabel: string;
+} {
+  const linkType = normalizeStoredLinkType(emagLinkType);
+  return { linkType, linkTypeLabel: LINK_TYPE_LABELS[linkType] };
 }
 
 function normalizeInventorySku(value: string | null | undefined): string {
@@ -396,8 +396,9 @@ router.post('/from-purchase-plans', async (req: Request, res: Response) => {
           ownerId: userId,
           items: {
             create: resolvedLines.map((line) => ({
-              productId: skuToProductId.get(line.productSku)!,
-              quantity: line.quantity,
+              productId:        skuToProductId.get(line.productSku)!,
+              storeProductId:   line.storeProductId,
+              quantity:         line.quantity,
               receivedQuantity: 0,
             })),
           },
@@ -633,9 +634,13 @@ router.post('/', async (req: Request, res: Response) => {
     if (unmappedStoreProducts.length > 0) {
       res.status(400).json({
         code: 400, data: null,
-        message: `该平台商品尚未绑定本地库存 SKU，请先在平台产品页面完成关联：${unmappedStoreProducts.join(', ')}`,
+        message: `该平台产品未绑定有效库存 SKU，请先在平台产品页绑定库存 SKU：${unmappedStoreProducts.join(', ')}`,
       });
       return;
+    }
+
+    if (parsedItems.some((i) => i.storeProductId === null && i.sku)) {
+      console.warn('[FBE] DEPRECATED: items[].sku 兼容路径即将废弃，请前端传 storeProductId');
     }
 
     const mappedInventorySkus = [...new Set(resolvedLines.map((line) => line.productSku))];
@@ -689,6 +694,7 @@ router.post('/', async (req: Request, res: Response) => {
         items: {
           create: resolvedLines.map((i) => ({
             productId:        skuToProductId.get(i.productSku)!,
+            storeProductId:   i.storeProductId,
             quantity:         i.quantity,
             receivedQuantity: 0,
           })),
@@ -823,107 +829,178 @@ router.get('/counts', async (req: Request, res: Response) => {
 
 type FbeItemStoreProductMeta = {
   storeProductId: number | null;
+  storeProductAmbiguous: boolean;
   pnk: string | null;
   ean: string | null;
+  platformSku: string | null;
+  vendorSku: string | null;
+  storeProductName: string | null;
   emagOfferId: string | null;
   productUrl: string | null;
-  linkType: FbeLinkType;
+  linkType: EmagLinkType;
   linkTypeLabel: string;
+  brand: string | null;
+  platformBrand: string | null;
+  imageUrl: string | null;
+  mappedInventorySku: string | null;
 };
 
-/** 为 FBE 明细批量解析同店铺 StoreProduct（sourceStoreProductId 优先，其次 sku/vendorSku/pnk/mappedInventorySku） */
-async function resolveStoreProductMetaForShipmentItems(
-  shopId: number | null,
-  items: Array<{
-    product: {
-      id: number;
-      sku: string | null;
-      pnk: string | null;
-      sourceStoreProductId: number | null;
-    };
-  }>,
-): Promise<Map<number, FbeItemStoreProductMeta>> {
-  const emptyLink = toFbeLinkType(null);
-  const empty: FbeItemStoreProductMeta = {
+const STORE_PRODUCT_DETAIL_SELECT = {
+  id: true,
+  pnk: true,
+  ean: true,
+  sku: true,
+  vendorSku: true,
+  name: true,
+  emagOfferId: true,
+  productUrl: true,
+  emagLinkType: true,
+  emagOfferMeta: true,
+  mainImage: true,
+  imageUrl: true,
+  mappedInventorySku: true,
+} as const;
+
+function storeProductToFbeItemMeta(sp: {
+  id: number;
+  pnk: string;
+  ean: string | null;
+  sku: string | null;
+  vendorSku: string | null;
+  name: string;
+  emagOfferId: string | null;
+  productUrl: string | null;
+  emagLinkType: string | null;
+  emagOfferMeta: unknown;
+  mainImage: string | null;
+  imageUrl: string | null;
+  mappedInventorySku: string | null;
+}): FbeItemStoreProductMeta {
+  const linkMeta = toStoreProductLinkMeta(sp.emagLinkType);
+  const platformBrand = resolveBrandFromOfferMeta(sp.emagOfferMeta);
+  return {
+    storeProductId: sp.id,
+    storeProductAmbiguous: false,
+    pnk: sp.pnk ?? null,
+    ean: sp.ean ?? null,
+    platformSku: sp.sku ?? null,
+    vendorSku: sp.vendorSku ?? null,
+    storeProductName: sp.name ?? null,
+    emagOfferId: sp.emagOfferId ?? null,
+    productUrl: sp.productUrl ?? null,
+    linkType: linkMeta.linkType,
+    linkTypeLabel: linkMeta.linkTypeLabel,
+    brand: platformBrand,
+    platformBrand,
+    imageUrl: sp.mainImage ?? sp.imageUrl ?? null,
+    mappedInventorySku: sp.mappedInventorySku ?? null,
+  };
+}
+
+function emptyFbeItemStoreProductMeta(pnk: string | null, ambiguous = false): FbeItemStoreProductMeta {
+  const emptyLink = toStoreProductLinkMeta(null);
+  return {
     storeProductId: null,
-    pnk: null,
+    storeProductAmbiguous: ambiguous,
+    pnk,
     ean: null,
+    platformSku: null,
+    vendorSku: null,
+    storeProductName: null,
     emagOfferId: null,
     productUrl: null,
     linkType: emptyLink.linkType,
     linkTypeLabel: emptyLink.linkTypeLabel,
+    brand: null,
+    platformBrand: null,
+    imageUrl: null,
+    mappedInventorySku: null,
   };
+}
+
+/** 为 FBE 明细批量解析平台产品：优先 item.storeProductId，历史数据仅唯一命中 fallback */
+async function resolveFbeItemStoreProductMeta(
+  shopId: number | null,
+  items: Array<{
+    id: number;
+    storeProductId: number | null;
+    product: { id: number; sku: string | null; pnk: string | null };
+  }>,
+): Promise<Map<number, FbeItemStoreProductMeta>> {
   const result = new Map<number, FbeItemStoreProductMeta>();
   if (!shopId) {
     for (const item of items) {
-      result.set(item.product.id, { ...empty, pnk: item.product.pnk ?? null });
+      result.set(item.id, emptyFbeItemStoreProductMeta(item.product.pnk ?? null));
     }
     return result;
   }
 
-  const sourceIds = [...new Set(
-    items.map((i) => i.product.sourceStoreProductId).filter((id): id is number => id != null && id > 0),
-  )];
-  const skus = [...new Set(
-    items.map((i) => normalizeInventorySku(i.product.sku)).filter(Boolean),
-  )];
-
-  const orClauses: Array<Record<string, unknown>> = [];
-  if (sourceIds.length > 0) orClauses.push({ id: { in: sourceIds } });
-  if (skus.length > 0) {
-    orClauses.push(
-      { mappedInventorySku: { in: skus } },
-      { sku: { in: skus } },
-      { vendorSku: { in: skus } },
-      { pnk: { in: skus } },
-    );
-  }
-
-  const storeProducts = orClauses.length > 0
+  const directIds = [
+    ...new Set(items.map((i) => i.storeProductId).filter((id): id is number => id != null && id > 0)),
+  ];
+  const directStoreProducts = directIds.length > 0
     ? await prisma.storeProduct.findMany({
-        where: { shopId, isArchived: false, OR: orClauses },
-        select: {
-          id: true, pnk: true, ean: true, emagOfferId: true, productUrl: true,
-          sku: true, vendorSku: true, mappedInventorySku: true, emagLinkType: true,
-        },
+        where: { id: { in: directIds }, shopId, isArchived: false },
+        select: STORE_PRODUCT_DETAIL_SELECT,
+      })
+    : [];
+  const directById = new Map(directStoreProducts.map((sp) => [sp.id, sp]));
+
+  const legacyItems = items.filter((i) => !i.storeProductId);
+  const legacySkus = [
+    ...new Set(legacyItems.map((i) => normalizeInventorySku(i.product.sku)).filter(Boolean)),
+  ];
+  const legacyCandidates = legacySkus.length > 0
+    ? await prisma.storeProduct.findMany({
+        where: { shopId, isArchived: false, mappedInventorySku: { in: legacySkus } },
+        select: STORE_PRODUCT_DETAIL_SELECT,
         orderBy: { id: 'asc' },
       })
     : [];
-
-  const byId = new Map(storeProducts.map((sp) => [sp.id, sp]));
-  const lookupBySkuKey = new Map<string, (typeof storeProducts)[number]>();
-  for (const sp of storeProducts) {
-    for (const key of [sp.mappedInventorySku, sp.sku, sp.vendorSku, sp.pnk]) {
-      const normalized = normalizeInventorySku(key);
-      if (!normalized) continue;
-      if (!lookupBySkuKey.has(normalized)) lookupBySkuKey.set(normalized, sp);
-      const lower = normalized.toLowerCase();
-      if (!lookupBySkuKey.has(lower)) lookupBySkuKey.set(lower, sp);
-    }
+  const legacyBySku = new Map<string, typeof legacyCandidates>();
+  for (const sp of legacyCandidates) {
+    const sku = normalizeInventorySku(sp.mappedInventorySku);
+    if (!sku) continue;
+    const arr = legacyBySku.get(sku) ?? [];
+    arr.push(sp);
+    legacyBySku.set(sku, arr);
   }
 
   for (const item of items) {
-    const p = item.product;
-    let sp = p.sourceStoreProductId ? byId.get(p.sourceStoreProductId) : undefined;
-    if (!sp) {
-      const sku = normalizeInventorySku(p.sku);
-      if (sku) {
-        sp = lookupBySkuKey.get(sku) ?? lookupBySkuKey.get(sku.toLowerCase());
+    if (item.storeProductId) {
+      const sp = directById.get(item.storeProductId);
+      if (sp) {
+        result.set(item.id, storeProductToFbeItemMeta(sp));
+      } else {
+        console.warn(
+          `[FBE] 明细 storeProductId=${item.storeProductId} 在店铺 ${shopId} 未找到，itemId=${item.id}`,
+        );
+        result.set(item.id, emptyFbeItemStoreProductMeta(item.product.pnk ?? null));
       }
+      continue;
     }
-    const linkMeta = toFbeLinkType(sp?.emagLinkType);
-    result.set(p.id, sp
-      ? {
-          storeProductId: sp.id,
-          pnk: sp.pnk ?? null,
-          ean: sp.ean ?? null,
-          emagOfferId: sp.emagOfferId ?? null,
-          productUrl: sp.productUrl ?? null,
-          linkType: linkMeta.linkType,
-          linkTypeLabel: linkMeta.linkTypeLabel,
-        }
-      : { ...empty, pnk: p.pnk ?? null });
+
+    const sku = normalizeInventorySku(item.product.sku);
+    if (!sku) {
+      result.set(item.id, emptyFbeItemStoreProductMeta(item.product.pnk ?? null));
+      continue;
+    }
+
+    const candidates = legacyBySku.get(sku) ?? [];
+    if (candidates.length === 1) {
+      result.set(item.id, storeProductToFbeItemMeta(candidates[0]));
+    } else if (candidates.length > 1) {
+      console.warn(
+        `[FBE] FBE历史明细平台产品来源不唯一，无法自动判定 storeProductId ` +
+        `itemId=${item.id} productId=${item.product.id} shopId=${shopId} ` +
+        `candidates=[${candidates.map((c) => c.id).join(',')}]`,
+      );
+      result.set(item.id, emptyFbeItemStoreProductMeta(item.product.pnk ?? null, true));
+    } else {
+      result.set(item.id, emptyFbeItemStoreProductMeta(item.product.pnk ?? null));
+    }
   }
+
   return result;
 }
 
@@ -973,31 +1050,44 @@ router.get('/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    const storeMetaByProductId = await resolveStoreProductMetaForShipmentItems(raw.shopId, raw.items);
+    const storeMetaByItemId = await resolveFbeItemStoreProductMeta(raw.shopId, raw.items.map((item) => ({
+      id: item.id,
+      storeProductId: item.storeProductId,
+      product: item.product,
+    })));
     const enrichedItems = raw.items.map((item) => {
-      const meta = storeMetaByProductId.get(item.product.id) ?? {
-        storeProductId: null,
-        pnk: item.product.pnk ?? null,
-        ean: null,
-        emagOfferId: null,
-        productUrl: null,
-        linkType: 'UNKNOWN' as FbeLinkType,
-        linkTypeLabel: FBE_LINK_TYPE_LABELS.UNKNOWN,
-      };
+      const meta = storeMetaByItemId.get(item.id) ?? emptyFbeItemStoreProductMeta(item.product.pnk ?? null);
+      const displayImage = meta.imageUrl ?? item.product.imageUrl ?? null;
       return {
-        ...item,
+        id: item.id,
+        shipmentId: item.shipmentId,
         productId: item.product.id,
+        storeProductId: meta.storeProductId,
+        quantity: item.quantity,
+        receivedQuantity: item.receivedQuantity,
+        localProductId: item.product.id,
         sku: item.product.sku ?? null,
+        mappedInventorySku: meta.mappedInventorySku ?? item.product.sku ?? null,
         chineseName: item.product.chineseName ?? null,
         productName: item.product.chineseName ?? item.product.title ?? null,
-        imageUrl: item.product.imageUrl ?? null,
-        storeProductId: meta.storeProductId,
-        pnk: meta.pnk,
+        imageUrl: displayImage,
+        storeProductName: meta.storeProductName,
+        platformSku: meta.platformSku,
+        vendorSku: meta.vendorSku,
+        pnk: meta.pnk ?? item.product.pnk ?? null,
         ean: meta.ean,
         emagOfferId: meta.emagOfferId,
         productUrl: meta.productUrl,
         linkType: meta.linkType,
         linkTypeLabel: meta.linkTypeLabel,
+        brand: meta.brand,
+        platformBrand: meta.platformBrand,
+        storeProductAmbiguous: meta.storeProductAmbiguous,
+        product: item.product,
+        link_type: meta.linkType,
+        link_type_label: meta.linkTypeLabel,
+        platform_brand: meta.platformBrand,
+        product_url: meta.productUrl,
       };
     });
 
@@ -1064,13 +1154,29 @@ router.put('/:id', async (req: Request, res: Response) => {
       return;
     }
 
-    type UpdateItem = { id: number; quantity: number };
-    type AppendItem = { storeProductId: number; quantity: number };
-
     const { shipmentNumber, remark, items } = req.body as {
       shipmentNumber?: string;
       remark?: string;
-      items?: Array<UpdateItem | AppendItem>;
+      items?: Array<Record<string, unknown>>;
+    };
+
+    console.log('[FBE PUT items]', JSON.stringify(req.body?.items));
+
+    type UpdateItem = { id: number; quantity: number };
+    type AppendItem = { storeProductId: number; quantity: number };
+
+    const rejectAppendWithoutStoreProductId = (item: Record<string, unknown>) => {
+      res.status(400).json({
+        code: 400,
+        data: null,
+        message: '新增 FBE 明细必须提供 storeProductId，禁止使用 sku/productId 旧路径',
+      });
+    };
+
+    const parsePositiveInt = (value: unknown): number | null => {
+      if (value === null || value === undefined || value === '') return null;
+      const num = typeof value === 'number' ? value : Number(value);
+      return Number.isInteger(num) && num > 0 ? num : null;
     };
 
     // ── 分拣 items：已有行（有 id）vs 新追加行（有 storeProductId，无 id）──
@@ -1078,24 +1184,33 @@ router.put('/:id', async (req: Request, res: Response) => {
     const appendItems: AppendItem[] = [];
 
     if (Array.isArray(items) && items.length > 0) {
-      for (const item of items) {
-        if (!item.quantity || !Number.isInteger(item.quantity) || item.quantity <= 0) {
+      for (const rawItem of items) {
+        const item = rawItem as Record<string, unknown>;
+        const quantity = Number(item.quantity);
+        if (!Number.isInteger(quantity) || quantity <= 0) {
           res.status(400).json({ code: 400, data: null, message: 'quantity 必须为正整数' });
           return;
         }
-        if ('id' in item && Number.isInteger((item as UpdateItem).id)) {
-          updateItems.push(item as UpdateItem);
-        } else if ('storeProductId' in item && Number.isInteger((item as AppendItem).storeProductId)) {
-          appendItems.push(item as AppendItem);
-        } else {
-          // ★ 明确拒绝：元素既没有合法 id（更新已有行），也没有合法 storeProductId（追加新行）
-          res.status(400).json({
-            code: 400,
-            data: null,
-            message: `items 元素格式非法：每个元素必须携带合法的 "id"（更新已有明细）或 "storeProductId"（追加新产品），收到：${JSON.stringify(item)}`,
-          });
+
+        const itemId = parsePositiveInt(item.id);
+        const storeProductId = parsePositiveInt(item.storeProductId);
+        const hasLegacyAppendFields = 'productId' in item || 'sku' in item;
+
+        if (itemId !== null) {
+          updateItems.push({ id: itemId, quantity });
+          continue;
+        }
+
+        if (storeProductId === null) {
+          rejectAppendWithoutStoreProductId(item);
           return;
         }
+
+        if (hasLegacyAppendFields) {
+          console.warn('[FBE PUT] 追加明细携带 sku/productId 旧字段，已忽略，仅使用 storeProductId=', storeProductId);
+        }
+
+        appendItems.push({ storeProductId, quantity });
       }
     }
 
@@ -1211,6 +1326,12 @@ router.put('/:id', async (req: Request, res: Response) => {
       for (const appendItem of appendItems) {
         const sp      = storeProductMap.get(appendItem.storeProductId)!;
         const product = productBySkuMap.get(sp.mappedInventorySku!)!;
+        console.log('[FBE append create]', {
+          storeProductId: appendItem.storeProductId,
+          productId: product.id,
+          mappedInventorySku: sp.mappedInventorySku,
+          quantity: appendItem.quantity,
+        });
         resolvedAppends.push({
           storeProductId: appendItem.storeProductId,
           productId:      product.id,
@@ -1303,6 +1424,7 @@ router.put('/:id', async (req: Request, res: Response) => {
             data: {
               shipmentId:       id,
               productId:        ra.productId,
+              storeProductId:   ra.storeProductId,
               quantity:         ra.quantity,
               receivedQuantity: 0,
             },

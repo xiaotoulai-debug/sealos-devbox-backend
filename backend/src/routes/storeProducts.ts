@@ -40,6 +40,7 @@ import {
   STOCK_STATUS_FILTERS,
   type StockGroupKey,
 } from '../services/storeProductOverview';
+import { buildStoreProductInTransitMap } from '../services/fbeInTransitQuery';
 import {
   calculateComprehensiveSales,
   calculateStockStatus,
@@ -1153,12 +1154,21 @@ router.get('/', async (req: Request, res: Response) => {
       }
     }
 
-    // ── 按当前店铺隔离计算 FBE 在途库存（SKU / Product.id 维度，非 PNK 维度）──
-    // Product.inTransitQuantity 是全局累积值，跨店污染；此处实时聚合：
-    //   条件：发货单 shopId === 当前 shopId，状态为 SHIPPED（已发但未入仓）
-    //   聚合 key = 本地 Product.id（通过 mappedInventorySku / sku 映射）
-    // 如果多个 StoreProduct / PNK 绑定同一个本地 Product.id，它们会共享同一在途数量。
-    // 这不是 PNK 维度；API 返回 inTransitScope=SKU 标明口径。
+    // ── 按当前店铺隔离计算 FBE 在途库存（StoreProduct 维度）──
+    const pageStoreProductIds = list.map((p) => p.id);
+    const productIdByStoreProductId = new Map<number, number>();
+    for (const p of list) {
+      const skuKey = (p.mappedInventorySku ?? '').trim() || (p.sku ?? p.vendorSku ?? '').trim();
+      const inv = (skuKey ? inventoryMap.get(normalizeSkuKey(skuKey)) : undefined) ?? pnkMap.get(p.pnk);
+      if (inv?.localProductId != null) {
+        productIdByStoreProductId.set(p.id, inv.localProductId);
+      }
+    }
+
+    const storeProductInTransitMap = pageStoreProductIds.length > 0
+      ? await buildStoreProductInTransitMap(shopId, pageStoreProductIds, productIdByStoreProductId)
+      : new Map<number, number>();
+
     const allProductIds = [...inventoryMap.values()]
       .map((e) => e.localProductId)
       .filter((id): id is number => id !== null);
@@ -1229,36 +1239,6 @@ router.get('/', async (req: Request, res: Response) => {
         const key = normalizeSkuKey(prod.sku);
         if (!key) continue;
         planningStockMap.set(key, (planningStockMap.get(key) ?? 0) + Number(prod.purchaseQuantity ?? 0));
-      }
-    }
-
-    // productId → 该店在途数量
-    const shopInTransitMap = new Map<number, number>();
-    if (productIdsToCheck.length > 0) {
-      const fbeItems = await prisma.fbeShipmentItem.findMany({
-        where: {
-          productId: { in: productIdsToCheck },
-          shipment:  { shopId, status: 'SHIPPED' },   // ★ 核心隔离：仅计当前店 + 在途状态
-        },
-        select: { productId: true, quantity: true },
-      });
-      for (const item of fbeItems) {
-        shopInTransitMap.set(
-          item.productId,
-          (shopInTransitMap.get(item.productId) ?? 0) + item.quantity,
-        );
-      }
-    }
-
-    // 将店铺级在途数回写到 inventoryMap / pnkMap，覆盖全局字段
-    for (const entry of inventoryMap.values()) {
-      if (entry.localProductId !== null) {
-        entry.inTransitQuantity = shopInTransitMap.get(entry.localProductId) ?? 0;
-      }
-    }
-    for (const entry of pnkMap.values()) {
-      if (entry.localProductId !== null) {
-        entry.inTransitQuantity = shopInTransitMap.get(entry.localProductId) ?? 0;
       }
     }
 
@@ -1373,8 +1353,8 @@ router.get('/', async (req: Request, res: Response) => {
       const stockAgg = inv?.localProductId != null
         ? warehouseStockMap.get(inv.localProductId)
         : undefined;
-      // FBE 平台在途必须与列表「在途库存」列同源，避免明细气泡与主列不一致。
-      const fbeInTransitQuantity = Number(inv?.inTransitQuantity ?? 0);
+      // FBE 平台在途：StoreProduct 维度（当前页精确聚合，不复制到同 SKU 的其他 EAN）
+      const fbeInTransitQuantity = storeProductInTransitMap.get(p.id) ?? 0;
       const effectiveSignals = stockSignalMap.get(p.id)!;
       const fallbackClassification = classifyStoreProduct({
         stock: stockNum,
@@ -1542,8 +1522,8 @@ router.get('/', async (req: Request, res: Response) => {
         inTransitQuantity: fbeInTransitQuantity,
         sku_in_transit_quantity: fbeInTransitQuantity,
         skuInTransitQuantity: fbeInTransitQuantity,
-        in_transit_scope: 'SKU',
-        inTransitScope: 'SKU',
+        in_transit_scope: 'STORE_PRODUCT',
+        inTransitScope: 'STORE_PRODUCT',
         purchaseSuggestion: {
           ...purchaseSuggestion,
           platformInTransit: fbeInTransitQuantity,

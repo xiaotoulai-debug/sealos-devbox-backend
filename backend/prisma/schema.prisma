@@ -353,6 +353,7 @@ model StoreProduct {
   shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
   inventorySnapshots StoreProductInventorySnapshot[]
   purchasePlanProducts Product[] @relation("ProductSourceStoreProduct")
+  fbeShipmentItems FbeShipmentItem[]
 
   @@unique([shopId, pnk])
   @@unique([shopId, sku])
@@ -1069,12 +1070,15 @@ model FbeShipmentItem {
   id               Int         @id @default(autoincrement())
   shipmentId       Int         @map("shipment_id")
   productId        Int         @map("product_id")
+  storeProductId   Int?        @map("store_product_id")
   quantity         Int
   receivedQuantity Int         @default(0) @map("received_quantity")
   shipment         FbeShipment @relation(fields: [shipmentId], references: [id], onDelete: Cascade)
   product          Product     @relation(fields: [productId], references: [id])
+  storeProduct     StoreProduct? @relation(fields: [storeProductId], references: [id], onDelete: SetNull)
 
   @@index([shipmentId])
   @@index([productId])
+  @@index([storeProductId])
   @@map("fbe_shipment_items")
 }
