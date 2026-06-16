@@ -123,6 +123,10 @@ type PriceContext = {
     logisticsCost: number | null;
     commissionRate: number | null;
     vatRate: number | null;
+    fbeFeeCny: number | null;
+    fbeLocal: number | null;
+    isEstimatedFbe: boolean;
+    exchangeRateCnyToLocal: number | null;
   };
 };
 
@@ -164,6 +168,9 @@ export type GrabCartPreviewResult = {
   profitMarginPctAfter: number | null;
   costStatus: CostStatus;
   costWarnings: string[];
+  commissionRate: number | null;
+  fbeFeeCny: number | null;
+  fbeLocal: number | null;
   warnings: string[];
 };
 
@@ -1365,11 +1372,13 @@ export async function loadPriceContext(params: { shopId: number; storeProductId:
       )
     : null;
   const headFreightLocal = headFreightCny != null && cnyToLocal != null ? headFreightCny * cnyToLocal : null;
-  const fbeLocal = localProduct?.fbeFee != null
+  const isEstimatedFbe = localProduct?.fbeFee == null;
+  const fbeFeeCny = localProduct?.fbeFee != null
     ? Number(localProduct.fbeFee)
     : cnyToLocal != null
-      ? DEFAULT_FBE_CNY * cnyToLocal
+      ? DEFAULT_FBE_CNY
       : null;
+  const fbeLocal = fbeFeeCny != null && cnyToLocal != null ? fbeFeeCny * cnyToLocal : null;
   const logisticsCost = headFreightLocal != null && fbeLocal != null ? headFreightLocal + fbeLocal : null;
 
   let commissionRate = storeProduct.commissionRate != null ? Number(storeProduct.commissionRate) : null;
@@ -1405,7 +1414,7 @@ export async function loadPriceContext(params: { shopId: number; storeProductId:
     hasAnyLogisticsDimension: hasWeight || hasVolume,
     hasCompleteLogisticsDimensions: hasWeight && hasVolume,
     isEstimatedLogistics: headFreightCny == null ? false : !(hasWeight && hasVolume),
-    isEstimatedFbeFee: localProduct?.fbeFee == null,
+    isEstimatedFbeFee: isEstimatedFbe,
     isEstimatedCommission,
     isEstimatedVat: vatResolution.isEstimatedVat,
   });
@@ -1452,6 +1461,10 @@ export async function loadPriceContext(params: { shopId: number; storeProductId:
       logisticsCost,
       commissionRate,
       vatRate: vatResolution.vatRate,
+      fbeFeeCny: fbeFeeCny != null ? roundPrice(fbeFeeCny) : null,
+      fbeLocal: fbeLocal != null ? roundPrice(fbeLocal) : null,
+      isEstimatedFbe,
+      exchangeRateCnyToLocal: cnyToLocal,
     },
   };
 }
@@ -1631,6 +1644,9 @@ export async function buildGrabCartPreview(params: {
       profitMarginPctAfter: null,
       costStatus: 'MISSING_COST',
       costWarnings: [],
+      commissionRate: null,
+      fbeFeeCny: null,
+      fbeLocal: null,
       warnings: [],
     };
   }
@@ -1680,6 +1696,9 @@ export async function buildGrabCartPreview(params: {
     cartPriceExVat: cart.cartPriceExVat,
     grabStep: context.strategy.grabStep,
     suggestedGrabPriceExVat,
+    commissionRate: context.rawLocalCost.commissionRate,
+    fbeFeeCny: context.rawLocalCost.fbeFeeCny,
+    fbeLocal: context.rawLocalCost.fbeLocal,
     estimatedProfitAfter: profit.estimatedProfitAfter,
     profitMarginPctAfter: profit.profitMarginPctAfter,
     warnings: [...context.minPrices.warnings, ...cart.warnings],

@@ -635,6 +635,40 @@ Phase B-4 新增 eMAG `GET /api/v1/commission/estimate/{extId}` 只读调用能�
 - 同步成功后 `isEstimatedCommission=false`，可消除「佣金率来自字典或默认配置」warning。
 - FBE 估算仍可能阻断抢车 preview，留 Phase B-5。
 
+### 4.5.2.8 Product.fbeFee 统一 CNY 口径（Phase B-5b，2026-06-16）
+
+Phase B-5a.1 审计确认：`Product.fbeFee` 业务原意为 **CNY**，但非空时部分代码曾直接当作站点币种（RON/EUR/HUF）使用，与 `DEFAULT_FBE_CNY=7` 兜底路径口径分裂。Phase B-5b 统一修复。
+
+**字段定义：**
+
+- `products.fbe_fee`：FBE 履约费，**单位 CNY**，与 `purchase_price`、`freight_cost` 一致。
+- `DEFAULT_FBE_CNY = 7`：仅当 `fbe_fee IS NULL` 时的缺省估算值（≈5 RON / ≈1 EUR / ≈2000 HUF），`isEstimatedFbe=true`。
+
+**换算规则（全链路统一）：**
+
+```text
+fbeFeeCny = Product.fbeFee != null ? Number(Product.fbeFee) : DEFAULT_FBE_CNY
+fbeLocal  = fbeFeeCny * exchange_rates(CNY→站点币种)
+logisticsCost = headFreightLocal + fbeLocal
+```
+
+**涉及服务：**
+
+| 服务 | 行为 |
+|------|------|
+| `profitCalculator.ts` | 利润预计算；`profitBreakdown` 保留 `fbeFeeCny`、`fbeLocal`、`fbe`（当地币，兼容旧字段）、`isEstimatedFbe` |
+| `emagPrice.ts` | 手动改价 / 抢购物车 preview / 价格保护；preview 额外返回 `fbeFeeCny`、`fbeLocal`、`commissionRate` |
+| `orderProfitCalculator.ts` | 订单毛利 fallback：`profitBreakdown.fbe` 已是当地币不二次换算；直接读 `Product.fbeFee` 时按 CNY→订单币种换算 |
+
+**FBE 账单 API 边界（Phase B-5）：**
+
+- eMAG `invoice/read` 可见账期 FBE 费用汇总，但无法精确关联 SKU/PNK/EAN/orderId，**暂不做自动回填** `Product.fbeFee`；当前仍建议人工维护或规则估算。
+
+**抢购物车安全边界：**
+
+- `grabCartAllowEstimatedCost` 默认 `false`；`costStatus=ESTIMATED`（含 FBE 缺省估算）时 preview / execute 阻断。
+- `grab-cart/execute` 禁止在估算 FBE 成本下执行真实改价。
+
 **运营动作建议 operationAdvice（实时 DTO，不落库）**：`GET /api/store-products` 每行返回双命名 `operationAdvice/operation_advice`，用于回答“运营接下来做什么”，与 `purchaseSuggestion` 的供应链采购动作分离。规则引擎实时使用四类主分类与风险标签含义：主推款优先保供、补货和广告；成长款观察趋势并适度加广告；常规款正常维护；清理款降价、清仓或停止采购。动作集合：`REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/RAISE_PRICE/LOWER_PRICE/JOIN_CAMPAIGN/ADVERTISE/CLEARANCE/PAUSE_PURCHASE/WAIT_FOR_ARRIVAL/OBSERVE`；优先级：`P0/P1/P2/P3`。断货补货规则优先于普通调价、广告、活动和观察兜底：`stock=0 && replenishReferenceDailySales>0 && coverageStock<=0` 返回立即/紧急补货，`coverageStock<targetStock` 返回仍需补货，`coverageStock>=targetStock` 返回等待到货。其他规则按顺序短路：负毛利动销异常、清仓处理、暂停采购、等待到货、建议涨价、建议降价、加广告、参加活动、观察即可。阈值集中配置为 `lowProfitMarginPct=15`、`goodProfitMarginPct=25`、`lowStockDays=30`、`warningStockDays=60`、`overstockDays=120`、`clearanceStockThreshold=10`；`profitMarginPct` 单位是百分数（`15` 表示 15%）。因当前缺少竞品价格、价格历史、广告 ROI、曝光点击转化数据，涨价/降价/广告/活动文案必须表达为“可考虑/测试”，不能作为强结论。
 
 **补货参考日销**：`purchaseSuggestion` 与 `operationAdvice` 统一使用 `replenishReferenceDailySales = max(comprehensiveSales, sales30/30, sales90/90, sales180/180)`。该指标只用于采购建议和运营建议，不改变 `productClass` 分类；`targetStockDays` 按分类/阶段常量解析（HOT=90 等），`coverageStock = platformStock + platformInTransit + purchasingInTransit + planningStock`（不含 localStock），`suggestAmount = max(0, ceil(replenishReferenceDailySales * targetStockDays) - coverageStock)`。清理款默认 targetStockDays=0；复活观察时 targetStockDays=30。
@@ -753,11 +787,11 @@ graph TD
 
 **税口径字段（Phase 3A）**：`summary/days/currencyGroups.*` 统一返回 `amountWithVat/vatAmount/salesTaxMode/profitFormulaVersion`。`salesTaxMode='ex_vat'`，`profitFormulaVersion='order_profit_v1_ex_vat_phase3a'`。退款订单的 `raw_json.refunded_amount` 经样本验证多为含 VAT 金额；当前优先用 `raw_json.products[].sale_price * storno_qty` 计算不含 VAT `refundAmount`，无法从商品明细还原时才回退到原始退款金额并输出 warning。
 
-**完整毛利成本项（Phase 3B）**：`profitFormulaVersion='order_profit_v2_ex_vat_full_cost_phase3b'`。订单毛利不直接使用 `store_products.estimated_profit * quantity`，而是逐订单商品用真实不含税成交价计算：`commissionCost = sale_price * quantity * commissionRate`，`productCost = products.purchase_price(CNY) * CNY→订单币种 * quantity`，`firstLegCost = calcHeadFreightCny(length,width,height,actualWeight) * CNY→订单币种 * quantity`，`fulfillmentCost = FBE本地币费用 * quantity`，`returnLossCost = purchase_price(CNY) * return_loss_rate * CNY→订单币种 * quantity`。`grossProfit = netSales - commissionCost - productCost - firstLegCost - fulfillmentCost - returnLossCost`，`grossMargin = grossProfit / netSales * 100`。
+**完整毛利成本项（Phase 3B）**：`profitFormulaVersion='order_profit_v2_ex_vat_full_cost_phase3b'`。订单毛利不直接使用 `store_products.estimated_profit * quantity`，而是逐订单商品用真实不含税成交价计算：`commissionCost = sale_price * quantity * commissionRate`，`productCost = products.purchase_price(CNY) * CNY→订单币种 * quantity`，`firstLegCost = calcHeadFreightCny(length,width,height,actualWeight) * CNY→订单币种 * quantity`，`fulfillmentCost = (products.fbe_fee(CNY) * CNY→订单币种) * quantity`（或优先使用已换算的 `profitBreakdown.fbe`），`returnLossCost = purchase_price(CNY) * return_loss_rate * CNY→订单币种 * quantity`。`grossProfit = netSales - commissionCost - productCost - firstLegCost - fulfillmentCost - returnLossCost`，`grossMargin = grossProfit / netSales * 100`。
 
 **订单 FBE 取值优先级（2026-05-30 修正）**：`orderProfitCalculator.ts` 中 `fulfillmentCost` 优先读取命中的 `StoreProduct.profitBreakdown.fbe`，仅当 `store_products.currency` 与 `profitBreakdown.currency` 同订单币种一致时直接使用，并在商品级 `profitBreakdown.fbeFeeSource` 返回 `store_product_profit_breakdown`；若不存在或币种不一致，再读取 `products.fbe_fee`（来源 `product_fbe_fee`）；仍缺失时按 0 估算（来源 `missing`）并输出 `profitWarnings`。这样平台订单页与平台产品页共用平台产品利润预计算出的 FBE 成本口径；注意 `store_products.profit_breakdown` 是缓存，汇率或 FBE 规则变更后需重算平台产品利润才能同步刷新。
 
-**利润可靠性（Phase 3B）**：`summary/days/currencyGroups.*` 返回 `firstLegCost/returnLossCost/profitWarnings/costReliabilityStatus`。`costReliabilityStatus` 可为 `complete/estimated/partial/missing`；`grossProfitReliable=true` 仅当采购成本、汇率、精确佣金率、FBE 运费、头程尺寸/重量等关键成本完整。缺 Product、采购价、汇率会进入 `partial/missing`；佣金率使用字典/默认值、FBE 缺失按 0、头程尺寸重量缺失按 0 会进入 `estimated`。如果 `StoreProduct.profitBreakdown.fbe` 标记 `isEstimatedFbe=true`，订单利润同样保持 `estimated` 可靠性状态。`returnLossRate` 为空时按 0 估算并记录 `profitWarnings`，但不单独拉低可靠性。FBE 运费本阶段沿用平台产品现有口径，按站点本地币种处理，不做二次 CNY 折算。
+**利润可靠性（Phase 3B）**：`summary/days/currencyGroups.*` 返回 `firstLegCost/returnLossCost/profitWarnings/costReliabilityStatus`。`costReliabilityStatus` 可为 `complete/estimated/partial/missing`；`grossProfitReliable=true` 仅当采购成本、汇率、精确佣金率、FBE 运费、头程尺寸/重量等关键成本完整。缺 Product、采购价、汇率会进入 `partial/missing`；佣金率使用字典/默认值、FBE 缺失按 0、头程尺寸重量缺失按 0 会进入 `estimated`。如果 `StoreProduct.profitBreakdown.fbe` 标记 `isEstimatedFbe=true`，订单利润同样保持 `estimated` 可靠性状态。`returnLossRate` 为空时按 0 估算并记录 `profitWarnings`，但不单独拉低可靠性。`Product.fbeFee` 按 CNY 存储，订单毛利 fallback 路径统一 `CNY→订单币种` 换算；`profitBreakdown.fbe` 已是当地币，不二次折算。
 
 **毛利展示控制字段（2026-05-30）**：订单日报 `summary/days/currencyGroups.*` 统一返回 `profitDisplayable` 与 `profitDisplayStatus`，用于区分“可展示但含估算”和“确实不可算”，前端不应再把 `grossProfitReliable=false` 直接等同于隐藏毛利。状态含义：`complete`=关键成本完整且可靠，`estimated`=主要成本已计入但存在默认值/预计算缓存/估算项，`partial`=部分成本缺失但仍有参考毛利，`unavailable`=净销售额无效、商品成本为 0、成本大面积缺失或毛利数值无效。`grossProfitReliable` 继续表示“是否完全可靠”，`profitDisplayable` 表示“是否允许展示估算毛利”。例如 RO 2026-05 当前 `costReliabilityStatus=estimated`、`grossProfitReliable=false`，但成本已全部命中且毛利已算出，因此 `profitDisplayable=true`、`profitDisplayStatus=estimated`。
 
@@ -1269,6 +1303,7 @@ RECEIVED（已全部入库）
 |----------|------|
 | 无佣金率 | 三级降级：① `sp.commissionRate`（精确）→ ② `guessCommissionRate()`（字典匹配）→ ③ `DEFAULT_COMMISSION_RATE=0.18`；`profitBreakdown.commissionRateSource` 标记来源，`isEstimatedCommission=true` 标记已估算 |
 | 无 FBE 费 | **`DEFAULT_FBE_CNY = 7` 换算为当地货币兜底**（≈5 RON/1 EUR/2000 HUF），严禁按 0；`isEstimatedFbe=true` 标记已估算 |
+| 有 FBE 费 | `Product.fbeFee`（CNY）× `CNY→当地` 换算；`isEstimatedFbe=false` |
 | 无退货损耗率 | `returnLossRate` 默认 0.0（即不扣减），不影响存量计算；前端录入真实值后自动生效 |
 | 无头程数据 | 按 0 计算 |
 | 无采购价 | 跳过，不写利润字段，前端显示 "-" |

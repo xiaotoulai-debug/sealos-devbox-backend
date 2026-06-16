@@ -409,21 +409,21 @@ export async function calculateOrderProfitBreakdowns(params: {
         }
 
         const storeProductFbe = resolveStoreProductFbe(sp, currency, itemWarnings);
-        const fbeFeeLocal = product.fbeFee != null ? Number(product.fbeFee) : null;
+        const fbeFeeCny = product.fbeFee != null ? Number(product.fbeFee) : null;
         if (storeProductFbe) {
           itemFulfillmentCost = storeProductFbe.fee * qty;
           fbeFeeSource = 'store_product_profit_breakdown';
           if (storeProductFbe.isEstimated) {
             reliabilityStatus = resolveReliabilityStatus([reliabilityStatus, 'estimated']);
           }
-        } else if (fbeFeeLocal != null && fbeFeeLocal > 0) {
-          itemFulfillmentCost = fbeFeeLocal * qty;
+        } else if (fbeFeeCny != null && fbeFeeCny > 0) {
+          itemFulfillmentCost = fbeFeeCny * cnyToCurrency * qty;
           fbeFeeSource = 'product_fbe_fee';
         } else {
           reliabilityStatus = resolveReliabilityStatus([reliabilityStatus, 'estimated']);
           addWarning(itemWarnings, '缺少 FBE 运费，fulfillmentCost 已按 0 估算');
         }
-        addWarning(itemWarnings, 'FBE 运费沿用平台产品口径，按订单站点本地币种处理');
+        addWarning(itemWarnings, 'Product.fbeFee 按 CNY 存储，已换算为订单站点本地币种');
 
         const returnLossRate = product.returnLossRate ?? null;
         if (returnLossRate == null) {

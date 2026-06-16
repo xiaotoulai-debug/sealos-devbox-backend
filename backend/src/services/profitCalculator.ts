@@ -157,10 +157,9 @@ function computePendingProfitUpdates(params: {
     const isMissingVolumeWeight = headFreightCny === null;
     const headFreightLocal = (headFreightCny ?? 0) * cnyToLocal;
 
-    const isEstimatedFbe = !local.fbeFee;
-    const fbeLocal = local.fbeFee
-      ? Number(local.fbeFee)
-      : DEFAULT_FBE_CNY * cnyToLocal;
+    const isEstimatedFbe = local.fbeFee == null;
+    const fbeFeeCny = local.fbeFee != null ? Number(local.fbeFee) : DEFAULT_FBE_CNY;
+    const fbeLocal = fbeFeeCny * cnyToLocal;
 
     const returnLossRate = local.returnLossRate ?? 0;
     const returnLossCny = purchasePriceCny * returnLossRate;
@@ -185,6 +184,8 @@ function computePendingProfitUpdates(params: {
         isEstimatedCommission,
         commission: round2(commission),
         fbe: round2(fbeLocal),
+        fbeLocal: round2(fbeLocal),
+        fbeFeeCny: round2(fbeFeeCny),
         isEstimatedFbe,
         isMissingVolumeWeight,
         headFreightCny: round2(headFreightCny ?? 0),
