@@ -18,6 +18,7 @@ import {
   markPriceAdjustmentPendingVerify,
   markPriceAdjustmentSkipped,
   markPriceAdjustmentSuccess,
+  mergeSaveAndReadBackEmagResponse,
 } from './priceAdjustmentLogs';
 import { recalcProfitForStoreProducts } from './profitCalculator';
 import {
@@ -174,6 +175,10 @@ const FORBIDDEN_PRICE_PAYLOAD_FIELDS = new Set([
 /** Phase 1-B1 默认关闭真实 eMAG 写请求；后续真实测试需老板单独授权后再开启。 */
 const ALLOW_EMAG_PRICE_WRITE = false;
 
+const READBACK_MAX_ATTEMPTS = 3;
+const READBACK_RETRY_INTERVAL_MS = 5000;
+const READBACK_PRICE_TOLERANCE = 0.005;
+
 const ALLOWED_PRICE_PAYLOAD_KEYS = new Set(['id', 'sale_price', 'vat_id']);
 
 const DRY_RUN_ONLY_MESSAGE = '当前处于 Phase 1-B1 安全模式，未发送 eMAG 写请求，未真实改价';
@@ -181,6 +186,19 @@ const DRY_RUN_ONLY_MESSAGE = '当前处于 Phase 1-B1 安全模式，未发送 e
 const GRAB_CART_PRICE_TOLERANCE = 0.005;
 
 export type PriceWriteStatus = 'SUCCESS' | 'FAILED' | 'PENDING_VERIFY' | 'DRY_RUN_ONLY';
+
+export type ReadBackStatus = 'CONFIRMED' | 'UNCONFIRMED' | 'READBACK_FAILED';
+
+export type PriceReadBackResult = {
+  readBackStatus: ReadBackStatus;
+  readBackPrice: number | null;
+  readBackAt: string;
+  readBackAttempts: number;
+  readBackWarning: string | null;
+  targetPrice: number;
+  filterUsed: 'id' | 'part_number_key' | 'sku' | null;
+  priceFieldUsed: 'sale_price';
+};
 
 export type PriceExecuteResult = {
   status: PriceExecuteResultStatus;
@@ -195,6 +213,9 @@ export type PriceExecuteResult = {
   payloadPreview?: PriceUpdatePayloadItem[] | null;
   profitRecalculated?: boolean;
   profitRecalcWarning?: string | null;
+  readBackStatus?: ReadBackStatus | null;
+  readBackPrice?: number | null;
+  readBackWarning?: string | null;
   noEmagWriteExecuted: boolean;
 };
 
@@ -401,6 +422,130 @@ function buildBlockedExecuteResult(params: {
     profitRecalculated: false,
     profitRecalcWarning: null,
     noEmagWriteExecuted: true,
+  };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+export function isPriceMatch(target: number, actual: number, tolerance = READBACK_PRICE_TOLERANCE): boolean {
+  return Math.abs(actual - target) <= tolerance;
+}
+
+export async function readBackOfferSalePrice(params: {
+  shopId: number;
+  emagOfferId?: string | number | null;
+  pnk?: string | null;
+  sku?: string | null;
+}): Promise<{
+  salePrice: number | null;
+  filterUsed: 'id' | 'part_number_key' | 'sku' | null;
+  rawId?: unknown;
+  pnk?: string | null;
+}> {
+  type FilterAttempt = {
+    filter: Record<string, unknown>;
+    filterUsed: 'id' | 'part_number_key' | 'sku';
+  };
+
+  const attempts: FilterAttempt[] = [];
+  const offerId = toPositiveInteger(params.emagOfferId ?? null);
+  if (offerId) attempts.push({ filter: { id: offerId }, filterUsed: 'id' });
+  if (params.pnk?.trim()) attempts.push({ filter: { part_number_key: params.pnk.trim() }, filterUsed: 'part_number_key' });
+  if (params.sku?.trim()) attempts.push({ filter: { part_number: params.sku.trim() }, filterUsed: 'sku' });
+
+  if (attempts.length === 0) {
+    return { salePrice: null, filterUsed: null };
+  }
+
+  const creds = await getEmagCredentials(params.shopId);
+
+  for (const attempt of attempts) {
+    try {
+      const res = await readProductOffers(creds, attempt.filter, { timeout: 60_000, requireProxy: true });
+      if (res.isError) continue;
+      const raw = pickFirstOfferResult(res.results);
+      if (!raw) continue;
+      const salePrice = toFiniteNumber(raw.sale_price ?? raw.salePrice);
+      if (salePrice == null) continue;
+      return {
+        salePrice,
+        filterUsed: attempt.filterUsed,
+        rawId: raw.id,
+        pnk: typeof raw.part_number_key === 'string' ? raw.part_number_key : null,
+      };
+    } catch {
+      continue;
+    }
+  }
+
+  return { salePrice: null, filterUsed: null };
+}
+
+export async function performPriceReadBackWithRetry(params: {
+  shopId: number;
+  emagOfferId?: string | number | null;
+  pnk?: string | null;
+  sku?: string | null;
+  targetPrice: number;
+}): Promise<PriceReadBackResult> {
+  const targetPrice = roundPrice(params.targetPrice);
+  let lastReadPrice: number | null = null;
+  let lastFilterUsed: 'id' | 'part_number_key' | 'sku' | null = null;
+
+  for (let attempt = 1; attempt <= READBACK_MAX_ATTEMPTS; attempt += 1) {
+    const readResult = await readBackOfferSalePrice({
+      shopId: params.shopId,
+      emagOfferId: params.emagOfferId,
+      pnk: params.pnk,
+      sku: params.sku,
+    });
+
+    if (readResult.salePrice != null) {
+      lastReadPrice = readResult.salePrice;
+      lastFilterUsed = readResult.filterUsed;
+      if (isPriceMatch(targetPrice, readResult.salePrice)) {
+        return {
+          readBackStatus: 'CONFIRMED',
+          readBackPrice: readResult.salePrice,
+          readBackAt: new Date().toISOString(),
+          readBackAttempts: attempt,
+          readBackWarning: null,
+          targetPrice,
+          filterUsed: readResult.filterUsed,
+          priceFieldUsed: 'sale_price',
+        };
+      }
+    }
+
+    if (attempt < READBACK_MAX_ATTEMPTS) {
+      await sleep(READBACK_RETRY_INTERVAL_MS);
+    }
+  }
+
+  if (lastReadPrice != null) {
+    return {
+      readBackStatus: 'UNCONFIRMED',
+      readBackPrice: lastReadPrice,
+      readBackAt: new Date().toISOString(),
+      readBackAttempts: READBACK_MAX_ATTEMPTS,
+      readBackWarning: `readBack sale_price=${lastReadPrice} 与目标价 ${targetPrice} 不一致，可能为 eMAG read 传播延迟`,
+      targetPrice,
+      filterUsed: lastFilterUsed,
+      priceFieldUsed: 'sale_price',
+    };
+  }
+
+  return {
+    readBackStatus: 'READBACK_FAILED',
+    readBackPrice: null,
+    readBackAt: new Date().toISOString(),
+    readBackAttempts: READBACK_MAX_ATTEMPTS,
+    readBackWarning: 'readBack 读取失败或未返回 sale_price，请稍后人工或 sync 对账',
+    targetPrice,
+    filterUsed: null,
+    priceFieldUsed: 'sale_price',
   };
 }
 
@@ -687,8 +832,21 @@ export async function executePriceChange(params: {
       }),
     ]);
 
+    const readBack = await performPriceReadBackWithRetry({
+      shopId: params.shopId,
+      emagOfferId: payload[0]?.id ?? context?.storeProduct.emagOfferId,
+      pnk: context?.storeProduct.pnk ?? null,
+      sku: (await prisma.storeProduct.findUnique({
+        where: { id: params.storeProductId },
+        select: { sku: true },
+      }))?.sku ?? null,
+      targetPrice: newSalePrice,
+    });
+
+    const emagResponseForLog = mergeSaveAndReadBackEmagResponse(writeResult.rawResponse, readBack);
+
     await markPriceAdjustmentSuccess(logId, {
-      emagResponse: writeResult.rawResponse,
+      emagResponse: emagResponseForLog,
       estimatedProfitAfter: preview.estimatedProfitAfter,
       profitMarginPctAfter: preview.profitMarginPctAfter,
     });
@@ -704,10 +862,14 @@ export async function executePriceChange(params: {
       console.error('[executePriceChange] profit recalc failed:', profitRecalcWarning);
     }
 
+    const successMessage = readBack.readBackStatus === 'CONFIRMED'
+      ? 'price execute success'
+      : `price execute success; ${readBack.readBackWarning ?? 'readBack 未确认'}`;
+
     return {
       status: 'SUCCESS',
       code: 'OK',
-      message: 'price execute success',
+      message: successMessage,
       storeProductId: params.storeProductId,
       shopId: params.shopId,
       logId,
@@ -717,6 +879,9 @@ export async function executePriceChange(params: {
       payloadPreview: payload,
       profitRecalculated,
       profitRecalcWarning,
+      readBackStatus: readBack.readBackStatus,
+      readBackPrice: readBack.readBackPrice,
+      readBackWarning: readBack.readBackWarning,
       noEmagWriteExecuted: false,
     };
   } catch (err: any) {

@@ -182,3 +182,25 @@ export async function markPriceAdjustmentSkipped(
     },
   });
 }
+
+export type ReadBackLogPayload = {
+  readBackStatus: 'CONFIRMED' | 'UNCONFIRMED' | 'READBACK_FAILED';
+  readBackPrice: number | null;
+  readBackAt: string;
+  readBackAttempts: number;
+  readBackWarning: string | null;
+  targetPrice: number;
+  filterUsed: 'id' | 'part_number_key' | 'sku' | null;
+  priceFieldUsed: 'sale_price';
+};
+
+/** 合并 save 响应与 readBack 摘要，写入 emagResponse Json（不新增 DB 字段）。 */
+export function mergeSaveAndReadBackEmagResponse(
+  saveResponse: unknown,
+  readBack: ReadBackLogPayload,
+): Prisma.InputJsonValue {
+  return sanitizeAndTruncateJson({
+    save: saveResponse ?? null,
+    readBack,
+  });
+}

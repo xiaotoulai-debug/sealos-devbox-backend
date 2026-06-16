@@ -554,6 +554,34 @@ Phase 1-B1 新增 execute 代码框架，但默认禁止真实改价。
 - 初始日志 create 失败会阻断 execute。
 - 真实 SKU 测试必须等待老板下一轮明确授权后再开启写开关。
 
+### 4.5.2.5 eMAG 改价 readBack 对账（Phase 1-B2.1，2026-06-16）
+
+Phase 1-B2.1 在 `executePriceChange` 真实 save 成功后增加 readBack 对账，解决 eMAG `product_offer/read` 传播延迟导致的假对账失败感知。
+
+**流程：**
+
+1. `product_offer/save` 成功 → 事务更新本地 `sale_price` / `vatId` / `vatRate`（不回滚）。
+2. `performPriceReadBackWithRetry`：`product_offer/read`，最多 3 次、间隔 5s，`requireProxy=true`。
+3. 合并 `{ save, readBack }` 写入 `StoreProductPriceAdjustmentLog.emagResponse` Json（不新增 DB 字段）。
+4. 日志 `status` 仍 **SUCCESS**；API 响应增加 `readBackStatus` / `readBackPrice` / `readBackWarning`。
+
+**readBackStatus 语义：**
+
+| 状态 | 含义 |
+|------|------|
+| CONFIRMED | readBack `sale_price` 与目标价一致（容差 0.005） |
+| UNCONFIRMED | save 成功但 read 暂不一致，**不等于改价失败**，不回滚本地价 |
+| READBACK_FAILED | 多次 read 无有效 `sale_price`，需人工或 sync 对账 |
+
+**价格字段口径：**
+
+- 我方当前售价 / readBack 对账：**仅 `sale_price`**。
+- 禁止用 `main_offer_price`、`recommended_price`、`best_offer_recommended_price`、`best_offer_sale_price` 作为我方售价（`best_offer_sale_price` 仅 BuyBox/抢购物车参考）。
+
+**readBack 查询优先级：** `emagOfferId/id` → `pnk/part_number_key` → `sku/part_number`；**禁止单独用 EAN**（可能命中其他 offer）。
+
+**范围：** 本轮仅接入 `executePriceChange`；`executeGrabCartPriceChange` readBack 留后续阶段。
+
 **运营动作建议 operationAdvice（实时 DTO，不落库）**：`GET /api/store-products` 每行返回双命名 `operationAdvice/operation_advice`，用于回答“运营接下来做什么”，与 `purchaseSuggestion` 的供应链采购动作分离。规则引擎实时使用四类主分类与风险标签含义：主推款优先保供、补货和广告；成长款观察趋势并适度加广告；常规款正常维护；清理款降价、清仓或停止采购。动作集合：`REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/RAISE_PRICE/LOWER_PRICE/JOIN_CAMPAIGN/ADVERTISE/CLEARANCE/PAUSE_PURCHASE/WAIT_FOR_ARRIVAL/OBSERVE`；优先级：`P0/P1/P2/P3`。断货补货规则优先于普通调价、广告、活动和观察兜底：`stock=0 && replenishReferenceDailySales>0 && coverageStock<=0` 返回立即/紧急补货，`coverageStock<targetStock` 返回仍需补货，`coverageStock>=targetStock` 返回等待到货。其他规则按顺序短路：负毛利动销异常、清仓处理、暂停采购、等待到货、建议涨价、建议降价、加广告、参加活动、观察即可。阈值集中配置为 `lowProfitMarginPct=15`、`goodProfitMarginPct=25`、`lowStockDays=30`、`warningStockDays=60`、`overstockDays=120`、`clearanceStockThreshold=10`；`profitMarginPct` 单位是百分数（`15` 表示 15%）。因当前缺少竞品价格、价格历史、广告 ROI、曝光点击转化数据，涨价/降价/广告/活动文案必须表达为“可考虑/测试”，不能作为强结论。
 
 **补货参考日销**：`purchaseSuggestion` 与 `operationAdvice` 统一使用 `replenishReferenceDailySales = max(comprehensiveSales, sales30/30, sales90/90, sales180/180)`。该指标只用于采购建议和运营建议，不改变 `productClass` 分类；`targetStockDays` 按分类/阶段常量解析（HOT=90 等），`coverageStock = platformStock + platformInTransit + purchasingInTransit + planningStock`（不含 localStock），`suggestAmount = max(0, ceil(replenishReferenceDailySales * targetStockDays) - coverageStock)`。清理款默认 targetStockDays=0；复活观察时 targetStockDays=30。
