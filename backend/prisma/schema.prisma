@@ -33,6 +33,7 @@ model User {
   updatedWorkdayCalendars WorkdayCalendar[] @relation("WorkdayCalendarUpdatedBy")
   employeeWeeklyAiSummaries EmployeeWeeklyAiSummary[]
   employeeWeeklyPlans       EmployeeWeeklyPlan[]
+  priceAdjustmentLogs StoreProductPriceAdjustmentLog[]
   role           Role       @relation(fields: [roleId], references: [id])
 
   @@map("users")
@@ -261,6 +262,8 @@ model ShopAuthorization {
   operationDailyLogs OperationDailyLog[]
   employeeTasks EmployeeTask[]
   dailyReminderTemplates DailyReminderTemplate[]
+  priceAdjustmentLogs StoreProductPriceAdjustmentLog[]
+  priceStrategyConfig StorePriceStrategyConfig?
 
   @@index([platform])
   @@index([status])
@@ -304,6 +307,8 @@ model StoreProduct {
   name             String
   salePrice        Decimal  @map("sale_price") @db.Decimal(10, 2)
   currency         String?  @default("RON") // eMAG 币种，RO=RON, BG=EUR(2026欧元区), HU=HUF
+  vatId            Int?     @map("vat_id") // eMAG vat_id，供最小改价 payload 使用
+  vatRate          Decimal? @map("vat_rate") @db.Decimal(8, 6) // VAT 比例小数，如 0.190000
   stock            Int      @default(0)
   status           Int      @default(1) // 1=Active, 0=Inactive
   categoryId       Int?     @map("category_id")
@@ -312,6 +317,7 @@ model StoreProduct {
   productUrl       String?  @map("product_url") // 前台商品链接，用于爬虫补图
   mappedInventorySku String? @map("mapped_inventory_sku") // 手动绑定的库存 SKU（对应 Product.sku，纯字符串存储，无 FK 约束）
   validationStatus String?  @map("validation_status")
+  offerValidationStatus Json? @map("offer_validation_status") // eMAG offer_validation_status 原始紧凑快照
   docErrors        String?  @map("doc_errors") // eMAG 驳回原因 (JSON 或文本)
   rejectionReason  String?  @map("rejection_reason") // 驳回原因（便于展示）
   comprehensiveSales Float    @default(0) @map("comprehensive_sales") // 综合日销 = d7/7*0.3 + d14/14*0.3 + d30/30*0.4
@@ -322,6 +328,9 @@ model StoreProduct {
   profitMarginPct      Float?     @map("profit_margin_pct")        // 毛利率 % = profit / salePrice × 100
   profitCalculatedAt   DateTime?  @map("profit_calculated_at")     // 上次利润计算时间
   profitBreakdown      Json?      @map("profit_breakdown")          // 利润明细拆解 JSON（各项扣费 + 估算标识）
+  manualMinPrice       Decimal?   @map("manual_min_price") @db.Decimal(12, 4) // 运营手动最低保护价（不含 VAT）
+  lastPriceAdjustedAt  DateTime?  @map("last_price_adjusted_at")
+  lastPriceAdjustmentMode String? @map("last_price_adjustment_mode") @db.VarChar(32)
   productClass         String?    @map("product_class")             // 平台产品业务分类：HOT/POTENTIAL/NORMAL/DEAD/NEW/TO_BE_ELIMINATED
   classificationReason String?    @map("classification_reason")     // 分类原因说明，面向运营展示
   classificationMetrics Json?     @map("classification_metrics")    // 分类计算指标快照（不伪造 90 天有货数据）
@@ -354,6 +363,7 @@ model StoreProduct {
   inventorySnapshots StoreProductInventorySnapshot[]
   purchasePlanProducts Product[] @relation("ProductSourceStoreProduct")
   fbeShipmentItems FbeShipmentItem[]
+  priceAdjustmentLogs StoreProductPriceAdjustmentLog[]
 
   @@unique([shopId, pnk])
   @@unique([shopId, sku])
@@ -372,6 +382,68 @@ model StoreProduct {
   @@index([shopId, firstStockSignalAt])
   @@index([shopId, firstInboundAt])
   @@map("store_products")
+}
+
+/// 平台产品调价日志：记录手动改价和手动抢购物车的 preview/execute 快照
+model StoreProductPriceAdjustmentLog {
+  id                      Int      @id @default(autoincrement())
+  shopId                  Int      @map("shop_id")
+  storeProductId          Int      @map("store_product_id")
+  pnk                     String?
+  mode                    String   @db.VarChar(32)
+  oldSalePriceExVat       Decimal? @map("old_sale_price_ex_vat") @db.Decimal(12, 4)
+  newSalePriceExVat       Decimal  @map("new_sale_price_ex_vat") @db.Decimal(12, 4)
+  currency                String?  @db.VarChar(8)
+  cartPriceRaw            Json?    @map("cart_price_raw")
+  cartPriceExVat          Decimal? @map("cart_price_ex_vat") @db.Decimal(12, 4)
+  vatRate                 Decimal? @map("vat_rate") @db.Decimal(8, 6)
+  hardFloorPrice          Decimal? @map("hard_floor_price") @db.Decimal(12, 4)
+  suggestedMinPrice       Decimal? @map("suggested_min_price") @db.Decimal(12, 4)
+  manualMinPrice          Decimal? @map("manual_min_price") @db.Decimal(12, 4)
+  finalMinPrice           Decimal? @map("final_min_price") @db.Decimal(12, 4)
+  estimatedProfitAfter    Decimal? @map("estimated_profit_after") @db.Decimal(12, 4)
+  profitMarginPctAfter    Decimal? @map("profit_margin_pct_after") @db.Decimal(8, 4)
+  reason                  String   @db.Text
+  operatorUserId          Int?     @map("operator_user_id")
+  emagRequestPayload      Json?    @map("emag_request_payload")
+  emagResponse            Json?    @map("emag_response")
+  status                  String   @db.VarChar(32)
+  errorMessage            String?  @map("error_message") @db.Text
+  createdAt               DateTime @default(now()) @map("created_at")
+  updatedAt               DateTime @updatedAt @map("updated_at")
+
+  shop                    ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
+  storeProduct            StoreProduct      @relation(fields: [storeProductId], references: [id], onDelete: Cascade)
+  operator                User?             @relation(fields: [operatorUserId], references: [id], onDelete: SetNull)
+
+  @@index([shopId, createdAt])
+  @@index([storeProductId, createdAt])
+  @@index([mode, createdAt])
+  @@index([status, createdAt])
+  @@index([operatorUserId, createdAt])
+  @@map("store_product_price_adjustment_logs")
+}
+
+/// 店铺级价格策略配置：无配置时后端走 DEFAULT_PRICE_STRATEGY
+model StorePriceStrategyConfig {
+  id                            Int      @id @default(autoincrement())
+  shopId                        Int      @unique @map("shop_id")
+  targetMinMarginPct            Decimal  @default(0.10) @map("target_min_margin_pct") @db.Decimal(8, 6)
+  safetyBufferPct               Decimal  @default(0.02) @map("safety_buffer_pct") @db.Decimal(8, 6)
+  grabStep                      Decimal  @default(0.10) @map("grab_step") @db.Decimal(12, 4)
+  defaultVatRate                Decimal? @map("default_vat_rate") @db.Decimal(8, 6)
+  defaultCommissionRate         Decimal? @map("default_commission_rate") @db.Decimal(8, 6)
+  returnLossRate                Decimal? @map("return_loss_rate") @db.Decimal(8, 6)
+  manualPriceAllowEstimatedCost Boolean  @default(true) @map("manual_price_allow_estimated_cost")
+  grabCartAllowEstimatedCost    Boolean  @default(false) @map("grab_cart_allow_estimated_cost")
+  isPriceChangePaused           Boolean  @default(false) @map("is_price_change_paused")
+  isGrabCartPaused              Boolean  @default(false) @map("is_grab_cart_paused")
+  createdAt                     DateTime @default(now()) @map("created_at")
+  updatedAt                     DateTime @updatedAt @map("updated_at")
+
+  shop                          ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@map("store_price_strategy_configs")
 }
 
 /// 平台产品每日库存快照：用于第二阶段计算近 90 天有货天数与有货日销

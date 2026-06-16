@@ -72,7 +72,7 @@ import {
   type BuyBoxStatusConfidence,
   type BuyBoxStatusSource,
 } from '../services/emagBuyBox';
-import { dryRunBuildPriceUpdate } from '../services/emagPrice';
+import { buildGrabCartPreview, buildPricePreview, dryRunBuildPriceUpdate } from '../services/emagPrice';
 
 const router = Router();
 router.use(authenticate);
@@ -1692,6 +1692,74 @@ router.post('/recalc-profit', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('[POST /api/store-products/recalc-profit]', err);
     res.status(500).json({ code: 500, data: null, message: err?.message ?? '利润重算失败' });
+  }
+});
+
+/**
+ * POST /api/store-products/:id/price/preview
+ * Phase 1-A 手动改价预览：只读刷新 eMAG offer 并计算保护价/毛利，不发送 product_offer/save，不写数据库。
+ */
+router.post('/:id/price/preview', async (req: Request, res: Response) => {
+  try {
+    const storeProductId = Number(req.params.id);
+    if (!Number.isInteger(storeProductId) || storeProductId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: 'storeProductId 无效' });
+      return;
+    }
+
+    const shopId = Number(req.body?.shopId);
+    if (!Number.isInteger(shopId) || shopId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+      return;
+    }
+
+    const newSalePriceExVat = Number(req.body?.newSalePriceExVat);
+    if (!Number.isFinite(newSalePriceExVat) || newSalePriceExVat <= 0) {
+      res.status(400).json({ code: 400, data: null, message: 'newSalePriceExVat 必须是大于 0 的不含 VAT 价格' });
+      return;
+    }
+
+    const result = await buildPricePreview({ shopId, storeProductId, newSalePriceExVat });
+    res.json({ code: 200, data: result, message: 'price preview generated, no eMAG write executed' });
+  } catch (err: any) {
+    console.error('[POST /api/store-products/:id/price/preview]', err?.message ?? err);
+    const status = err?.code === 'EMAG_PROXY_REQUIRED' ? 503 : 500;
+    res.status(status).json({
+      code: status,
+      data: null,
+      message: err?.message ?? 'price preview 生成失败',
+    });
+  }
+});
+
+/**
+ * POST /api/store-products/:id/grab-cart/preview
+ * Phase 1-A 手动抢购物车预览：只读计算建议价，不发送 product_offer/save，不写数据库。
+ */
+router.post('/:id/grab-cart/preview', async (req: Request, res: Response) => {
+  try {
+    const storeProductId = Number(req.params.id);
+    if (!Number.isInteger(storeProductId) || storeProductId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: 'storeProductId 无效' });
+      return;
+    }
+
+    const shopId = Number(req.body?.shopId);
+    if (!Number.isInteger(shopId) || shopId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+      return;
+    }
+
+    const result = await buildGrabCartPreview({ shopId, storeProductId });
+    res.json({ code: 200, data: result, message: 'grab-cart preview generated, no eMAG write executed' });
+  } catch (err: any) {
+    console.error('[POST /api/store-products/:id/grab-cart/preview]', err?.message ?? err);
+    const status = err?.code === 'EMAG_PROXY_REQUIRED' ? 503 : 500;
+    res.status(status).json({
+      code: status,
+      data: null,
+      message: err?.message ?? 'grab-cart preview 生成失败',
+    });
   }
 });
 

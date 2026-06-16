@@ -69,10 +69,11 @@ backend/
 │   │   │                      #   GET /api/permissions       — 权限平铺列表（供角色回显已选权限）
 │   │   ├── shop.ts            # 店铺授权（增删改查）+ GET /api/shops/authorized（仪表盘下拉专用）
 │   │   ├── emag.ts            # eMAG 业务（类目、发布、同步触发）
-│   │   ├── storeProducts.ts   # 店铺在售产品（同步、补图、综合日销回填、库存绑定、采购建议）
+│   │   ├── storeProducts.ts   # 店铺在售产品（同步、补图、综合日销回填、库存绑定、采购建议、价格 preview）
 │   │   │                      #   GET  /api/store-products          — 分页列表（mappingStatus=mapped/unmapped/all 筛选；优先 Product 表查图片/成本；批量聚合 purchaseSuggestion）
 │   │   │                      #   POST /api/store-products/sync     — 手动全量同步
 │   │   │                      #   POST /api/store-products/map      — 绑定库存 SKU（★ SKU 字符串优先匹配，inventorySkuId 兜底；pnk+shopId 或 storeProductId 定位平台产品）
+│   │   │                      #   POST /api/store-products/:id/price/preview / grab-cart/preview — Phase 1-A 只读价格预览
 │   │   ├── dashboard.ts       # 业绩看板（stats、shops 下拉）
 │   │   ├── analytics.ts       # 运营分析接口（订单日报）
 │   │   ├── translate.ts       # 翻译代理（MyMemory API 转发，ro→zh 等）
@@ -86,6 +87,9 @@ backend/
 │   │   ├── emagClient.ts      # eMAG API 客户端（Adapter）：BaseURL/货币/域名按 region 查表
 │   │   │                      # ★ 正向代理：所有 HTTPS 请求经 EMAG_PROXY_URL 代理转发（固定 IP 白名单）
 │   │   ├── emagProduct.ts     # product_offer/read、product/read、documentation/find_by_eans
+│   │   ├── emagPrice.ts       # eMAG 改价 dry-run / Phase 1-A 价格 preview（只读 product_offer/read）
+│   │   ├── priceProtection.ts # 最低保护价、成本完整度、默认价格策略
+│   │   ├── priceErrors.ts     # 价格模块统一错误码与文案
 │   │   ├── emagProductNormalizer.ts  # 唯一 Normalizer：解析、图片提纯、输出统一结构
 │   │   ├── storeProductSync.ts       # 两段式同步编排（补全 mainImage）
 │   │   ├── alibabaOrder.ts           # 1688 下单 payload 组装与发送
@@ -484,6 +488,34 @@ npm run backfill:buy-box -- --shopId=5 --dryRun=false
 ```
 
 脚本按店铺分页调用 `product_offer/read`，逐条以当前 `shopId + pnk` 更新 Buy Box 字段；dry-run 不写库，并输出 `WON/LOST/NO_ACTIVE_BUYBOX/POSSIBLY_WON/POSSIBLY_LOST/UNKNOWN` 统计。历史旧店铺应先 dry-run，再按店铺正式回填。
+
+### 4.5.2.3 eMAG 价格预览与保护价基础（Phase 1-A，2026-06-16）
+
+Phase 1-A 只提供后端基础能力和 preview，不开放真实 execute，不发送 `product_offer/save`。
+
+**新增 schema：**
+
+- `StoreProductPriceAdjustmentLog`：调价日志表，记录手动改价/手动抢购物车的价格、保护价、成本、payload、响应、状态和操作人快照。索引包括 `(shopId, createdAt)`、`(storeProductId, createdAt)`、`(mode, createdAt)`、`(status, createdAt)`、`(operatorUserId, createdAt)`。
+- `StorePriceStrategyConfig`：店铺级价格策略配置，`shopId` 唯一；无配置时后端使用 `DEFAULT_PRICE_STRATEGY`。
+- `StoreProduct` 新增 `vatId/vatRate/offerValidationStatus/manualMinPrice/lastPriceAdjustedAt/lastPriceAdjustmentMode`。`hardFloorPrice/suggestedMinPrice/finalMinPrice/costStatus` 不缓存到 `StoreProduct`，只在 preview 响应和日志快照中出现。
+
+**服务职责：**
+
+- `services/priceProtection.ts`：实现 `calculateMinPrices()` 与 `calculateCostStatus()`；所有价格均按不含 VAT 口径计算，百分比按小数处理；分母小于等于 0 或手动保护价低于硬底价会返回阻断码。
+- `services/priceErrors.ts`：集中定义价格模块错误码与前端文案。
+- `lib/priceLocks.ts`：准备单实例内存短锁和店铺并发槽。Phase 1-A 的 preview 不使用锁；后续 execute 必须 `finally` 释放。多实例部署需迁移 Redis 或 PostgreSQL advisory lock。
+- `services/emagPrice.ts`：复用 Phase 0 的 `requireProxy=true` 只读刷新，新增 `loadPriceContext()`、`buildPricePreview()`、`buildGrabCartPreview()`、`resolveCartPriceExVat()`；严禁调用 `product_offer/save`。
+
+**API：**
+
+- `POST /api/store-products/:id/price/preview`：手动改价预览。允许 `SELF_BUILT / RESELL / OWN_BRAND_RESELL`，校验 `newSalePriceExVat > 0`，通过代理只读刷新 eMAG offer，返回 `priceActionEligibility`、当前价、新价含/不含 VAT、保护价、改价后毛利、成本完整度和 warnings。
+- `POST /api/store-products/:id/grab-cart/preview`：手动抢购物车预览。仅允许 `RESELL`，排除无库存、不可售、已赢得购物车、成本不完整、购物车价税口径未知或建议价低于最低保护价。默认只允许 `costStatus=COMPLETE`。
+
+**安全边界：**
+
+- Phase 1-A 未新增 `price/execute` 或 `grab-cart/execute` 路由。
+- preview 不写数据库、不更新 `store_products.sale_price`、不发送 `product_offer/save`。
+- eMAG 读取继续使用 `readProductOffers(..., { requireProxy: true })`；代理不可用时禁止直连。
 
 **运营动作建议 operationAdvice（实时 DTO，不落库）**：`GET /api/store-products` 每行返回双命名 `operationAdvice/operation_advice`，用于回答“运营接下来做什么”，与 `purchaseSuggestion` 的供应链采购动作分离。规则引擎实时使用四类主分类与风险标签含义：主推款优先保供、补货和广告；成长款观察趋势并适度加广告；常规款正常维护；清理款降价、清仓或停止采购。动作集合：`REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/RAISE_PRICE/LOWER_PRICE/JOIN_CAMPAIGN/ADVERTISE/CLEARANCE/PAUSE_PURCHASE/WAIT_FOR_ARRIVAL/OBSERVE`；优先级：`P0/P1/P2/P3`。断货补货规则优先于普通调价、广告、活动和观察兜底：`stock=0 && replenishReferenceDailySales>0 && coverageStock<=0` 返回立即/紧急补货，`coverageStock<targetStock` 返回仍需补货，`coverageStock>=targetStock` 返回等待到货。其他规则按顺序短路：负毛利动销异常、清仓处理、暂停采购、等待到货、建议涨价、建议降价、加广告、参加活动、观察即可。阈值集中配置为 `lowProfitMarginPct=15`、`goodProfitMarginPct=25`、`lowStockDays=30`、`warningStockDays=60`、`overstockDays=120`、`clearanceStockThreshold=10`；`profitMarginPct` 单位是百分数（`15` 表示 15%）。因当前缺少竞品价格、价格历史、广告 ROI、曝光点击转化数据，涨价/降价/广告/活动文案必须表达为“可考虑/测试”，不能作为强结论。
 
