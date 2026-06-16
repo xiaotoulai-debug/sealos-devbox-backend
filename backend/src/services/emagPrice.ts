@@ -26,7 +26,9 @@ import {
   calculateMinPrices,
   DEFAULT_PRICE_STRATEGY,
   estimateProfitAfterPrice,
+  normalizeCartPriceTaxMode,
   roundPrice,
+  type CartPriceTaxMode,
   type CostStatus,
 } from './priceProtection';
 import { PRICE_ERROR_CODES, PRICE_ERROR_MESSAGES, type PriceErrorCode } from './priceErrors';
@@ -87,6 +89,7 @@ type PriceStrategy = {
   grabCartAllowEstimatedCost: boolean;
   isPriceChangePaused: boolean;
   isGrabCartPaused: boolean;
+  cartPriceTaxMode: CartPriceTaxMode;
 };
 
 type PriceContext = {
@@ -145,6 +148,7 @@ export type PricePreviewResult = {
 export type GrabCartPreviewResult = {
   grabCartEligibility: GrabCartEligibility;
   currentSalePriceExVat: number | null;
+  cartPriceTaxMode: CartPriceTaxMode;
   cartPriceRaw: unknown;
   cartPriceIncludesVat: boolean | null;
   cartPriceExVat: number | null;
@@ -1330,6 +1334,7 @@ export async function loadPriceContext(params: { shopId: number; storeProductId:
     grabCartAllowEstimatedCost: strategyConfig?.grabCartAllowEstimatedCost ?? DEFAULT_PRICE_STRATEGY.grabCartAllowEstimatedCost,
     isPriceChangePaused: strategyConfig?.isPriceChangePaused ?? false,
     isGrabCartPaused: strategyConfig?.isGrabCartPaused ?? false,
+    cartPriceTaxMode: normalizeCartPriceTaxMode(strategyConfig?.cartPriceTaxMode ?? DEFAULT_PRICE_STRATEGY.cartPriceTaxMode),
   };
 
   const localProduct = storeProduct.mappedInventorySku
@@ -1451,7 +1456,11 @@ export async function loadPriceContext(params: { shopId: number; storeProductId:
   };
 }
 
-export function resolveCartPriceExVat(raw: unknown, vatRate: number | null): {
+export function resolveCartPriceExVat(
+  raw: unknown,
+  vatRate: number | null,
+  cartPriceTaxMode: CartPriceTaxMode = 'UNKNOWN',
+): {
   cartPriceRaw: unknown;
   cartPriceIncludesVat: boolean | null;
   cartPriceExVat: number | null;
@@ -1465,14 +1474,9 @@ export function resolveCartPriceExVat(raw: unknown, vatRate: number | null): {
     return { cartPriceRaw, cartPriceIncludesVat: null, cartPriceExVat: null, blockCode: PRICE_ERROR_CODES.MISSING_CART_PRICE, warnings: ['缺少购物车参考价'] };
   }
 
-  const includesVat = toBooleanOrNull(
-    obj.cart_price_includes_vat ??
-    obj.price_includes_vat ??
-    obj.best_offer_price_includes_vat ??
-    obj.includes_vat ??
-    null,
-  );
-  if (includesVat == null) {
+  const mode = normalizeCartPriceTaxMode(cartPriceTaxMode);
+
+  if (mode === 'UNKNOWN') {
     return {
       cartPriceRaw,
       cartPriceIncludesVat: null,
@@ -1481,14 +1485,31 @@ export function resolveCartPriceExVat(raw: unknown, vatRate: number | null): {
       warnings: ['无法确认购物车参考价是否含 VAT'],
     };
   }
-  if (includesVat && (vatRate == null || vatRate <= 0)) {
-    return { cartPriceRaw, cartPriceIncludesVat: true, cartPriceExVat: null, blockCode: PRICE_ERROR_CODES.MISSING_VAT, warnings: ['购物车价含 VAT，但缺少 VAT 税率'] };
+
+  if (mode === 'EX_VAT') {
+    return {
+      cartPriceRaw,
+      cartPriceIncludesVat: false,
+      cartPriceExVat: roundPrice(price),
+      warnings: [],
+    };
+  }
+
+  // INC_VAT
+  if (vatRate == null || vatRate <= 0) {
+    return {
+      cartPriceRaw,
+      cartPriceIncludesVat: true,
+      cartPriceExVat: null,
+      blockCode: PRICE_ERROR_CODES.MISSING_VAT,
+      warnings: ['购物车价含 VAT，但缺少 VAT 税率'],
+    };
   }
 
   return {
     cartPriceRaw,
-    cartPriceIncludesVat: includesVat,
-    cartPriceExVat: includesVat ? roundPrice(price / (1 + (vatRate ?? 0))) : roundPrice(price),
+    cartPriceIncludesVat: true,
+    cartPriceExVat: roundPrice(price / (1 + vatRate)),
     warnings: [],
   };
 }
@@ -1594,6 +1615,7 @@ export async function buildGrabCartPreview(params: {
     return {
       grabCartEligibility: grabEligibility(false, PRICE_ERROR_CODES.STORE_PRODUCT_NOT_FOUND),
       currentSalePriceExVat: null,
+      cartPriceTaxMode: DEFAULT_PRICE_STRATEGY.cartPriceTaxMode,
       cartPriceRaw: null,
       cartPriceIncludesVat: null,
       cartPriceExVat: null,
@@ -1615,7 +1637,7 @@ export async function buildGrabCartPreview(params: {
 
   let grabCartEligibility = grabEligibility(true, 'OK');
   const linkType = normalizeLinkType(context.storeProduct.emagLinkType);
-  const cart = resolveCartPriceExVat(context.fresh.raw, context.rawLocalCost.vatRate);
+  const cart = resolveCartPriceExVat(context.fresh.raw, context.rawLocalCost.vatRate, context.strategy.cartPriceTaxMode);
   const suggestedGrabPriceExVat = cart.cartPriceExVat != null ? roundPrice(cart.cartPriceExVat - context.strategy.grabStep) : null;
   const profit = suggestedGrabPriceExVat != null
     ? estimateProfitAfterPrice({
@@ -1652,6 +1674,7 @@ export async function buildGrabCartPreview(params: {
   return {
     grabCartEligibility,
     ...basePreviewFields(context),
+    cartPriceTaxMode: context.strategy.cartPriceTaxMode,
     cartPriceRaw: cart.cartPriceRaw,
     cartPriceIncludesVat: cart.cartPriceIncludesVat,
     cartPriceExVat: cart.cartPriceExVat,

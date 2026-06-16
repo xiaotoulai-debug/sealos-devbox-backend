@@ -438,6 +438,7 @@ model StorePriceStrategyConfig {
   grabCartAllowEstimatedCost    Boolean  @default(false) @map("grab_cart_allow_estimated_cost")
   isPriceChangePaused           Boolean  @default(false) @map("is_price_change_paused")
   isGrabCartPaused              Boolean  @default(false) @map("is_grab_cart_paused")
+  cartPriceTaxMode              String   @default("UNKNOWN") @map("cart_price_tax_mode") @db.VarChar(16)
   createdAt                     DateTime @default(now()) @map("created_at")
   updatedAt                     DateTime @updatedAt @map("updated_at")
 

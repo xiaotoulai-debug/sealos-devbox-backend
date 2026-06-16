@@ -8,12 +8,25 @@ export type CostStatus =
   | 'MISSING_LOGISTICS'
   | 'MISSING_VAT';
 
+export type CartPriceTaxMode = 'UNKNOWN' | 'EX_VAT' | 'INC_VAT';
+
+const CART_PRICE_TAX_MODES = new Set<CartPriceTaxMode>(['UNKNOWN', 'EX_VAT', 'INC_VAT']);
+
+export function normalizeCartPriceTaxMode(value: unknown): CartPriceTaxMode {
+  const normalized = String(value ?? 'UNKNOWN').trim().toUpperCase();
+  if (CART_PRICE_TAX_MODES.has(normalized as CartPriceTaxMode)) {
+    return normalized as CartPriceTaxMode;
+  }
+  return 'UNKNOWN';
+}
+
 export const DEFAULT_PRICE_STRATEGY = {
   targetMinMarginPct: 0.10,
   safetyBufferPct: 0.02,
   grabStep: 0.1,
   manualPriceAllowEstimatedCost: true,
   grabCartAllowEstimatedCost: false,
+  cartPriceTaxMode: 'UNKNOWN' as CartPriceTaxMode,
 };
 
 export interface CalculateMinPricesInput {

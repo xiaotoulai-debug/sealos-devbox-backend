@@ -498,7 +498,7 @@ Phase 1-A 只提供后端基础能力和 preview，不开放真实 execute，不
 **新增 schema：**
 
 - `StoreProductPriceAdjustmentLog`：调价日志表，记录手动改价/手动抢购物车的价格、保护价、成本、payload、响应、状态和操作人快照。索引包括 `(shopId, createdAt)`、`(storeProductId, createdAt)`、`(mode, createdAt)`、`(status, createdAt)`、`(operatorUserId, createdAt)`。
-- `StorePriceStrategyConfig`：店铺级价格策略配置，`shopId` 唯一；无配置时后端使用 `DEFAULT_PRICE_STRATEGY`。
+- `StorePriceStrategyConfig`：店铺级价格策略配置，`shopId` 唯一；无配置时后端使用 `DEFAULT_PRICE_STRATEGY`。Phase B-1 起含 `cartPriceTaxMode`（默认 UNKNOWN）。
 - `StoreProduct` 新增 `vatId/vatRate/offerValidationStatus/manualMinPrice/lastPriceAdjustedAt/lastPriceAdjustmentMode`。`hardFloorPrice/suggestedMinPrice/finalMinPrice/costStatus` 不缓存到 `StoreProduct`，只在 preview 响应和日志快照中出现。
 
 **服务职责：**
@@ -511,7 +511,7 @@ Phase 1-A 只提供后端基础能力和 preview，不开放真实 execute，不
 **API：**
 
 - `POST /api/store-products/:id/price/preview`：手动改价预览。允许 `SELF_BUILT / RESELL / OWN_BRAND_RESELL`，校验 `newSalePriceExVat > 0`，通过代理只读刷新 eMAG offer，返回 `priceActionEligibility`、当前价、新价含/不含 VAT、保护价、改价后毛利、成本完整度和 warnings。
-- `POST /api/store-products/:id/grab-cart/preview`：手动抢购物车预览。仅允许 `RESELL`，排除无库存、不可售、已赢得购物车、成本不完整、购物车价税口径未知或建议价低于最低保护价。默认只允许 `costStatus=COMPLETE`。
+- `POST /api/store-products/:id/grab-cart/preview`：手动抢购物车预览。仅允许 `RESELL`，排除无库存、不可售、已赢得购物车、成本不完整、`cartPriceTaxMode=UNKNOWN`（CART_PRICE_TAX_MODE_UNKNOWN）、INC_VAT 缺 VAT 或建议价低于最低保护价。默认只允许 `costStatus=COMPLETE`。响应含 `cartPriceTaxMode`。
 
 **安全边界：**
 
@@ -581,6 +581,39 @@ Phase 1-B2.1 在 `executePriceChange` 真实 save 成功后增加 readBack 对�
 **readBack 查询优先级：** `emagOfferId/id` → `pnk/part_number_key` → `sku/part_number`；**禁止单独用 EAN**（可能命中其他 offer）。
 
 **范围：** 本轮仅接入 `executePriceChange`；`executeGrabCartPriceChange` readBack 留后续阶段。
+
+### 4.5.2.6 抢购物车 cartPriceTaxMode（Phase B-1，2026-06-16）
+
+Phase B-1 为 `StorePriceStrategyConfig` 新增店铺级购物车参考价 VAT 口径配置，驱动 `grab-cart/preview` 的 `resolveCartPriceExVat()`，不再依赖 eMAG offer 返回字段猜测。
+
+**数据库：**
+
+- `StorePriceStrategyConfig.cartPriceTaxMode`：`VARCHAR(16)`，默认 `UNKNOWN`，Prisma `@map("cart_price_tax_mode")`。
+- migration：`20260616081326_add_cart_price_tax_mode`。
+- 无店铺配置行时，后端使用 `DEFAULT_PRICE_STRATEGY.cartPriceTaxMode = 'UNKNOWN'`。
+
+**类型与归一化（`services/priceProtection.ts`）：**
+
+- `CartPriceTaxMode = 'UNKNOWN' | 'EX_VAT' | 'INC_VAT'`。
+- `normalizeCartPriceTaxMode(value)`：非法值回落 `UNKNOWN`。
+
+**resolveCartPriceExVat 规则（`services/emagPrice.ts`）：**
+
+| cartPriceTaxMode | cartPriceIncludesVat | cartPriceExVat | 阻断码 |
+|------------------|----------------------|----------------|--------|
+| UNKNOWN | null | null | CART_PRICE_TAX_MODE_UNKNOWN |
+| EX_VAT | false | cartPriceRaw | — |
+| INC_VAT（有 vatRate） | true | cartPriceRaw / (1 + vatRate) | — |
+| INC_VAT（缺 vatRate） | true | null | MISSING_VAT |
+
+**preview 响应：** `buildGrabCartPreview()` 额外返回 `cartPriceTaxMode`（来自店铺策略或默认 UNKNOWN）。
+
+**Phase B-1 安全边界：**
+
+- 未写入任何店铺 `cartPriceTaxMode` 配置；全库默认 UNKNOWN，业务行为与改造前一致（继续 CART_PRICE_TAX_MODE_UNKNOWN 阻断）。
+- 不影响 `price/preview` / `price/execute`（功能 A）。
+- 未调用 `grab-cart/execute`，未发送 `product_offer/save`。
+- 店铺 EX_VAT / INC_VAT 配置留待 Phase B-2 单独授权。
 
 **运营动作建议 operationAdvice（实时 DTO，不落库）**：`GET /api/store-products` 每行返回双命名 `operationAdvice/operation_advice`，用于回答“运营接下来做什么”，与 `purchaseSuggestion` 的供应链采购动作分离。规则引擎实时使用四类主分类与风险标签含义：主推款优先保供、补货和广告；成长款观察趋势并适度加广告；常规款正常维护；清理款降价、清仓或停止采购。动作集合：`REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/RAISE_PRICE/LOWER_PRICE/JOIN_CAMPAIGN/ADVERTISE/CLEARANCE/PAUSE_PURCHASE/WAIT_FOR_ARRIVAL/OBSERVE`；优先级：`P0/P1/P2/P3`。断货补货规则优先于普通调价、广告、活动和观察兜底：`stock=0 && replenishReferenceDailySales>0 && coverageStock<=0` 返回立即/紧急补货，`coverageStock<targetStock` 返回仍需补货，`coverageStock>=targetStock` 返回等待到货。其他规则按顺序短路：负毛利动销异常、清仓处理、暂停采购、等待到货、建议涨价、建议降价、加广告、参加活动、观察即可。阈值集中配置为 `lowProfitMarginPct=15`、`goodProfitMarginPct=25`、`lowStockDays=30`、`warningStockDays=60`、`overstockDays=120`、`clearanceStockThreshold=10`；`profitMarginPct` 单位是百分数（`15` 表示 15%）。因当前缺少竞品价格、价格历史、广告 ROI、曝光点击转化数据，涨价/降价/广告/活动文案必须表达为“可考虑/测试”，不能作为强结论。
 
