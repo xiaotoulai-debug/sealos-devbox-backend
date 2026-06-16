@@ -615,6 +615,26 @@ Phase B-1 为 `StorePriceStrategyConfig` 新增店铺级购物车参考价 VAT �
 - 未调用 `grab-cart/execute`，未发送 `product_offer/save`。
 - 店铺 EX_VAT / INC_VAT 配置留待 Phase B-2 单独授权。
 
+### 4.5.2.7 eMAG 佣金率 estimate 同步（Phase B-4，2026-06-16）
+
+Phase B-4 新增 eMAG `GET /api/v1/commission/estimate/{extId}` 只读调用能力，用于同步 `StoreProduct.commissionRate`，替代字典估算。
+
+**服务（`services/emagCommission.ts`）：**
+
+- `fetchCommissionEstimate(shopId, extId)`：使用店铺凭证 + Basic Auth + `EMAG_PROXY_URL` 代理，独立 axios 实例，不污染全局 axios。
+- `syncStoreProductCommissionRate({ shopId, storeProductId, dryRun })`：读取 `StoreProduct.emagOfferId` 作为 extId，解析 `data.value`（百分比，如 18.00=18%），映射 `commissionRate = value / 100`；`dryRun=true` 不写库。
+- extId 必须是正整数；value 必须在 `(0,100]`；否则拒绝写库。
+
+**API：**
+
+- `POST /api/store-products/:id/commission/sync`：body `{ shopId, dryRun? }`，默认 `dryRun=true`；返回 extId、rawValue、old/new commissionRate、updated。
+
+**与 grab-cart/preview 关系：**
+
+- `loadPriceContext()` 已有优先级：`StoreProduct.commissionRate`（精确）→ 字典 → 店铺默认 → DEFAULT。
+- 同步成功后 `isEstimatedCommission=false`，可消除「佣金率来自字典或默认配置」warning。
+- FBE 估算仍可能阻断抢车 preview，留 Phase B-5。
+
 **运营动作建议 operationAdvice（实时 DTO，不落库）**：`GET /api/store-products` 每行返回双命名 `operationAdvice/operation_advice`，用于回答“运营接下来做什么”，与 `purchaseSuggestion` 的供应链采购动作分离。规则引擎实时使用四类主分类与风险标签含义：主推款优先保供、补货和广告；成长款观察趋势并适度加广告；常规款正常维护；清理款降价、清仓或停止采购。动作集合：`REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/RAISE_PRICE/LOWER_PRICE/JOIN_CAMPAIGN/ADVERTISE/CLEARANCE/PAUSE_PURCHASE/WAIT_FOR_ARRIVAL/OBSERVE`；优先级：`P0/P1/P2/P3`。断货补货规则优先于普通调价、广告、活动和观察兜底：`stock=0 && replenishReferenceDailySales>0 && coverageStock<=0` 返回立即/紧急补货，`coverageStock<targetStock` 返回仍需补货，`coverageStock>=targetStock` 返回等待到货。其他规则按顺序短路：负毛利动销异常、清仓处理、暂停采购、等待到货、建议涨价、建议降价、加广告、参加活动、观察即可。阈值集中配置为 `lowProfitMarginPct=15`、`goodProfitMarginPct=25`、`lowStockDays=30`、`warningStockDays=60`、`overstockDays=120`、`clearanceStockThreshold=10`；`profitMarginPct` 单位是百分数（`15` 表示 15%）。因当前缺少竞品价格、价格历史、广告 ROI、曝光点击转化数据，涨价/降价/广告/活动文案必须表达为“可考虑/测试”，不能作为强结论。
 
 **补货参考日销**：`purchaseSuggestion` 与 `operationAdvice` 统一使用 `replenishReferenceDailySales = max(comprehensiveSales, sales30/30, sales90/90, sales180/180)`。该指标只用于采购建议和运营建议，不改变 `productClass` 分类；`targetStockDays` 按分类/阶段常量解析（HOT=90 等），`coverageStock = platformStock + platformInTransit + purchasingInTransit + planningStock`（不含 localStock），`suggestAmount = max(0, ceil(replenishReferenceDailySales * targetStockDays) - coverageStock)`。清理款默认 targetStockDays=0；复活观察时 targetStockDays=30。

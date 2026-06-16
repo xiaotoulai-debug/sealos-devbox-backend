@@ -72,6 +72,7 @@ import {
   type BuyBoxStatusConfidence,
   type BuyBoxStatusSource,
 } from '../services/emagBuyBox';
+import { syncStoreProductCommissionRate } from '../services/emagCommission';
 import { buildGrabCartPreview, buildPricePreview, dryRunBuildPriceUpdate, executeGrabCartPriceChange, executePriceChange } from '../services/emagPrice';
 
 export const STORE_PRODUCT_PRICE_PERMISSIONS = {
@@ -1746,6 +1747,47 @@ router.post('/:id/price/preview', async (req: Request, res: Response) => {
       code: status,
       data: null,
       message: err?.message ?? 'price preview 生成失败',
+    });
+  }
+});
+
+/**
+ * POST /api/store-products/:id/commission/sync
+ * Phase B-4 eMAG 佣金率同步：只读调用 commission/estimate，可选写入 StoreProduct.commissionRate。
+ * 默认 dryRun=true，不写库。
+ */
+router.post('/:id/commission/sync', async (req: Request, res: Response) => {
+  try {
+    const storeProductId = Number(req.params.id);
+    if (!Number.isInteger(storeProductId) || storeProductId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: 'storeProductId 无效' });
+      return;
+    }
+
+    const shopId = Number(req.body?.shopId);
+    if (!Number.isInteger(shopId) || shopId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+      return;
+    }
+
+    const dryRun = req.body?.dryRun !== false;
+    const result = await syncStoreProductCommissionRate({ shopId, storeProductId, dryRun });
+    if (!result.ok) {
+      res.status(400).json({ code: 400, data: result, message: result.errorMessage ?? 'commission sync 失败' });
+      return;
+    }
+
+    res.json({
+      code: 200,
+      data: result,
+      message: dryRun ? 'commission sync dry-run completed, no database write executed' : 'commission sync completed',
+    });
+  } catch (err: any) {
+    console.error('[POST /api/store-products/:id/commission/sync]', err?.message ?? err);
+    res.status(500).json({
+      code: 500,
+      data: null,
+      message: err?.message ?? 'commission sync 失败',
     });
   }
 });
