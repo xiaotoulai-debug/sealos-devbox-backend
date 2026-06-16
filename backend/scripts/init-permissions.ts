@@ -79,6 +79,30 @@ const BUTTON_DEFINITIONS: {
     sortOrder: 2,
     parentCode: 'MENU_DASHBOARD_COMPANY_MANAGEMENT',
   },
+  {
+    code: 'ACTION_STORE_PRODUCT_PRICE_CHANGE',
+    name: '手动改价执行',
+    sortOrder: 1,
+    parentCode: 'MENU_PLATFORM_PRODUCTS',
+  },
+  {
+    code: 'ACTION_STORE_PRODUCT_GRAB_CART',
+    name: '手动抢购物车执行',
+    sortOrder: 2,
+    parentCode: 'MENU_PLATFORM_PRODUCTS',
+  },
+  {
+    code: 'ACTION_STORE_PRODUCT_PRICE_LOG_VIEW',
+    name: '查看调价日志',
+    sortOrder: 3,
+    parentCode: 'MENU_PLATFORM_PRODUCTS',
+  },
+  {
+    code: 'ACTION_STORE_PRODUCT_PRICE_STRATEGY_MANAGE',
+    name: '管理店铺价格策略',
+    sortOrder: 4,
+    parentCode: 'MENU_PLATFORM_PRODUCTS',
+  },
 ];
 
 const SUPERVISOR_ROLE_NAMES = ['运营主管', '仓库主管'] as const;

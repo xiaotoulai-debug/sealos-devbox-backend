@@ -1,11 +1,25 @@
 import { prisma } from '../lib/prisma';
+import {
+  releaseShopPriceSlot,
+  releaseStoreProductPriceLock,
+  tryAcquireShopPriceSlot,
+  tryAcquireStoreProductPriceLock,
+} from '../lib/priceLocks';
 import { DEFAULT_COMMISSION_RATE } from '../config/commissionMap';
 import { guessCommissionRate } from '../utils/commissionMatcher';
-import { getEmagCredentials } from './emagClient';
+import { emagApiCall, getEmagCredentials } from './emagClient';
 import { isOfferSellable } from './emagBuyBox';
 import { readProductOffers } from './emagProduct';
 import { loadExchangeRateMap } from './exchangeRateSync';
 import { calcHeadFreightCny } from './freightCalculator';
+import {
+  createPriceAdjustmentLog,
+  markPriceAdjustmentFailed,
+  markPriceAdjustmentPendingVerify,
+  markPriceAdjustmentSkipped,
+  markPriceAdjustmentSuccess,
+} from './priceAdjustmentLogs';
+import { recalcProfitForStoreProducts } from './profitCalculator';
 import {
   calculateCostStatus,
   calculateMinPrices,
@@ -157,6 +171,35 @@ const FORBIDDEN_PRICE_PAYLOAD_FIELDS = new Set([
   'documentation',
 ]);
 
+/** Phase 1-B1 默认关闭真实 eMAG 写请求；后续真实测试需老板单独授权后再开启。 */
+const ALLOW_EMAG_PRICE_WRITE = false;
+
+const ALLOWED_PRICE_PAYLOAD_KEYS = new Set(['id', 'sale_price', 'vat_id']);
+
+const DRY_RUN_ONLY_MESSAGE = '当前处于 Phase 1-B1 安全模式，未发送 eMAG 写请求，未真实改价';
+
+const GRAB_CART_PRICE_TOLERANCE = 0.005;
+
+export type PriceWriteStatus = 'SUCCESS' | 'FAILED' | 'PENDING_VERIFY' | 'DRY_RUN_ONLY';
+
+export type PriceExecuteResult = {
+  status: PriceExecuteResultStatus;
+  code: PriceErrorCode | 'OK' | 'DRY_RUN_ONLY' | 'SKIPPED';
+  message: string;
+  storeProductId: number;
+  shopId: number;
+  logId?: number;
+  oldSalePriceExVat?: number | null;
+  newSalePriceExVat?: number | null;
+  emagOfferId?: string | null;
+  payloadPreview?: PriceUpdatePayloadItem[] | null;
+  profitRecalculated?: boolean;
+  profitRecalcWarning?: string | null;
+  noEmagWriteExecuted: boolean;
+};
+
+export type PriceExecuteResultStatus = 'SUCCESS' | 'FAILED' | 'PENDING_VERIFY' | 'DRY_RUN_ONLY' | 'SKIPPED' | 'BLOCKED';
+
 // 与 profitCalculator 的 FBE 冷启动兜底保持业务口径一致。
 const DEFAULT_FBE_CNY = 7;
 
@@ -295,6 +338,13 @@ export function validatePriceUpdatePayload(payload: unknown): { ok: boolean; err
     }
 
     const row = item as Record<string, unknown>;
+    const keys = Object.keys(row);
+    for (const key of keys) {
+      if (!ALLOWED_PRICE_PAYLOAD_KEYS.has(key)) {
+        errors.push(`payload[${index}] 包含不允许的字段 ${key}`);
+      }
+    }
+
     if (!toPositiveInteger(row.id as string | number | null | undefined)) {
       errors.push(`payload[${index}].id 必须是 eMAG offer 正整数 id`);
     }
@@ -312,6 +362,667 @@ export function validatePriceUpdatePayload(payload: unknown): { ok: boolean; err
   errors.push(...findForbiddenFields(payload));
 
   return { ok: errors.length === 0, errors };
+}
+
+function normalizeReason(reason: unknown): { ok: true; value: string } | { ok: false; message: string } {
+  if (typeof reason !== 'string') {
+    return { ok: false, message: PRICE_ERROR_MESSAGES.REASON_REQUIRED };
+  }
+  const trimmed = reason.trim();
+  if (trimmed.length < 5 || trimmed.length > 500) {
+    return { ok: false, message: '执行原因必填，长度需在 5-500 字之间' };
+  }
+  return { ok: true, value: trimmed };
+}
+
+function buildBlockedExecuteResult(params: {
+  storeProductId: number;
+  shopId: number;
+  code: PriceErrorCode | 'OK' | 'DRY_RUN_ONLY' | 'SKIPPED';
+  message: string;
+  status?: PriceExecuteResultStatus;
+  logId?: number;
+  oldSalePriceExVat?: number | null;
+  newSalePriceExVat?: number | null;
+  emagOfferId?: string | null;
+  payloadPreview?: PriceUpdatePayloadItem[] | null;
+}): PriceExecuteResult {
+  return {
+    status: params.status ?? 'BLOCKED',
+    code: params.code,
+    message: params.message,
+    storeProductId: params.storeProductId,
+    shopId: params.shopId,
+    logId: params.logId,
+    oldSalePriceExVat: params.oldSalePriceExVat,
+    newSalePriceExVat: params.newSalePriceExVat,
+    emagOfferId: params.emagOfferId,
+    payloadPreview: params.payloadPreview ?? null,
+    profitRecalculated: false,
+    profitRecalcWarning: null,
+    noEmagWriteExecuted: true,
+  };
+}
+
+export async function updateProductOfferPrice(params: {
+  shopId: number;
+  storeProductId: number;
+  payload: PriceUpdatePayloadItem[];
+}): Promise<{
+  ok: boolean;
+  status: PriceWriteStatus;
+  rawResponse?: unknown;
+  errorMessage?: string;
+}> {
+  const validation = validatePriceUpdatePayload(params.payload);
+  if (!validation.ok) {
+    return {
+      ok: false,
+      status: 'FAILED',
+      errorMessage: validation.errors.join('; '),
+    };
+  }
+
+  if (!ALLOW_EMAG_PRICE_WRITE) {
+    return {
+      ok: false,
+      status: 'DRY_RUN_ONLY',
+      errorMessage: DRY_RUN_ONLY_MESSAGE,
+    };
+  }
+
+  try {
+    const creds = await getEmagCredentials(params.shopId);
+    const response = await emagApiCall(creds, 'product_offer', 'save', params.payload, {
+      timeout: 60_000,
+      requireProxy: true,
+    });
+
+    if (response.isError) {
+      const message = response.messages?.join('; ') ?? 'eMAG 改价失败';
+      return {
+        ok: false,
+        status: 'FAILED',
+        rawResponse: response,
+        errorMessage: message,
+      };
+    }
+
+    return {
+      ok: true,
+      status: 'SUCCESS',
+      rawResponse: response,
+    };
+  } catch (err: any) {
+    const code = err?.code ?? '';
+    const message = err?.message ?? 'eMAG 改价请求失败';
+    const isPendingVerify = code === 'EMAG_PROXY_REQUIRED'
+      || /timeout|ECONNRESET|ETIMEDOUT|ECONNABORTED|socket hang up|状态不明/i.test(message);
+
+    if (isPendingVerify) {
+      return {
+        ok: false,
+        status: 'PENDING_VERIFY',
+        errorMessage: message,
+      };
+    }
+
+    return {
+      ok: false,
+      status: 'FAILED',
+      errorMessage: message,
+    };
+  }
+}
+
+export async function executePriceChange(params: {
+  shopId: number;
+  storeProductId: number;
+  newSalePriceExVat: number;
+  reason: string;
+  operatorUserId?: number | null;
+}): Promise<PriceExecuteResult> {
+  const reasonResult = normalizeReason(params.reason);
+  if (!reasonResult.ok) {
+    return buildBlockedExecuteResult({
+      storeProductId: params.storeProductId,
+      shopId: params.shopId,
+      code: PRICE_ERROR_CODES.REASON_REQUIRED,
+      message: reasonResult.message,
+    });
+  }
+
+  const newSalePrice = toFiniteNumber(params.newSalePriceExVat);
+  if (newSalePrice == null || newSalePrice <= 0) {
+    return buildBlockedExecuteResult({
+      storeProductId: params.storeProductId,
+      shopId: params.shopId,
+      code: PRICE_ERROR_CODES.INVALID_PRICE,
+      message: PRICE_ERROR_MESSAGES.INVALID_PRICE,
+    });
+  }
+
+  if (!tryAcquireStoreProductPriceLock(params.storeProductId)) {
+    return buildBlockedExecuteResult({
+      storeProductId: params.storeProductId,
+      shopId: params.shopId,
+      code: PRICE_ERROR_CODES.PRICE_LOCKED,
+      message: PRICE_ERROR_MESSAGES.PRICE_LOCKED,
+    });
+  }
+
+  if (!tryAcquireShopPriceSlot(params.shopId)) {
+    releaseStoreProductPriceLock(params.storeProductId);
+    return buildBlockedExecuteResult({
+      storeProductId: params.storeProductId,
+      shopId: params.shopId,
+      code: PRICE_ERROR_CODES.PRICE_LOCKED,
+      message: PRICE_ERROR_MESSAGES.PRICE_LOCKED,
+    });
+  }
+
+  let logId: number | undefined;
+
+  try {
+    const preview = await buildPricePreview({
+      shopId: params.shopId,
+      storeProductId: params.storeProductId,
+      newSalePriceExVat: newSalePrice,
+    });
+
+    if (!preview.priceActionEligibility.canChangePrice) {
+      return buildBlockedExecuteResult({
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        code: preview.priceActionEligibility.code,
+        message: preview.priceActionEligibility.message,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: newSalePrice,
+        payloadPreview: preview.payloadPreview,
+      });
+    }
+
+    if (preview.finalMinPrice != null && newSalePrice < preview.finalMinPrice) {
+      return buildBlockedExecuteResult({
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        code: PRICE_ERROR_CODES.BELOW_FINAL_MIN_PRICE,
+        message: PRICE_ERROR_MESSAGES.BELOW_FINAL_MIN_PRICE,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: newSalePrice,
+        payloadPreview: preview.payloadPreview,
+      });
+    }
+
+    const payload = preview.payloadPreview;
+    if (!payload) {
+      return buildBlockedExecuteResult({
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        code: PRICE_ERROR_CODES.MISSING_EMAG_OFFER_ID,
+        message: PRICE_ERROR_MESSAGES.MISSING_EMAG_OFFER_ID,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: newSalePrice,
+      });
+    }
+
+    const validation = validatePriceUpdatePayload(payload);
+    if (!validation.ok) {
+      return buildBlockedExecuteResult({
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        code: PRICE_ERROR_CODES.EMAG_PRICE_UPDATE_FAILED,
+        message: validation.errors.join('; '),
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: newSalePrice,
+        payloadPreview: payload,
+      });
+    }
+
+    const log = await createPriceAdjustmentLog({
+      shopId: params.shopId,
+      storeProductId: params.storeProductId,
+      pnk: null,
+      mode: 'MANUAL_PRICE_CHANGE',
+      oldSalePriceExVat: preview.currentSalePriceExVat,
+      newSalePriceExVat: newSalePrice,
+      currency: preview.currency,
+      vatRate: preview.vatRate,
+      hardFloorPrice: preview.hardFloorPrice,
+      suggestedMinPrice: preview.suggestedMinPrice,
+      manualMinPrice: preview.manualMinPrice,
+      finalMinPrice: preview.finalMinPrice,
+      estimatedProfitAfter: preview.estimatedProfitAfter,
+      profitMarginPctAfter: preview.profitMarginPctAfter,
+      reason: reasonResult.value,
+      operatorUserId: params.operatorUserId ?? null,
+      emagRequestPayload: payload,
+      status: 'PROCESSING',
+    });
+    logId = log.id;
+
+    const writeResult = await updateProductOfferPrice({
+      shopId: params.shopId,
+      storeProductId: params.storeProductId,
+      payload,
+    });
+
+    if (writeResult.status === 'DRY_RUN_ONLY') {
+      await markPriceAdjustmentSkipped(logId, {
+        errorMessage: writeResult.errorMessage ?? DRY_RUN_ONLY_MESSAGE,
+      });
+      return {
+        status: 'SKIPPED',
+        code: 'DRY_RUN_ONLY',
+        message: `${writeResult.errorMessage ?? DRY_RUN_ONLY_MESSAGE}；no eMAG write executed`,
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        logId,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: newSalePrice,
+        emagOfferId: payload[0]?.id != null ? String(payload[0].id) : null,
+        payloadPreview: payload,
+        profitRecalculated: false,
+        profitRecalcWarning: null,
+        noEmagWriteExecuted: true,
+      };
+    }
+
+    if (writeResult.status === 'FAILED') {
+      await markPriceAdjustmentFailed(logId, {
+        emagResponse: writeResult.rawResponse,
+        errorMessage: writeResult.errorMessage,
+      });
+      return {
+        status: 'FAILED',
+        code: PRICE_ERROR_CODES.EMAG_PRICE_UPDATE_FAILED,
+        message: writeResult.errorMessage ?? PRICE_ERROR_MESSAGES.EMAG_PRICE_UPDATE_FAILED,
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        logId,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: newSalePrice,
+        payloadPreview: payload,
+        profitRecalculated: false,
+        profitRecalcWarning: null,
+        noEmagWriteExecuted: true,
+      };
+    }
+
+    if (writeResult.status === 'PENDING_VERIFY') {
+      await markPriceAdjustmentPendingVerify(logId, {
+        emagResponse: writeResult.rawResponse,
+        errorMessage: writeResult.errorMessage,
+      });
+      return {
+        status: 'PENDING_VERIFY',
+        code: PRICE_ERROR_CODES.PENDING_VERIFY,
+        message: writeResult.errorMessage ?? PRICE_ERROR_MESSAGES.PENDING_VERIFY,
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        logId,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: newSalePrice,
+        payloadPreview: payload,
+        profitRecalculated: false,
+        profitRecalcWarning: null,
+        noEmagWriteExecuted: true,
+      };
+    }
+
+    const context = await loadPriceContext({ shopId: params.shopId, storeProductId: params.storeProductId });
+    const vatId = context?.storeProduct.vatId ?? payload[0]?.vat_id ?? null;
+    const vatRate = context?.rawLocalCost.vatRate ?? preview.vatRate ?? null;
+
+    await prisma.$transaction([
+      prisma.storeProduct.update({
+        where: { id: params.storeProductId },
+        data: {
+          salePrice: newSalePrice,
+          vatId,
+          vatRate,
+          lastPriceAdjustedAt: new Date(),
+          lastPriceAdjustmentMode: 'MANUAL_PRICE_CHANGE',
+        },
+      }),
+    ]);
+
+    await markPriceAdjustmentSuccess(logId, {
+      emagResponse: writeResult.rawResponse,
+      estimatedProfitAfter: preview.estimatedProfitAfter,
+      profitMarginPctAfter: preview.profitMarginPctAfter,
+    });
+
+    let profitRecalculated = false;
+    let profitRecalcWarning: string | null = null;
+    try {
+      const updatedCount = await recalcProfitForStoreProducts([params.storeProductId]);
+      profitRecalculated = updatedCount > 0;
+      if (updatedCount === 0) profitRecalcWarning = '单品利润重算未更新任何记录';
+    } catch (err: any) {
+      profitRecalcWarning = err?.message ?? '单品利润重算失败';
+      console.error('[executePriceChange] profit recalc failed:', profitRecalcWarning);
+    }
+
+    return {
+      status: 'SUCCESS',
+      code: 'OK',
+      message: 'price execute success',
+      storeProductId: params.storeProductId,
+      shopId: params.shopId,
+      logId,
+      oldSalePriceExVat: preview.currentSalePriceExVat,
+      newSalePriceExVat: newSalePrice,
+      emagOfferId: payload[0]?.id != null ? String(payload[0].id) : null,
+      payloadPreview: payload,
+      profitRecalculated,
+      profitRecalcWarning,
+      noEmagWriteExecuted: false,
+    };
+  } catch (err: any) {
+    if (logId) {
+      try {
+        await markPriceAdjustmentFailed(logId, {
+          errorMessage: err?.message ?? 'executePriceChange 执行失败',
+        });
+      } catch (logErr: any) {
+        console.error('[executePriceChange] failed to mark log FAILED:', logErr?.message ?? logErr);
+      }
+    }
+    throw err;
+  } finally {
+    releaseStoreProductPriceLock(params.storeProductId);
+    releaseShopPriceSlot(params.shopId);
+  }
+}
+
+export async function executeGrabCartPriceChange(params: {
+  shopId: number;
+  storeProductId: number;
+  confirmedPriceExVat: number;
+  reason: string;
+  operatorUserId?: number | null;
+}): Promise<PriceExecuteResult> {
+  const reasonResult = normalizeReason(params.reason);
+  if (!reasonResult.ok) {
+    return buildBlockedExecuteResult({
+      storeProductId: params.storeProductId,
+      shopId: params.shopId,
+      code: PRICE_ERROR_CODES.REASON_REQUIRED,
+      message: reasonResult.message,
+    });
+  }
+
+  const confirmedPrice = toFiniteNumber(params.confirmedPriceExVat);
+  if (confirmedPrice == null || confirmedPrice <= 0) {
+    return buildBlockedExecuteResult({
+      storeProductId: params.storeProductId,
+      shopId: params.shopId,
+      code: PRICE_ERROR_CODES.INVALID_PRICE,
+      message: PRICE_ERROR_MESSAGES.INVALID_PRICE,
+    });
+  }
+
+  if (!tryAcquireStoreProductPriceLock(params.storeProductId)) {
+    return buildBlockedExecuteResult({
+      storeProductId: params.storeProductId,
+      shopId: params.shopId,
+      code: PRICE_ERROR_CODES.PRICE_LOCKED,
+      message: PRICE_ERROR_MESSAGES.PRICE_LOCKED,
+    });
+  }
+
+  if (!tryAcquireShopPriceSlot(params.shopId)) {
+    releaseStoreProductPriceLock(params.storeProductId);
+    return buildBlockedExecuteResult({
+      storeProductId: params.storeProductId,
+      shopId: params.shopId,
+      code: PRICE_ERROR_CODES.PRICE_LOCKED,
+      message: PRICE_ERROR_MESSAGES.PRICE_LOCKED,
+    });
+  }
+
+  let logId: number | undefined;
+
+  try {
+    const preview = await buildGrabCartPreview({
+      shopId: params.shopId,
+      storeProductId: params.storeProductId,
+    });
+
+    if (preview.grabCartEligibility.code === PRICE_ERROR_CODES.ALREADY_WON) {
+      return buildBlockedExecuteResult({
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        code: PRICE_ERROR_CODES.ALREADY_WON,
+        message: preview.grabCartEligibility.message,
+        status: 'SKIPPED',
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: confirmedPrice,
+      });
+    }
+
+    if (!preview.grabCartEligibility.canGrab) {
+      return buildBlockedExecuteResult({
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        code: preview.grabCartEligibility.code,
+        message: preview.grabCartEligibility.message,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: confirmedPrice,
+      });
+    }
+
+    const suggestedPrice = preview.suggestedGrabPriceExVat;
+    if (suggestedPrice == null || Math.abs(confirmedPrice - suggestedPrice) > GRAB_CART_PRICE_TOLERANCE) {
+      return buildBlockedExecuteResult({
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        code: PRICE_ERROR_CODES.CONFIRMED_PRICE_MISMATCH,
+        message: PRICE_ERROR_MESSAGES.CONFIRMED_PRICE_MISMATCH,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: confirmedPrice,
+      });
+    }
+
+    if (preview.finalMinPrice != null && confirmedPrice < preview.finalMinPrice) {
+      return buildBlockedExecuteResult({
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        code: PRICE_ERROR_CODES.BELOW_FINAL_MIN_PRICE,
+        message: PRICE_ERROR_MESSAGES.BELOW_FINAL_MIN_PRICE,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: confirmedPrice,
+      });
+    }
+
+    const context = await loadPriceContext({ shopId: params.shopId, storeProductId: params.storeProductId });
+    if (!context?.fresh.emagOfferId) {
+      return buildBlockedExecuteResult({
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        code: PRICE_ERROR_CODES.MISSING_EMAG_OFFER_ID,
+        message: PRICE_ERROR_MESSAGES.MISSING_EMAG_OFFER_ID,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: confirmedPrice,
+      });
+    }
+
+    const payload = buildProductOfferPriceUpdatePayload({
+      emagOfferId: context.fresh.emagOfferId,
+      newSalePriceExVat: confirmedPrice,
+      vatId: context.storeProduct.vatId,
+    });
+
+    const validation = validatePriceUpdatePayload(payload);
+    if (!validation.ok) {
+      return buildBlockedExecuteResult({
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        code: PRICE_ERROR_CODES.EMAG_PRICE_UPDATE_FAILED,
+        message: validation.errors.join('; '),
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: confirmedPrice,
+        payloadPreview: payload,
+      });
+    }
+
+    const log = await createPriceAdjustmentLog({
+      shopId: params.shopId,
+      storeProductId: params.storeProductId,
+      pnk: context.storeProduct.pnk,
+      mode: 'GRAB_CART_MANUAL',
+      oldSalePriceExVat: preview.currentSalePriceExVat,
+      newSalePriceExVat: confirmedPrice,
+      currency: preview.currency,
+      cartPriceRaw: preview.cartPriceRaw,
+      cartPriceExVat: preview.cartPriceExVat,
+      vatRate: preview.vatRate,
+      hardFloorPrice: preview.hardFloorPrice,
+      suggestedMinPrice: preview.suggestedMinPrice,
+      manualMinPrice: preview.manualMinPrice,
+      finalMinPrice: preview.finalMinPrice,
+      estimatedProfitAfter: preview.estimatedProfitAfter,
+      profitMarginPctAfter: preview.profitMarginPctAfter,
+      reason: reasonResult.value,
+      operatorUserId: params.operatorUserId ?? null,
+      emagRequestPayload: payload,
+      status: 'PROCESSING',
+    });
+    logId = log.id;
+
+    const writeResult = await updateProductOfferPrice({
+      shopId: params.shopId,
+      storeProductId: params.storeProductId,
+      payload,
+    });
+
+    if (writeResult.status === 'DRY_RUN_ONLY') {
+      await markPriceAdjustmentSkipped(logId, {
+        errorMessage: writeResult.errorMessage ?? DRY_RUN_ONLY_MESSAGE,
+      });
+      return {
+        status: 'SKIPPED',
+        code: 'DRY_RUN_ONLY',
+        message: `${writeResult.errorMessage ?? DRY_RUN_ONLY_MESSAGE}；no eMAG write executed`,
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        logId,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: confirmedPrice,
+        emagOfferId: context.fresh.emagOfferId,
+        payloadPreview: payload,
+        profitRecalculated: false,
+        profitRecalcWarning: null,
+        noEmagWriteExecuted: true,
+      };
+    }
+
+    if (writeResult.status === 'FAILED') {
+      await markPriceAdjustmentFailed(logId, {
+        emagResponse: writeResult.rawResponse,
+        errorMessage: writeResult.errorMessage,
+      });
+      return {
+        status: 'FAILED',
+        code: PRICE_ERROR_CODES.EMAG_PRICE_UPDATE_FAILED,
+        message: writeResult.errorMessage ?? PRICE_ERROR_MESSAGES.EMAG_PRICE_UPDATE_FAILED,
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        logId,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: confirmedPrice,
+        payloadPreview: payload,
+        profitRecalculated: false,
+        profitRecalcWarning: null,
+        noEmagWriteExecuted: true,
+      };
+    }
+
+    if (writeResult.status === 'PENDING_VERIFY') {
+      await markPriceAdjustmentPendingVerify(logId, {
+        emagResponse: writeResult.rawResponse,
+        errorMessage: writeResult.errorMessage,
+      });
+      return {
+        status: 'PENDING_VERIFY',
+        code: PRICE_ERROR_CODES.PENDING_VERIFY,
+        message: writeResult.errorMessage ?? PRICE_ERROR_MESSAGES.PENDING_VERIFY,
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        logId,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: confirmedPrice,
+        payloadPreview: payload,
+        profitRecalculated: false,
+        profitRecalcWarning: null,
+        noEmagWriteExecuted: true,
+      };
+    }
+
+    const vatId = context.storeProduct.vatId ?? payload[0]?.vat_id ?? null;
+    const vatRate = context.rawLocalCost.vatRate ?? preview.vatRate ?? null;
+
+    await prisma.$transaction([
+      prisma.storeProduct.update({
+        where: { id: params.storeProductId },
+        data: {
+          salePrice: confirmedPrice,
+          vatId,
+          vatRate,
+          lastPriceAdjustedAt: new Date(),
+          lastPriceAdjustmentMode: 'GRAB_CART_MANUAL',
+        },
+      }),
+    ]);
+
+    await markPriceAdjustmentSuccess(logId, {
+      emagResponse: writeResult.rawResponse,
+      estimatedProfitAfter: preview.estimatedProfitAfter,
+      profitMarginPctAfter: preview.profitMarginPctAfter,
+    });
+
+    let profitRecalculated = false;
+    let profitRecalcWarning: string | null = null;
+    try {
+      const updatedCount = await recalcProfitForStoreProducts([params.storeProductId]);
+      profitRecalculated = updatedCount > 0;
+      if (updatedCount === 0) profitRecalcWarning = '单品利润重算未更新任何记录';
+    } catch (err: any) {
+      profitRecalcWarning = err?.message ?? '单品利润重算失败';
+      console.error('[executeGrabCartPriceChange] profit recalc failed:', profitRecalcWarning);
+    }
+
+    return {
+      status: 'SUCCESS',
+      code: 'OK',
+      message: 'grab-cart execute success',
+      storeProductId: params.storeProductId,
+      shopId: params.shopId,
+      logId,
+      oldSalePriceExVat: preview.currentSalePriceExVat,
+      newSalePriceExVat: confirmedPrice,
+      emagOfferId: context.fresh.emagOfferId,
+      payloadPreview: payload,
+      profitRecalculated,
+      profitRecalcWarning,
+      noEmagWriteExecuted: false,
+    };
+  } catch (err: any) {
+    if (logId) {
+      try {
+        await markPriceAdjustmentFailed(logId, {
+          errorMessage: err?.message ?? 'executeGrabCartPriceChange 执行失败',
+        });
+      } catch (logErr: any) {
+        console.error('[executeGrabCartPriceChange] failed to mark log FAILED:', logErr?.message ?? logErr);
+      }
+    }
+    throw err;
+  } finally {
+    releaseStoreProductPriceLock(params.storeProductId);
+    releaseShopPriceSlot(params.shopId);
+  }
 }
 
 export async function readFreshProductOfferForPriceCheck(params: {

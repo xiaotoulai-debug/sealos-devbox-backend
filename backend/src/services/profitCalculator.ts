@@ -36,6 +36,204 @@ const WRITE_CHUNK_DELAY = 80; // ms
 
 const sleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
 
+type StoreProductProfitRow = {
+  id: number;
+  shopId: number;
+  salePrice: unknown;
+  currency: string | null;
+  commissionRate: number | null;
+  mappedInventorySku: string | null;
+  pnk: string;
+  name: string;
+};
+
+type LocalProductRow = {
+  sku: string | null;
+  pnk: string | null;
+  purchasePrice: unknown;
+  fbeFee: unknown;
+  length: unknown;
+  width: unknown;
+  height: unknown;
+  actualWeight: unknown;
+  category: string | null;
+  returnLossRate: number | null;
+};
+
+type PendingProfitUpdate = {
+  id: number;
+  estimatedProfit: number;
+  estimatedProfitCny: number | null;
+  profitMarginPct: number | null;
+  profitCalculatedAt: Date;
+  profitBreakdown: object;
+};
+
+async function buildInheritedSkuMap(products: Array<{ pnk: string; shopId: number; mappedInventorySku: string | null }>): Promise<Map<string, string>> {
+  const unmappedPnks = [...new Set(
+    products.filter((p) => !p.mappedInventorySku && p.pnk).map((p) => p.pnk),
+  )];
+  if (unmappedPnks.length === 0) return new Map();
+
+  const inheritedRows = await prisma.storeProduct.findMany({
+    where: {
+      pnk: { in: unmappedPnks },
+      isArchived: false,
+      mappedInventorySku: { not: null },
+    },
+    select: { pnk: true, mappedInventorySku: true, shopId: true },
+  });
+
+  const requestingShopByPnk = new Map<string, Set<number>>();
+  for (const product of products) {
+    if (!product.mappedInventorySku && product.pnk) {
+      const shops = requestingShopByPnk.get(product.pnk) ?? new Set<number>();
+      shops.add(product.shopId);
+      requestingShopByPnk.set(product.pnk, shops);
+    }
+  }
+
+  const inheritedSkuMap = new Map<string, string>();
+  for (const row of inheritedRows) {
+    if (!row.pnk || !row.mappedInventorySku || inheritedSkuMap.has(row.pnk)) continue;
+    const requestingShops = requestingShopByPnk.get(row.pnk);
+    if (requestingShops?.has(row.shopId)) continue;
+    inheritedSkuMap.set(row.pnk, row.mappedInventorySku);
+  }
+  return inheritedSkuMap;
+}
+
+function computePendingProfitUpdates(params: {
+  products: StoreProductProfitRow[];
+  inheritedSkuMap: Map<string, string>;
+  skuMap: Map<string, LocalProductRow>;
+  pnkMap: Map<string, LocalProductRow>;
+  rateMap: Map<string, number>;
+}): PendingProfitUpdate[] {
+  const now = new Date();
+  const pending: PendingProfitUpdate[] = [];
+
+  for (const sp of params.products) {
+    const salePrice = Number(sp.salePrice);
+    if (salePrice <= 0) continue;
+
+    const currency = sp.currency ?? 'RON';
+    const effectiveSku = sp.mappedInventorySku ?? params.inheritedSkuMap.get(sp.pnk);
+    const local = (effectiveSku ? params.skuMap.get(effectiveSku) : undefined)
+      ?? params.pnkMap.get(sp.pnk);
+
+    if (!local?.purchasePrice) continue;
+
+    let commissionRateSource: 'exact' | 'dictionary' | 'default';
+    let commRate: number;
+    if (sp.commissionRate != null) {
+      commRate = sp.commissionRate;
+      commissionRateSource = 'exact';
+    } else {
+      const guessed = guessCommissionRate(sp.name, local.category ?? null);
+      if (guessed != null) {
+        commRate = guessed;
+        commissionRateSource = 'dictionary';
+      } else {
+        commRate = DEFAULT_COMMISSION_RATE;
+        commissionRateSource = 'default';
+      }
+    }
+    const isEstimatedCommission = commissionRateSource !== 'exact';
+
+    const cnyToLocal = params.rateMap.get(`CNY→${currency}`);
+    if (!cnyToLocal) continue;
+
+    const localToCny = params.rateMap.get(`${currency}→CNY`);
+    const purchasePriceCny = Number(local.purchasePrice);
+    const purchaseCostLocal = purchasePriceCny * cnyToLocal;
+
+    const headFreightCny = calcHeadFreightCny(
+      local.length ? Number(local.length) : null,
+      local.width ? Number(local.width) : null,
+      local.height ? Number(local.height) : null,
+      local.actualWeight ? Number(local.actualWeight) : null,
+    );
+    const isMissingVolumeWeight = headFreightCny === null;
+    const headFreightLocal = (headFreightCny ?? 0) * cnyToLocal;
+
+    const isEstimatedFbe = !local.fbeFee;
+    const fbeLocal = local.fbeFee
+      ? Number(local.fbeFee)
+      : DEFAULT_FBE_CNY * cnyToLocal;
+
+    const returnLossRate = local.returnLossRate ?? 0;
+    const returnLossCny = purchasePriceCny * returnLossRate;
+    const returnLossLocal = returnLossCny * cnyToLocal;
+    const commission = salePrice * commRate;
+    const profitLocal = salePrice - commission - fbeLocal - headFreightLocal
+      - purchaseCostLocal - returnLossLocal;
+    const profitCny = localToCny != null ? profitLocal * localToCny : null;
+    const marginPct = salePrice > 0 ? (profitLocal / salePrice) * 100 : null;
+
+    pending.push({
+      id: sp.id,
+      estimatedProfit: round2(profitLocal),
+      estimatedProfitCny: profitCny != null ? round2(profitCny) : null,
+      profitMarginPct: marginPct != null ? round2(marginPct) : null,
+      profitCalculatedAt: now,
+      profitBreakdown: {
+        salePrice: round2(salePrice),
+        currency,
+        commissionRate: commRate,
+        commissionRateSource,
+        isEstimatedCommission,
+        commission: round2(commission),
+        fbe: round2(fbeLocal),
+        isEstimatedFbe,
+        isMissingVolumeWeight,
+        headFreightCny: round2(headFreightCny ?? 0),
+        headFreightLocal: round2(headFreightLocal),
+        purchaseCostCny: round2(purchasePriceCny),
+        purchaseCostLocal: round2(purchaseCostLocal),
+        returnLossRate,
+        returnLossCny: round2(returnLossCny),
+        returnLossLocal: round2(returnLossLocal),
+        exchangeRateCnyToLocal: cnyToLocal,
+        exchangeRateLocalToCny: localToCny ?? null,
+        profitLocal: round2(profitLocal),
+        profitCny: profitCny != null ? round2(profitCny) : null,
+        profitMarginPct: marginPct != null ? round2(marginPct) : null,
+      },
+    });
+  }
+
+  return pending;
+}
+
+async function writePendingProfitUpdates(pending: PendingProfitUpdate[]): Promise<number> {
+  let updated = 0;
+  for (let i = 0; i < pending.length; i += WRITE_CHUNK_SIZE) {
+    const chunk = pending.slice(i, i + WRITE_CHUNK_SIZE);
+    try {
+      await prisma.$transaction(
+        chunk.map((u) =>
+          prisma.storeProduct.update({
+            where: { id: u.id },
+            data: {
+              estimatedProfit: u.estimatedProfit,
+              estimatedProfitCny: u.estimatedProfitCny,
+              profitMarginPct: u.profitMarginPct,
+              profitCalculatedAt: u.profitCalculatedAt,
+              profitBreakdown: u.profitBreakdown,
+            },
+          }),
+        ),
+      );
+      updated += chunk.length;
+    } catch (err: any) {
+      console.error(`[ProfitCalc] chunk[${i}~${i + chunk.length - 1}] 写入失败:`, err.message ?? err);
+    }
+    if (i + WRITE_CHUNK_SIZE < pending.length) await sleep(WRITE_CHUNK_DELAY);
+  }
+  return updated;
+}
+
 /**
  * 为指定店铺的全部 StoreProduct 重算利润并写入缓存字段。
  * @returns 更新条数
@@ -44,7 +242,7 @@ export async function recalcProfitForShop(shopId: number): Promise<number> {
   const products = await prisma.storeProduct.findMany({
     where: { shopId, isArchived: false },
     select: {
-      id: true, salePrice: true, currency: true,
+      id: true, shopId: true, salePrice: true, currency: true,
       commissionRate: true, mappedInventorySku: true, pnk: true,
       name: true,   // 用于 commissionMatcher 关键词匹配
     },
@@ -127,157 +325,15 @@ export async function recalcProfitForShop(shopId: number): Promise<number> {
   for (const lp of pnkProducts) if (lp.pnk) pnkMap.set(lp.pnk, lp);
 
   const rateMap = await loadExchangeRateMap();
-  const now = new Date();
+  const pending = computePendingProfitUpdates({
+    products,
+    inheritedSkuMap,
+    skuMap,
+    pnkMap,
+    rateMap,
+  });
 
-  // ── 第一步：纯内存计算，收集所有待写入记录 ────────────────────────
-  type PendingUpdate = {
-    id: number;
-    estimatedProfit: number;
-    estimatedProfitCny: number | null;
-    profitMarginPct: number | null;
-    profitCalculatedAt: Date;
-    profitBreakdown: object;
-  };
-  const pending: PendingUpdate[] = [];
-
-  for (const sp of products) {
-    const salePrice = Number(sp.salePrice);
-    if (salePrice <= 0) continue;
-
-    const currency = sp.currency ?? 'RON';
-
-    // 查找本地产品：① 本店 SKU 精确匹配 → ② 跨店继承 SKU → ③ PNK 兜底
-    const effectiveSku = sp.mappedInventorySku ?? inheritedSkuMap.get(sp.pnk);
-    const local = (effectiveSku ? skuMap.get(effectiveSku) : undefined)
-      ?? pnkMap.get(sp.pnk);
-
-    if (!local?.purchasePrice) continue; // 无采购价则跳过
-
-    // ── 三级佣金率优先链路 ─────────────────────────────────────────
-    let commissionRateSource: 'exact' | 'dictionary' | 'default';
-    let commRate: number;
-    if (sp.commissionRate != null) {
-      commRate = sp.commissionRate;
-      commissionRateSource = 'exact';
-    } else {
-      const guessed = guessCommissionRate(sp.name, local.category ?? null);
-      if (guessed != null) {
-        commRate = guessed;
-        commissionRateSource = 'dictionary';
-      } else {
-        commRate = DEFAULT_COMMISSION_RATE;
-        commissionRateSource = 'default';
-      }
-    }
-    const isEstimatedCommission = commissionRateSource !== 'exact';
-
-    const cnyToLocal = rateMap.get(`CNY→${currency}`);
-    if (!cnyToLocal) continue; // 无汇率则跳过
-
-    const localToCny = rateMap.get(`${currency}→CNY`);
-    const purchasePriceCny = Number(local.purchasePrice);
-
-    // 采购成本（当地货币）
-    const purchaseCostLocal = purchasePriceCny * cnyToLocal;
-
-    // 头程运费（CNY → 当地货币）
-    // calcHeadFreightCny 返回 null 表示尺寸与重量数据均缺失
-    const headFreightCny = calcHeadFreightCny(
-      local.length ? Number(local.length) : null,
-      local.width  ? Number(local.width)  : null,
-      local.height ? Number(local.height) : null,
-      local.actualWeight ? Number(local.actualWeight) : null,
-    );
-    const isMissingVolumeWeight = headFreightCny === null; // 体积/重量数据缺失标识
-    const headFreightLocal = (headFreightCny ?? 0) * cnyToLocal;
-
-    // FBE 费用：有真实录入值则用；否则 DEFAULT_FBE_CNY 换算兜底，严禁按 0 处理
-    const isEstimatedFbe = !local.fbeFee;
-    const fbeLocal = local.fbeFee
-      ? Number(local.fbeFee)
-      : DEFAULT_FBE_CNY * cnyToLocal;
-
-    // 退货损耗（CNY → 当地货币）= 采购价 CNY × returnLossRate
-    const returnLossRate  = (local.returnLossRate ?? 0);
-    const returnLossCny   = purchasePriceCny * returnLossRate;
-    const returnLossLocal = returnLossCny * cnyToLocal;
-
-    // 佣金（当地货币）
-    const commission = salePrice * commRate;
-
-    // 利润（当地货币）
-    const profitLocal = salePrice - commission - fbeLocal - headFreightLocal
-                        - purchaseCostLocal - returnLossLocal;
-
-    // 利润（CNY）
-    const profitCny = localToCny != null ? profitLocal * localToCny : null;
-
-    // 毛利率 %
-    const marginPct = salePrice > 0 ? (profitLocal / salePrice) * 100 : null;
-
-    // ── 利润明细 breakdown ──────────────────────────────────────────
-    const breakdown = {
-      salePrice:               round2(salePrice),
-      currency,
-      commissionRate:          commRate,
-      commissionRateSource,
-      isEstimatedCommission,
-      commission:              round2(commission),
-      fbe:                     round2(fbeLocal),
-      isEstimatedFbe,
-      isMissingVolumeWeight,   // true = 缺少尺寸/重量，头程按 0 估算
-      headFreightCny:          round2(headFreightCny ?? 0),
-      headFreightLocal:        round2(headFreightLocal),
-      purchaseCostCny:         round2(purchasePriceCny),
-      purchaseCostLocal:       round2(purchaseCostLocal),
-      returnLossRate,
-      returnLossCny:           round2(returnLossCny),
-      returnLossLocal:         round2(returnLossLocal),
-      exchangeRateCnyToLocal:  cnyToLocal,
-      exchangeRateLocalToCny:  localToCny ?? null,
-      profitLocal:             round2(profitLocal),
-      profitCny:               profitCny != null ? round2(profitCny) : null,
-      profitMarginPct:         marginPct != null ? round2(marginPct) : null,
-    };
-
-    pending.push({
-      id:                 sp.id,
-      estimatedProfit:    round2(profitLocal),
-      estimatedProfitCny: profitCny != null ? round2(profitCny) : null,
-      profitMarginPct:    marginPct != null ? round2(marginPct) : null,
-      profitCalculatedAt: now,
-      profitBreakdown:    breakdown,
-    });
-  }
-
-  // ── 第二步：分块批量写入，防连接池打满 ────────────────────────────
-  let updated = 0;
-  for (let i = 0; i < pending.length; i += WRITE_CHUNK_SIZE) {
-    const chunk = pending.slice(i, i + WRITE_CHUNK_SIZE);
-    try {
-      await prisma.$transaction(
-        chunk.map((u) =>
-          prisma.storeProduct.update({
-            where: { id: u.id },
-            data: {
-              estimatedProfit:    u.estimatedProfit,
-              estimatedProfitCny: u.estimatedProfitCny,
-              profitMarginPct:    u.profitMarginPct,
-              profitCalculatedAt: u.profitCalculatedAt,
-              profitBreakdown:    u.profitBreakdown,
-            },
-          }),
-        ),
-      );
-      updated += chunk.length;
-    } catch (err: any) {
-      console.error(`[ProfitCalc] shopId=${shopId} chunk[${i}~${i + chunk.length - 1}] 写入失败:`, err.message ?? err);
-    }
-    // 块间休眠，保护连接池
-    if (i + WRITE_CHUNK_SIZE < pending.length) await sleep(WRITE_CHUNK_DELAY);
-  }
-
-  return updated;
+  return writePendingProfitUpdates(pending);
 }
 
 /**
@@ -329,4 +385,75 @@ export async function recalcProfitBySkus(skus: string[]): Promise<number> {
     totalUpdated += await recalcProfitForShop(shopId);
   }
   return totalUpdated;
+}
+
+/**
+ * 按 StoreProduct ID 列表重算利润，避免一次改价触发全店重算。
+ */
+export async function recalcProfitForStoreProducts(storeProductIds: number[]): Promise<number> {
+  const uniqueIds = [...new Set(storeProductIds.filter((id) => Number.isInteger(id) && id > 0))];
+  if (uniqueIds.length === 0) return 0;
+
+  const products = await prisma.storeProduct.findMany({
+    where: { id: { in: uniqueIds }, isArchived: false },
+    select: {
+      id: true,
+      shopId: true,
+      salePrice: true,
+      currency: true,
+      commissionRate: true,
+      mappedInventorySku: true,
+      pnk: true,
+      name: true,
+    },
+  });
+
+  if (products.length === 0) return 0;
+
+  const ownSkus = products
+    .map((p) => p.mappedInventorySku)
+    .filter((s): s is string => !!s);
+  const pnks = products.map((p) => p.pnk).filter(Boolean) as string[];
+  const inheritedSkuMap = await buildInheritedSkuMap(products);
+  const inheritedSkus = [...inheritedSkuMap.values()].filter((s) => !ownSkus.includes(s));
+  const allSkus = [...new Set([...ownSkus, ...inheritedSkus])];
+
+  const [skuProducts, pnkProducts] = await Promise.all([
+    allSkus.length > 0
+      ? prisma.product.findMany({
+          where: { sku: { in: allSkus } },
+          select: {
+            sku: true, pnk: true, purchasePrice: true, fbeFee: true,
+            length: true, width: true, height: true, actualWeight: true,
+            category: true, returnLossRate: true,
+          },
+        })
+      : [],
+    pnks.length > 0
+      ? prisma.product.findMany({
+          where: { pnk: { in: pnks } },
+          select: {
+            sku: true, pnk: true, purchasePrice: true, fbeFee: true,
+            length: true, width: true, height: true, actualWeight: true,
+            category: true, returnLossRate: true,
+          },
+        })
+      : [],
+  ]);
+
+  const skuMap = new Map<string, LocalProductRow>();
+  const pnkMap = new Map<string, LocalProductRow>();
+  for (const lp of skuProducts) if (lp.sku) skuMap.set(lp.sku, lp);
+  for (const lp of pnkProducts) if (lp.pnk) pnkMap.set(lp.pnk, lp);
+
+  const rateMap = await loadExchangeRateMap();
+  const pending = computePendingProfitUpdates({
+    products,
+    inheritedSkuMap,
+    skuMap,
+    pnkMap,
+    rateMap,
+  });
+
+  return writePendingProfitUpdates(pending);
 }

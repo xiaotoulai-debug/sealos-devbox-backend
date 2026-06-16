@@ -9,7 +9,7 @@
 import { Router, Request, Response } from 'express';
 import { Prisma } from '@prisma/client';
 import { prisma } from '../lib/prisma';
-import { authenticate, requireSuperAdmin } from '../middleware/auth';
+import { authenticate, requireStrictPermission, requireSuperAdmin } from '../middleware/auth';
 import { getEmagCredentials, resolveRegion, REGION_CURRENCY, REGION_DOMAIN } from '../services/emagClient';
 import { getSalesStatsByShop, getSalesForProduct, logZeroSalesDiagnostic } from '../services/salesStats';
 import { tryAcquireLock, releaseLock } from '../lib/syncStatus';
@@ -72,7 +72,25 @@ import {
   type BuyBoxStatusConfidence,
   type BuyBoxStatusSource,
 } from '../services/emagBuyBox';
-import { buildGrabCartPreview, buildPricePreview, dryRunBuildPriceUpdate } from '../services/emagPrice';
+import { buildGrabCartPreview, buildPricePreview, dryRunBuildPriceUpdate, executeGrabCartPriceChange, executePriceChange } from '../services/emagPrice';
+
+export const STORE_PRODUCT_PRICE_PERMISSIONS = {
+  PRICE_CHANGE: 'ACTION_STORE_PRODUCT_PRICE_CHANGE',
+  GRAB_CART: 'ACTION_STORE_PRODUCT_GRAB_CART',
+  LOG_VIEW: 'ACTION_STORE_PRODUCT_PRICE_LOG_VIEW',
+  STRATEGY_MANAGE: 'ACTION_STORE_PRODUCT_PRICE_STRATEGY_MANAGE',
+} as const;
+
+function normalizeExecuteReason(reason: unknown): { ok: true; value: string } | { ok: false; message: string } {
+  if (typeof reason !== 'string') {
+    return { ok: false, message: '执行原因必填' };
+  }
+  const trimmed = reason.trim();
+  if (trimmed.length < 5 || trimmed.length > 500) {
+    return { ok: false, message: '执行原因必填，长度需在 5-500 字之间' };
+  }
+  return { ok: true, value: trimmed };
+}
 
 const router = Router();
 router.use(authenticate);
@@ -1762,6 +1780,128 @@ router.post('/:id/grab-cart/preview', async (req: Request, res: Response) => {
     });
   }
 });
+
+/**
+ * POST /api/store-products/:id/price/execute
+ * Phase 1-B1 手动改价执行框架：默认 DRY_RUN_ONLY，不发送 product_offer/save，不更新本地价格。
+ */
+router.post(
+  '/:id/price/execute',
+  requireStrictPermission(STORE_PRODUCT_PRICE_PERMISSIONS.PRICE_CHANGE, '无权限执行手动改价'),
+  async (req: Request, res: Response) => {
+    try {
+      const storeProductId = Number(req.params.id);
+      if (!Number.isInteger(storeProductId) || storeProductId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'storeProductId 无效' });
+        return;
+      }
+
+      const shopId = Number(req.body?.shopId);
+      if (!Number.isInteger(shopId) || shopId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+        return;
+      }
+
+      const newSalePriceExVat = Number(req.body?.newSalePriceExVat);
+      if (!Number.isFinite(newSalePriceExVat) || newSalePriceExVat <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'newSalePriceExVat 必须是大于 0 的不含 VAT 价格' });
+        return;
+      }
+
+      const reasonResult = normalizeExecuteReason(req.body?.reason);
+      if (!reasonResult.ok) {
+        res.status(400).json({ code: 400, data: null, message: reasonResult.message });
+        return;
+      }
+
+      const result = await executePriceChange({
+        shopId,
+        storeProductId,
+        newSalePriceExVat,
+        reason: reasonResult.value,
+        operatorUserId: req.user?.userId ?? null,
+      });
+
+      const httpStatus = result.status === 'BLOCKED' ? 409 : 200;
+      res.status(httpStatus).json({
+        code: httpStatus,
+        data: result,
+        message: result.noEmagWriteExecuted
+          ? `${result.message}；no eMAG write executed，未真实改价`
+          : result.message,
+      });
+    } catch (err: any) {
+      console.error('[POST /api/store-products/:id/price/execute]', err?.message ?? err);
+      const status = err?.code === 'EMAG_PROXY_REQUIRED' ? 503 : 500;
+      res.status(status).json({
+        code: status,
+        data: null,
+        message: err?.message ?? 'price execute 执行失败',
+      });
+    }
+  },
+);
+
+/**
+ * POST /api/store-products/:id/grab-cart/execute
+ * Phase 1-B1 手动抢购物车执行框架：默认 DRY_RUN_ONLY / SKIPPED，不发送 product_offer/save。
+ */
+router.post(
+  '/:id/grab-cart/execute',
+  requireStrictPermission(STORE_PRODUCT_PRICE_PERMISSIONS.GRAB_CART, '无权限执行手动抢购物车'),
+  async (req: Request, res: Response) => {
+    try {
+      const storeProductId = Number(req.params.id);
+      if (!Number.isInteger(storeProductId) || storeProductId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'storeProductId 无效' });
+        return;
+      }
+
+      const shopId = Number(req.body?.shopId);
+      if (!Number.isInteger(shopId) || shopId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+        return;
+      }
+
+      const confirmedPriceExVat = Number(req.body?.confirmedPriceExVat);
+      if (!Number.isFinite(confirmedPriceExVat) || confirmedPriceExVat <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'confirmedPriceExVat 必须是大于 0 的不含 VAT 价格' });
+        return;
+      }
+
+      const reasonResult = normalizeExecuteReason(req.body?.reason);
+      if (!reasonResult.ok) {
+        res.status(400).json({ code: 400, data: null, message: reasonResult.message });
+        return;
+      }
+
+      const result = await executeGrabCartPriceChange({
+        shopId,
+        storeProductId,
+        confirmedPriceExVat,
+        reason: reasonResult.value,
+        operatorUserId: req.user?.userId ?? null,
+      });
+
+      const httpStatus = result.status === 'BLOCKED' ? 409 : 200;
+      res.status(httpStatus).json({
+        code: httpStatus,
+        data: result,
+        message: result.noEmagWriteExecuted
+          ? `${result.message}；no eMAG write executed，未真实改价`
+          : result.message,
+      });
+    } catch (err: any) {
+      console.error('[POST /api/store-products/:id/grab-cart/execute]', err?.message ?? err);
+      const status = err?.code === 'EMAG_PROXY_REQUIRED' ? 503 : 500;
+      res.status(status).json({
+        code: status,
+        data: null,
+        message: err?.message ?? 'grab-cart execute 执行失败',
+      });
+    }
+  },
+);
 
 /**
  * POST /api/store-products/:id/price/dry-run

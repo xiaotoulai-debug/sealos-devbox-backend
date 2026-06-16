@@ -74,6 +74,7 @@ backend/
 │   │   │                      #   POST /api/store-products/sync     — 手动全量同步
 │   │   │                      #   POST /api/store-products/map      — 绑定库存 SKU（★ SKU 字符串优先匹配，inventorySkuId 兜底；pnk+shopId 或 storeProductId 定位平台产品）
 │   │   │                      #   POST /api/store-products/:id/price/preview / grab-cart/preview — Phase 1-A 只读价格预览
+│   │   │                      #   POST /api/store-products/:id/price/execute / grab-cart/execute — Phase 1-B1 执行框架（默认 DRY_RUN_ONLY）
 │   │   ├── dashboard.ts       # 业绩看板（stats、shops 下拉）
 │   │   ├── analytics.ts       # 运营分析接口（订单日报）
 │   │   ├── translate.ts       # 翻译代理（MyMemory API 转发，ro→zh 等）
@@ -87,7 +88,8 @@ backend/
 │   │   ├── emagClient.ts      # eMAG API 客户端（Adapter）：BaseURL/货币/域名按 region 查表
 │   │   │                      # ★ 正向代理：所有 HTTPS 请求经 EMAG_PROXY_URL 代理转发（固定 IP 白名单）
 │   │   ├── emagProduct.ts     # product_offer/read、product/read、documentation/find_by_eans
-│   │   ├── emagPrice.ts       # eMAG 改价 dry-run / Phase 1-A 价格 preview（只读 product_offer/read）
+│   │   ├── emagPrice.ts       # eMAG 改价 dry-run / preview / Phase 1-B1 execute 框架（默认禁止真实写请求）
+│   │   ├── priceAdjustmentLogs.ts # 调价日志写入、脱敏与状态流转
 │   │   ├── priceProtection.ts # 最低保护价、成本完整度、默认价格策略
 │   │   ├── priceErrors.ts     # 价格模块统一错误码与文案
 │   │   ├── emagProductNormalizer.ts  # 唯一 Normalizer：解析、图片提纯、输出统一结构
@@ -516,6 +518,41 @@ Phase 1-A 只提供后端基础能力和 preview，不开放真实 execute，不
 - Phase 1-A 未新增 `price/execute` 或 `grab-cart/execute` 路由。
 - preview 不写数据库、不更新 `store_products.sale_price`、不发送 `product_offer/save`。
 - eMAG 读取继续使用 `readProductOffers(..., { requireProxy: true })`；代理不可用时禁止直连。
+
+### 4.5.2.4 eMAG 价格执行框架（Phase 1-B1，2026-06-16）
+
+Phase 1-B1 新增 execute 代码框架，但默认禁止真实改价。
+
+**安全开关：**
+
+- `services/emagPrice.ts` 内私有常量 `ALLOW_EMAG_PRICE_WRITE = false`。
+- 不暴露给前端，不允许 body/query 打开。
+- `updateProductOfferPrice()` 在开关关闭时于 `getEmagCredentials / emagApiCall` 之前直接返回 `DRY_RUN_ONLY`。
+- 本阶段任何 execute 调用都不会发送 `product_offer/save`。
+
+**新增服务：**
+
+- `services/priceAdjustmentLogs.ts`：`createPriceAdjustmentLog()`、`markPriceAdjustmentSuccess/Failed/PendingVerify/Skipped()`；payload 只保存 `id/sale_price/vat_id`，response 脱敏并截断到 20KB。
+- `services/emagPrice.ts`：新增 `updateProductOfferPrice()`、`executePriceChange()`、`executeGrabCartPriceChange()`；execute 会重新 preview、校验保护价、构造最小 payload、写日志，并在 DRY_RUN_ONLY 时标记 `SKIPPED`。
+- `services/profitCalculator.ts`：新增 `recalcProfitForStoreProducts(storeProductIds)`，避免一次改价触发全店重算。
+
+**API：**
+
+- `POST /api/store-products/:id/price/execute`：手动改价执行框架，需 `ACTION_STORE_PRODUCT_PRICE_CHANGE` 权限；默认返回 `DRY_RUN_ONLY/SKIPPED`，message 明确 `no eMAG write executed`。
+- `POST /api/store-products/:id/grab-cart/execute`：手动抢购物车执行框架，需 `ACTION_STORE_PRODUCT_GRAB_CART` 权限；若 preview 后 `ALREADY_WON` 则安全跳过；默认不发送写请求。
+
+**权限码（init-permissions.ts）：**
+
+- `ACTION_STORE_PRODUCT_PRICE_CHANGE`
+- `ACTION_STORE_PRODUCT_GRAB_CART`
+- `ACTION_STORE_PRODUCT_PRICE_LOG_VIEW`
+- `ACTION_STORE_PRODUCT_PRICE_STRATEGY_MANAGE`
+
+**安全边界：**
+
+- Phase 1-B1 默认不更新 `store_products.sale_price`。
+- 初始日志 create 失败会阻断 execute。
+- 真实 SKU 测试必须等待老板下一轮明确授权后再开启写开关。
 
 **运营动作建议 operationAdvice（实时 DTO，不落库）**：`GET /api/store-products` 每行返回双命名 `operationAdvice/operation_advice`，用于回答“运营接下来做什么”，与 `purchaseSuggestion` 的供应链采购动作分离。规则引擎实时使用四类主分类与风险标签含义：主推款优先保供、补货和广告；成长款观察趋势并适度加广告；常规款正常维护；清理款降价、清仓或停止采购。动作集合：`REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/RAISE_PRICE/LOWER_PRICE/JOIN_CAMPAIGN/ADVERTISE/CLEARANCE/PAUSE_PURCHASE/WAIT_FOR_ARRIVAL/OBSERVE`；优先级：`P0/P1/P2/P3`。断货补货规则优先于普通调价、广告、活动和观察兜底：`stock=0 && replenishReferenceDailySales>0 && coverageStock<=0` 返回立即/紧急补货，`coverageStock<targetStock` 返回仍需补货，`coverageStock>=targetStock` 返回等待到货。其他规则按顺序短路：负毛利动销异常、清仓处理、暂停采购、等待到货、建议涨价、建议降价、加广告、参加活动、观察即可。阈值集中配置为 `lowProfitMarginPct=15`、`goodProfitMarginPct=25`、`lowStockDays=30`、`warningStockDays=60`、`overstockDays=120`、`clearanceStockThreshold=10`；`profitMarginPct` 单位是百分数（`15` 表示 15%）。因当前缺少竞品价格、价格历史、广告 ROI、曝光点击转化数据，涨价/降价/广告/活动文案必须表达为“可考虑/测试”，不能作为强结论。
 
