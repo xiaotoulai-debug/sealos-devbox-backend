@@ -19,7 +19,12 @@ import {
   markPriceAdjustmentSkipped,
   markPriceAdjustmentSuccess,
   mergeSaveAndReadBackEmagResponse,
+  type PriceAdjustmentMode,
 } from './priceAdjustmentLogs';
+import {
+  canExecuteEmagPriceWrite,
+  type EmagPriceWriteGuardReasonCode,
+} from './emagPriceWriteGuard';
 import { recalcProfitForStoreProducts } from './profitCalculator';
 import {
   calculateCostStatus,
@@ -183,16 +188,13 @@ const FORBIDDEN_PRICE_PAYLOAD_FIELDS = new Set([
   'documentation',
 ]);
 
-/** Phase 1-B1 默认关闭真实 eMAG 写请求；后续真实测试需老板单独授权后再开启。 */
-const ALLOW_EMAG_PRICE_WRITE = false;
-
 const READBACK_MAX_ATTEMPTS = 3;
 const READBACK_RETRY_INTERVAL_MS = 5000;
 const READBACK_PRICE_TOLERANCE = 0.005;
 
 const ALLOWED_PRICE_PAYLOAD_KEYS = new Set(['id', 'sale_price', 'vat_id']);
 
-const DRY_RUN_ONLY_MESSAGE = '当前处于 Phase 1-B1 安全模式，未发送 eMAG 写请求，未真实改价';
+const DRY_RUN_ONLY_MESSAGE = '当前处于安全模式，未发送 eMAG 写请求，未真实改价';
 
 const GRAB_CART_PRICE_TOLERANCE = 0.005;
 
@@ -227,6 +229,7 @@ export type PriceExecuteResult = {
   readBackStatus?: ReadBackStatus | null;
   readBackPrice?: number | null;
   readBackWarning?: string | null;
+  writeGuardReasonCode?: EmagPriceWriteGuardReasonCode | null;
   noEmagWriteExecuted: boolean;
 };
 
@@ -563,12 +566,14 @@ export async function performPriceReadBackWithRetry(params: {
 export async function updateProductOfferPrice(params: {
   shopId: number;
   storeProductId: number;
+  mode: PriceAdjustmentMode;
   payload: PriceUpdatePayloadItem[];
 }): Promise<{
   ok: boolean;
   status: PriceWriteStatus;
   rawResponse?: unknown;
   errorMessage?: string;
+  writeGuardReasonCode?: EmagPriceWriteGuardReasonCode;
 }> {
   const validation = validatePriceUpdatePayload(params.payload);
   if (!validation.ok) {
@@ -579,11 +584,17 @@ export async function updateProductOfferPrice(params: {
     };
   }
 
-  if (!ALLOW_EMAG_PRICE_WRITE) {
+  const writeGuard = canExecuteEmagPriceWrite({
+    shopId: params.shopId,
+    storeProductId: params.storeProductId,
+    mode: params.mode,
+  });
+  if (!writeGuard.allowed) {
     return {
       ok: false,
       status: 'DRY_RUN_ONLY',
-      errorMessage: DRY_RUN_ONLY_MESSAGE,
+      errorMessage: `${DRY_RUN_ONLY_MESSAGE}（${writeGuard.message}）`,
+      writeGuardReasonCode: writeGuard.reasonCode,
     };
   }
 
@@ -760,6 +771,7 @@ export async function executePriceChange(params: {
     const writeResult = await updateProductOfferPrice({
       shopId: params.shopId,
       storeProductId: params.storeProductId,
+      mode: 'MANUAL_PRICE_CHANGE',
       payload,
     });
 
@@ -780,6 +792,7 @@ export async function executePriceChange(params: {
         payloadPreview: payload,
         profitRecalculated: false,
         profitRecalcWarning: null,
+        writeGuardReasonCode: writeResult.writeGuardReasonCode ?? 'DISABLED',
         noEmagWriteExecuted: true,
       };
     }
@@ -1070,6 +1083,7 @@ export async function executeGrabCartPriceChange(params: {
     const writeResult = await updateProductOfferPrice({
       shopId: params.shopId,
       storeProductId: params.storeProductId,
+      mode: 'GRAB_CART_MANUAL',
       payload,
     });
 
@@ -1090,6 +1104,7 @@ export async function executeGrabCartPriceChange(params: {
         payloadPreview: payload,
         profitRecalculated: false,
         profitRecalcWarning: null,
+        writeGuardReasonCode: writeResult.writeGuardReasonCode ?? 'DISABLED',
         noEmagWriteExecuted: true,
       };
     }
@@ -1152,8 +1167,21 @@ export async function executeGrabCartPriceChange(params: {
       }),
     ]);
 
+    const readBack = await performPriceReadBackWithRetry({
+      shopId: params.shopId,
+      emagOfferId: payload[0]?.id ?? context.fresh.emagOfferId,
+      pnk: context.storeProduct.pnk ?? null,
+      sku: (await prisma.storeProduct.findUnique({
+        where: { id: params.storeProductId },
+        select: { sku: true },
+      }))?.sku ?? null,
+      targetPrice: confirmedPrice,
+    });
+
+    const emagResponseForLog = mergeSaveAndReadBackEmagResponse(writeResult.rawResponse, readBack);
+
     await markPriceAdjustmentSuccess(logId, {
-      emagResponse: writeResult.rawResponse,
+      emagResponse: emagResponseForLog,
       estimatedProfitAfter: preview.estimatedProfitAfter,
       profitMarginPctAfter: preview.profitMarginPctAfter,
     });
@@ -1169,10 +1197,14 @@ export async function executeGrabCartPriceChange(params: {
       console.error('[executeGrabCartPriceChange] profit recalc failed:', profitRecalcWarning);
     }
 
+    const successMessage = readBack.readBackStatus === 'CONFIRMED'
+      ? 'grab-cart execute success'
+      : `grab-cart execute success; ${readBack.readBackWarning ?? 'readBack 未确认'}`;
+
     return {
       status: 'SUCCESS',
       code: 'OK',
-      message: 'grab-cart execute success',
+      message: successMessage,
       storeProductId: params.storeProductId,
       shopId: params.shopId,
       logId,
@@ -1182,6 +1214,9 @@ export async function executeGrabCartPriceChange(params: {
       payloadPreview: payload,
       profitRecalculated,
       profitRecalcWarning,
+      readBackStatus: readBack.readBackStatus,
+      readBackPrice: readBack.readBackPrice,
+      readBackWarning: readBack.readBackWarning,
       noEmagWriteExecuted: false,
     };
   } catch (err: any) {

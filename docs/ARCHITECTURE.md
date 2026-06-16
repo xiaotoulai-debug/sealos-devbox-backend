@@ -88,7 +88,8 @@ backend/
 │   │   ├── emagClient.ts      # eMAG API 客户端（Adapter）：BaseURL/货币/域名按 region 查表
 │   │   │                      # ★ 正向代理：所有 HTTPS 请求经 EMAG_PROXY_URL 代理转发（固定 IP 白名单）
 │   │   ├── emagProduct.ts     # product_offer/read、product/read、documentation/find_by_eans
-│   │   ├── emagPrice.ts       # eMAG 改价 dry-run / preview / Phase 1-B1 execute 框架（默认禁止真实写请求）
+│   │   ├── emagPrice.ts       # eMAG 改价 dry-run / preview / execute 框架（env 安全闸门 + readBack）
+│   │   ├── emagPriceWriteGuard.ts # eMAG 真实写价 env 闸门与白名单（fail-closed，只读 process.env）
 │   │   ├── priceAdjustmentLogs.ts # 调价日志写入、脱敏与状态流转
 │   │   ├── priceProtection.ts # 最低保护价、成本完整度、默认价格策略
 │   │   ├── priceErrors.ts     # 价格模块统一错误码与文案
@@ -519,16 +520,21 @@ Phase 1-A 只提供后端基础能力和 preview，不开放真实 execute，不
 - preview 不写数据库、不更新 `store_products.sale_price`、不发送 `product_offer/save`。
 - eMAG 读取继续使用 `readProductOffers(..., { requireProxy: true })`；代理不可用时禁止直连。
 
-### 4.5.2.4 eMAG 价格执行框架（Phase 1-B1，2026-06-16）
+### 4.5.2.4 eMAG 价格执行框架（Phase 1-B1，2026-06-16；Phase B-7 安全闸门升级）
 
-Phase 1-B1 新增 execute 代码框架，但默认禁止真实改价。
+Phase 1-B1 新增 execute 代码框架；Phase B-7 将源码硬编码开关升级为 **环境变量 + 三层白名单**，默认仍禁止真实改价。
 
-**安全开关：**
+**安全开关（Phase B-7）：**
 
-- `services/emagPrice.ts` 内私有常量 `ALLOW_EMAG_PRICE_WRITE = false`。
-- 不暴露给前端，不允许 body/query 打开。
-- `updateProductOfferPrice()` 在开关关闭时于 `getEmagCredentials / emagApiCall` 之前直接返回 `DRY_RUN_ONLY`。
-- 本阶段任何 execute 调用都不会发送 `product_offer/save`。
+- 统一闸门：`services/emagPriceWriteGuard.ts` → `canExecuteEmagPriceWrite({ shopId, storeProductId, mode })`。
+- 环境变量（**默认 fail-closed，缺失/空值/拼写错误均禁止写价**）：
+  - `EMAG_PRICE_WRITE_ENABLED` — 必须为 `true` 才允许真实写价（默认 false）。
+  - `EMAG_PRICE_WRITE_ALLOWED_SHOP_IDS` — 逗号分隔 shopId 白名单。
+  - `EMAG_PRICE_WRITE_ALLOWED_STORE_PRODUCT_IDS` — 逗号分隔 storeProductId 白名单。
+  - `EMAG_PRICE_WRITE_ALLOWED_MODES` — 逗号分隔模式白名单，如 `GRAB_CART_MANUAL,MANUAL_PRICE_CHANGE`。
+- **仅当** `ENABLED=true` 且 shopId / storeProductId / mode **三者均命中白名单**时，`updateProductOfferPrice()` 才会调用 `product_offer/save`。
+- 不暴露给前端，**不允许** body/query/header 打开；闸门只读 `process.env`。
+- 开关关闭时于 `getEmagCredentials / emagApiCall` 之前直接返回 `DRY_RUN_ONLY`；execute 响应含 `writeGuardReasonCode`（`DISABLED` / `SHOP_NOT_ALLOWED` / `STORE_PRODUCT_NOT_ALLOWED` / `MODE_NOT_ALLOWED`），不泄露完整白名单配置。
 
 **新增服务：**
 
@@ -580,7 +586,32 @@ Phase 1-B2.1 在 `executePriceChange` 真实 save 成功后增加 readBack 对�
 
 **readBack 查询优先级：** `emagOfferId/id` → `pnk/part_number_key` → `sku/part_number`；**禁止单独用 EAN**（可能命中其他 offer）。
 
-**范围：** 本轮仅接入 `executePriceChange`；`executeGrabCartPriceChange` readBack 留后续阶段。
+**范围：** Phase B-7 已将同一套 readBack 接入 `executeGrabCartPriceChange` 真实 SUCCESS 路径；`SKIPPED` / `DRY_RUN_ONLY` 不触发 readBack。
+
+### 4.5.2.9 eMAG 真实写价安全闸门（Phase B-7，2026-06-16）
+
+Phase B-7 补齐 B-6c 评审阻塞项：env 开关 + 白名单 + grab-cart readBack。
+
+**闸门 reasonCode：**
+
+| reasonCode | 含义 |
+|------------|------|
+| DISABLED | `EMAG_PRICE_WRITE_ENABLED` 不为 true |
+| SHOP_NOT_ALLOWED | shopId 未命中白名单或白名单为空 |
+| STORE_PRODUCT_NOT_ALLOWED | storeProductId 未命中白名单或白名单为空 |
+| MODE_NOT_ALLOWED | mode 未命中白名单或白名单为空 |
+| ALLOWED | 已通过闸门（仍会走 preview / 保护价 / 权限校验） |
+
+**灰度示例（仅文档，生产需老板授权后配置）：**
+
+```text
+EMAG_PRICE_WRITE_ENABLED=true
+EMAG_PRICE_WRITE_ALLOWED_SHOP_IDS=9
+EMAG_PRICE_WRITE_ALLOWED_STORE_PRODUCT_IDS=15636
+EMAG_PRICE_WRITE_ALLOWED_MODES=GRAB_CART_MANUAL
+```
+
+**安全边界：** 未配置或未全开时，任何 execute 均 `SKIPPED` / `DRY_RUN_ONLY`，不发送 `product_offer/save`，不触发 readBack。
 
 ### 4.5.2.6 抢购物车 cartPriceTaxMode（Phase B-1，2026-06-16）
 
