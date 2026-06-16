@@ -17,10 +17,10 @@ export interface EmagProductOffer {
   brand?: string;
   category_id: number;               // eMAG 类目 ID
   description?: string;              // HTML 描述
-  sale_price: number;                // 含税销售价
+  sale_price: number;                // 不含 VAT 销售价
   recommended_price?: number;
-  min_sale_price?: number;
-  max_sale_price?: number;
+  min_sale_price?: number;           // 不含 VAT 最低保护价
+  max_sale_price?: number;           // 不含 VAT 最高价
   currency_type?: string;            // RON / EUR(BG) / HUF
   vat_id?: number;                   // 税率 ID (19% → vat_id=1 for RO)
   status?: number;                   // 1=Active
@@ -144,7 +144,7 @@ export async function saveFullProductOffer(
 export async function readProductOffers(
   creds: EmagCredentials,
   filters: Record<string, any> = {},
-  options: { timeout?: number } = {},
+  options: { timeout?: number; requireProxy?: boolean } = {},
 ): Promise<EmagApiResponse> {
   return emagApiCall(creds, 'product_offer', 'read', filters, options);
 }

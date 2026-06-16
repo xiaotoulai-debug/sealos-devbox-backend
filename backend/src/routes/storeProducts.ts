@@ -72,6 +72,7 @@ import {
   type BuyBoxStatusConfidence,
   type BuyBoxStatusSource,
 } from '../services/emagBuyBox';
+import { dryRunBuildPriceUpdate } from '../services/emagPrice';
 
 const router = Router();
 router.use(authenticate);
@@ -1691,6 +1692,47 @@ router.post('/recalc-profit', async (req: Request, res: Response) => {
   } catch (err: any) {
     console.error('[POST /api/store-products/recalc-profit]', err);
     res.status(500).json({ code: 500, data: null, message: err?.message ?? '利润重算失败' });
+  }
+});
+
+/**
+ * POST /api/store-products/:id/price/dry-run
+ * Phase 0 价格验证：只构造 product_offer/save 最小改价 payload，不发送 eMAG 写请求、不更新数据库。
+ */
+router.post('/:id/price/dry-run', async (req: Request, res: Response) => {
+  try {
+    const storeProductId = Number(req.params.id);
+    if (!Number.isInteger(storeProductId) || storeProductId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: 'storeProductId 无效' });
+      return;
+    }
+
+    const shopId = Number(req.body?.shopId);
+    if (!Number.isInteger(shopId) || shopId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+      return;
+    }
+
+    const newSalePriceExVat = Number(req.body?.newSalePriceExVat);
+    if (!Number.isFinite(newSalePriceExVat) || newSalePriceExVat <= 0) {
+      res.status(400).json({ code: 400, data: null, message: 'newSalePriceExVat 必须是大于 0 的不含 VAT 价格' });
+      return;
+    }
+
+    const result = await dryRunBuildPriceUpdate({ shopId, storeProductId, newSalePriceExVat });
+    res.json({
+      code: 200,
+      data: result,
+      message: 'dry-run payload generated, no eMAG write executed',
+    });
+  } catch (err: any) {
+    console.error('[POST /api/store-products/:id/price/dry-run]', err?.message ?? err);
+    const status = err?.code === 'EMAG_PROXY_REQUIRED' ? 503 : 500;
+    res.status(status).json({
+      code: status,
+      data: null,
+      message: err?.message ?? 'dry-run payload 生成失败',
+    });
   }
 });
 

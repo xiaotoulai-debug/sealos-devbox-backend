@@ -326,7 +326,7 @@ export async function emagApiCall<T = any>(
   resource: string,
   action: string,
   data: any = {},
-  options: { timeout?: number } = {},
+  options: { timeout?: number; requireProxy?: boolean } = {},
 ): Promise<EmagApiResponse<T>> {
   const throttle = isOrderRoute(resource) ? orderThrottle : generalThrottle;
   await throttle.acquire();
@@ -341,6 +341,11 @@ export async function emagApiCall<T = any>(
 
   const doRequest = async (): Promise<{ data: any; headers: Record<string, any>; status: number }> => {
     const proxyAgent = getEmagProxyAgent();
+    if (options.requireProxy && !proxyAgent) {
+      const err = new Error('EMAG_PROXY_REQUIRED: eMAG 改价类请求要求代理可用，当前代理不可用，已阻断直连') as Error & { code?: string };
+      err.code = 'EMAG_PROXY_REQUIRED';
+      throw err;
+    }
 
     const resp = await axios.post(url, { data }, {
       headers: { 'Authorization': `Basic ${basicAuth}`, 'Content-Type': 'application/json' },
