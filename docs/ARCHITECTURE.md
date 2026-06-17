@@ -613,6 +613,42 @@ EMAG_PRICE_WRITE_ALLOWED_MODES=GRAB_CART_MANUAL
 
 **安全边界：** 未配置或未全开时，任何 execute 均 `SKIPPED` / `DRY_RUN_ONLY`，不发送 `product_offer/save`，不触发 readBack。
 
+### 4.5.2.10 批量抢车后端 MVP（Phase B-13a，2026-06-17）
+
+Phase B-13a 从单 SKU 灰度切换为**批次运营后端 MVP**：不新增 batch 数据表，批次结果通过 API response 返回；单条仍写 `StoreProductPriceAdjustmentLog`。
+
+**新服务（`services/grabCartBatch.ts`）：**
+
+- `listGrabCartCandidates({ shopId, page, pageSize })`：DB 预筛（RESELL、stock>0、commission/fbeFee 齐全、未赢 BuyBox）→ 最多 preview **100** 条 → 过滤 `canGrab=true` / `costStatus=COMPLETE` / margin≥店铺 targetMinMarginPct → 分页返回。
+- `batchExecuteGrabCart({ shopId, reason, items, operatorUserId })`：生成 `batchId`（UUID），**串行**调用现有 `executeGrabCartPriceChange`；reason 前缀 `[batch:{batchId}]` 写入单条日志；items **1–5**，禁止重复 storeProductId。
+- readBack `UNCONFIRMED` 计为 `pendingConfirm`，**不自动重复 execute**。
+
+**新 API（`routes/storeProducts.ts`，注册在 `/:id/...` 之前）：**
+
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| GET | `/api/store-products/grab-cart/candidates?shopId=&page=&pageSize=` | `ACTION_STORE_PRODUCT_GRAB_CART` | 候选池，只读 preview |
+| POST | `/api/store-products/grab-cart/batch-execute` | 同上 | 批量 execute，仍受 env 闸门 |
+
+**batch-execute 请求体：**
+
+```json
+{
+  "shopId": 9,
+  "reason": "10-500 字",
+  "items": [{ "storeProductId": 15687, "confirmedPriceExVat": 29.57 }]
+}
+```
+
+**响应摘要字段：** `batchId`, `total`, `success`, `failed`, `skipped`, `blocked`, `pendingConfirm`, `items[]`（含单条 logId / readBackStatus）。
+
+**安全边界：**
+
+- env 未开启时 batch 内每条 `SKIPPED` / `DRY_RUN_ONLY`，互不影响。
+- 单 SKU 不在白名单时仅该条 blocked/skipped，不阻断同批其他 SKU（由 `canExecuteEmagPriceWrite` per-item 决定）。
+- 禁止并发 `product_offer/save`（串行 for-loop + 现有 shop/storeProduct 锁）。
+- 本轮未新增 `PriceAdjustmentBatch` 表；B-13b 可补持久化批次日志。
+
 ### 4.5.2.6 抢购物车 cartPriceTaxMode（Phase B-1，2026-06-16）
 
 Phase B-1 为 `StorePriceStrategyConfig` 新增店铺级购物车参考价 VAT 口径配置，驱动 `grab-cart/preview` 的 `resolveCartPriceExVat()`，不再依赖 eMAG offer 返回字段猜测。

@@ -74,6 +74,13 @@ import {
 } from '../services/emagBuyBox';
 import { syncStoreProductCommissionRate } from '../services/emagCommission';
 import { buildGrabCartPreview, buildPricePreview, dryRunBuildPriceUpdate, executeGrabCartPriceChange, executePriceChange } from '../services/emagPrice';
+import {
+  batchExecuteGrabCart,
+  GRAB_CART_CANDIDATES_MAX_PAGE_SIZE,
+  listGrabCartCandidates,
+  normalizeGrabCartBatchReason,
+  validateGrabCartBatchItems,
+} from '../services/grabCartBatch';
 
 export const STORE_PRODUCT_PRICE_PERMISSIONS = {
   PRICE_CHANGE: 'ACTION_STORE_PRODUCT_PRICE_CHANGE',
@@ -1791,6 +1798,109 @@ router.post('/:id/commission/sync', async (req: Request, res: Response) => {
     });
   }
 });
+
+/**
+ * GET /api/store-products/grab-cart/candidates
+ * Phase B-13a 抢车候选池：DB 预筛 + 逐条 preview，只读 product_offer/read。
+ */
+router.get(
+  '/grab-cart/candidates',
+  requireStrictPermission(STORE_PRODUCT_PRICE_PERMISSIONS.GRAB_CART, '无权限查看抢车候选池'),
+  async (req: Request, res: Response) => {
+    try {
+      const shopId = Number(req.query.shopId);
+      if (!Number.isInteger(shopId) || shopId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+        return;
+      }
+
+      const page = req.query.page != null ? Number(req.query.page) : 1;
+      const pageSize = req.query.pageSize != null ? Number(req.query.pageSize) : 50;
+      if (!Number.isInteger(page) || page <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'page 无效' });
+        return;
+      }
+      if (!Number.isInteger(pageSize) || pageSize <= 0 || pageSize > GRAB_CART_CANDIDATES_MAX_PAGE_SIZE) {
+        res.status(400).json({
+          code: 400,
+          data: null,
+          message: `pageSize 无效，最大 ${GRAB_CART_CANDIDATES_MAX_PAGE_SIZE}`,
+        });
+        return;
+      }
+
+      const result = await listGrabCartCandidates({ shopId, page, pageSize });
+      res.json({ code: 200, data: result, message: 'grab-cart candidates generated, no eMAG write executed' });
+    } catch (err: any) {
+      console.error('[GET /api/store-products/grab-cart/candidates]', err?.message ?? err);
+      const status = err?.code === 'EMAG_PROXY_REQUIRED' ? 503 : 500;
+      res.status(status).json({
+        code: status,
+        data: null,
+        message: err?.message ?? 'grab-cart candidates 生成失败',
+      });
+    }
+  },
+);
+
+/**
+ * POST /api/store-products/grab-cart/batch-execute
+ * Phase B-13a 批量抢车：串行逐条 executeGrabCartPriceChange，仍受 env 写价闸门控制。
+ */
+router.post(
+  '/grab-cart/batch-execute',
+  requireStrictPermission(STORE_PRODUCT_PRICE_PERMISSIONS.GRAB_CART, '无权限执行批量抢购物车'),
+  async (req: Request, res: Response) => {
+    try {
+      const shopId = Number(req.body?.shopId);
+      if (!Number.isInteger(shopId) || shopId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+        return;
+      }
+
+      const reasonResult = normalizeGrabCartBatchReason(req.body?.reason);
+      if (!reasonResult.ok) {
+        res.status(400).json({ code: 400, data: null, message: reasonResult.message });
+        return;
+      }
+
+      const items = Array.isArray(req.body?.items) ? req.body.items : [];
+      const itemsValidation = validateGrabCartBatchItems(items);
+      if (!itemsValidation.ok) {
+        res.status(400).json({ code: 400, data: null, message: itemsValidation.message });
+        return;
+      }
+
+      const normalizedItems = items.map((item: { storeProductId: number; confirmedPriceExVat: number }) => ({
+        storeProductId: Number(item.storeProductId),
+        confirmedPriceExVat: Number(item.confirmedPriceExVat),
+      }));
+
+      const result = await batchExecuteGrabCart({
+        shopId,
+        reason: reasonResult.value,
+        items: normalizedItems,
+        operatorUserId: req.user?.userId ?? null,
+      });
+
+      res.json({
+        code: 200,
+        data: result,
+        message: result.items.every((row) => row.noEmagWriteExecuted)
+          ? 'batch execute completed in safe mode; no eMAG write executed'
+          : 'batch execute completed',
+      });
+    } catch (err: any) {
+      console.error('[POST /api/store-products/grab-cart/batch-execute]', err?.message ?? err);
+      const status = err?.code === 'EMAG_PROXY_REQUIRED' ? 503 : 500;
+      res.status(status).json({
+        code: status,
+        data: null,
+        message: err?.message ?? 'grab-cart batch execute 失败',
+      });
+    }
+  },
+);
 
 /**
  * POST /api/store-products/:id/grab-cart/preview
