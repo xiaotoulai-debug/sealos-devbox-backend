@@ -620,7 +620,7 @@ Phase B-13a 从单 SKU 灰度切换为**批次运营后端 MVP**：不新增 bat
 **新服务（`services/grabCartBatch.ts`）：**
 
 - `listGrabCartCandidates({ shopId, page, pageSize })`：DB 预筛（RESELL、stock>0、commission/fbeFee 齐全、未赢 BuyBox）→ 最多 preview **100** 条 → 过滤 `canGrab=true` / `costStatus=COMPLETE` / margin≥店铺 targetMinMarginPct → 分页返回。
-- `buildGrabCartReadiness({ shopId })`（Phase B-13b）：只读输出候选准备漏斗，统计 RESELL、库存、Product 映射、FBE、物流尺寸、佣金、`cartPriceTaxMode`、preview OK 和最终候选数量，并返回 blockers / nextActions / 自动接入判断。
+- `buildGrabCartReadiness({ shopId, includePreview })`（Phase B-13b/B-13c）：默认 **DB-only** 输出候选准备漏斗，统计 RESELL、库存、Product 映射、采购成本、FBE、物流尺寸、佣金、`cartPriceTaxMode` 和 DB 侧候选准备数；仅 `includePreview=true` 时才逐条调用现有 preview / 候选池逻辑做实时 eMAG read 检查。
 - `batchExecuteGrabCart({ shopId, reason, items, operatorUserId })`：生成 `batchId`（UUID），**串行**调用现有 `executeGrabCartPriceChange`；reason 前缀 `[batch:{batchId}]` 写入单条日志；items **1–5**，禁止重复 storeProductId。
 - readBack `UNCONFIRMED` 计为 `pendingConfirm`，**不自动重复 execute**。
 
@@ -628,7 +628,7 @@ Phase B-13a 从单 SKU 灰度切换为**批次运营后端 MVP**：不新增 bat
 
 | 方法 | 路径 | 权限 | 说明 |
 |------|------|------|------|
-| GET | `/api/store-products/grab-cart/readiness?shopId=` | `ACTION_STORE_PRODUCT_GRAB_CART` | 候选准备漏斗，只读诊断为什么没有候选 |
+| GET | `/api/store-products/grab-cart/readiness?shopId=&includePreview=` | `ACTION_STORE_PRODUCT_GRAB_CART` | 候选准备漏斗，默认 DB-only；`includePreview=true` 时做实时 preview 诊断 |
 | GET | `/api/store-products/grab-cart/candidates?shopId=&page=&pageSize=` | `ACTION_STORE_PRODUCT_GRAB_CART` | 候选池，只读 preview |
 | POST | `/api/store-products/grab-cart/batch-execute` | 同上 | 批量 execute，仍受 env 闸门 |
 
@@ -647,7 +647,9 @@ Phase B-13a 从单 SKU 灰度切换为**批次运营后端 MVP**：不新增 bat
 **readiness 响应摘要字段（Phase B-13b）：**
 
 - `summary`：`totalStoreProducts/resellCount/resellWithStockCount/hasOfferPnkSkuCount/notWonCount/mappedProductCount/fbeFeeReadyCount/logisticsReadyCount/commissionReadyCount/cartPriceTaxModeReady/previewOkCount/candidateCount`。
-- `blockers`：`NOT_RESELL/NO_STOCK/ALREADY_WON/MISSING_PRODUCT_MAPPING/MISSING_FBE_FEE/MISSING_LOGISTICS/MISSING_COMMISSION/CART_PRICE_TAX_MODE_UNKNOWN/OFFER_NOT_SELLABLE/BELOW_FINAL_MIN_PRICE/OTHER`。
+- `displaySummary`：`resellCount/inStockResellCount/dataReadyCount/candidateReadyCount`，给前端空状态直接展示。
+- `blockers/topBlockers`：按 `count desc` 输出 `NOT_RESELL/OUT_OF_STOCK/ALREADY_WON/MISSING_PRODUCT_MAPPING/MISSING_COST/MISSING_FBE_FEE/MISSING_LOGISTICS/MISSING_COMMISSION/CART_PRICE_TAX_MODE_UNKNOWN/OFFER_NOT_SELLABLE/BELOW_FINAL_MIN_PRICE/OTHER`。
+- `nextActions`：结构化运营动作 `{ action, description, priority }[]`；`legacyNextActions` 保留字符串说明，便于旧展示兼容。
 - `autoIntegration`：`codeLayerAutoSupported/dataReady/configReady/candidateReady/message`，用于前端告诉运营「代码已支持，但数据或配置未准备好」。
 
 **安全边界：**

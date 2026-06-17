@@ -1802,7 +1802,7 @@ router.post('/:id/commission/sync', async (req: Request, res: Response) => {
 
 /**
  * GET /api/store-products/grab-cart/readiness
- * Phase B-13b 抢车候选准备漏斗：只读诊断当前店铺为什么没有可抢车候选。
+ * Phase B-13b 抢车候选准备漏斗：默认 DB-only，includePreview=true 时才做实时 preview。
  */
 router.get(
   '/grab-cart/readiness',
@@ -1815,7 +1815,8 @@ router.get(
         return;
       }
 
-      const result = await buildGrabCartReadiness({ shopId });
+      const includePreview = req.query.includePreview === 'true' || req.query.includePreview === '1';
+      const result = await buildGrabCartReadiness({ shopId, includePreview });
       res.json({ code: 200, data: result, message: 'grab-cart readiness generated, no eMAG write executed' });
     } catch (err: any) {
       console.error('[GET /api/store-products/grab-cart/readiness]', err?.message ?? err);
