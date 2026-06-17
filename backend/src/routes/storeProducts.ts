@@ -72,7 +72,7 @@ import {
   type BuyBoxStatusConfidence,
   type BuyBoxStatusSource,
 } from '../services/emagBuyBox';
-import { syncStoreProductCommissionRate } from '../services/emagCommission';
+import { batchSyncCommissionRate, syncStoreProductCommissionRate } from '../services/emagCommission';
 import { buildGrabCartPreview, buildPricePreview, dryRunBuildPriceUpdate, executeGrabCartPriceChange, executePriceChange } from '../services/emagPrice';
 import {
   batchExecuteGrabCart,
@@ -1755,6 +1755,45 @@ router.post('/:id/price/preview', async (req: Request, res: Response) => {
       code: status,
       data: null,
       message: err?.message ?? 'price preview 生成失败',
+    });
+  }
+});
+
+/**
+ * POST /api/store-products/commission/batch-sync
+ * Phase 1 批量佣金同步：按 shopId 批量调用 commission/estimate，更新 StoreProduct.commissionRate。
+ * 必须注册在 /:id 路由之前，否则 Express 会把 "commission" 误匹配为 :id。
+ * dryRun=true（默认）只返回计划不写库；dryRun=false 才真实写入。
+ */
+router.post('/commission/batch-sync', async (req: Request, res: Response) => {
+  try {
+    const shopId = Number(req.body?.shopId);
+    if (!Number.isInteger(shopId) || shopId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: 'shopId 必须为正整数' });
+      return;
+    }
+
+    const dryRun = req.body?.dryRun !== false;
+    const limit = req.body?.limit != null ? Number(req.body.limit) : 50;
+    if (!Number.isInteger(limit) || limit < 1) {
+      res.status(400).json({ code: 400, data: null, message: 'limit 必须为正整数' });
+      return;
+    }
+
+    const result = await batchSyncCommissionRate({ shopId, dryRun, limit });
+    res.json({
+      code: 200,
+      data: result,
+      message: dryRun
+        ? `commission batch-sync dry-run 完成，共扫描 ${result.totalScanned} 条，计划更新 ${result.planned} 条，未写库`
+        : `commission batch-sync 完成，成功 ${result.success}，失败 ${result.failed}，跳过 ${result.skipped}`,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/store-products/commission/batch-sync]', err?.message ?? err);
+    res.status(500).json({
+      code: 500,
+      data: null,
+      message: err?.message ?? 'commission batch-sync 失败',
     });
   }
 });

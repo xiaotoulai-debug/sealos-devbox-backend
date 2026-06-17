@@ -114,6 +114,22 @@ router.post('/', async (req: Request, res: Response) => {
         createdBy: req.user!.userId,
       },
     });
+
+    // eMAG 新店铺自动创建价格策略配置，cartPriceTaxMode 必须为 UNKNOWN，
+    // 防止系统在老板手动确认税价模式前做出错误的价格计算。
+    if (platform.toLowerCase() === 'emag') {
+      await prisma.storePriceStrategyConfig.upsert({
+        where: { shopId: shop.id },
+        create: {
+          shopId: shop.id,
+          cartPriceTaxMode: 'UNKNOWN',
+          grabCartAllowEstimatedCost: false,
+          manualPriceAllowEstimatedCost: true,
+        },
+        update: {},
+      });
+    }
+
     res.json({ code: 200, data: { id: shop.id, businessModel: bm }, message: '店铺授权创建成功' });
   } catch (err) {
     console.error('[POST /api/shops]', err);

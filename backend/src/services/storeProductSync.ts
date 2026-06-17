@@ -343,6 +343,9 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
           buyBoxActionTips: buyBoxResult.buyBoxActionTips as Prisma.InputJsonValue,
           buyBoxMeta: buyBoxMeta as Prisma.InputJsonValue,
           isArchived: false,
+          // VAT 同步：仅当本次 eMAG 返回明确值时才写入，避免以 null 覆盖旧有效值
+          ...(np.vatId !== null ? { vatId: np.vatId } : {}),
+          ...(np.vatRate !== null ? { vatRate: np.vatRate } : {}),
         };
 
         const updateData: Record<string, any> = { ...data };

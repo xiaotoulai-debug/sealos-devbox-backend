@@ -33,6 +33,27 @@ export type SyncStoreProductCommissionRateResult = {
   errorMessage?: string;
 };
 
+export type BatchSyncCommissionItemResult = {
+  storeProductId: number;
+  sku: string | null;
+  emagOfferId: string | null;
+  oldCommissionRate: number | null;
+  newCommissionRate: number | null;
+  status: 'PLANNED' | 'SUCCESS' | 'SKIPPED' | 'FAILED';
+  message?: string;
+};
+
+export type BatchSyncCommissionRateResult = {
+  shopId: number;
+  dryRun: boolean;
+  totalScanned: number;
+  planned: number;
+  success: number;
+  skipped: number;
+  failed: number;
+  items: BatchSyncCommissionItemResult[];
+};
+
 function getCommissionAxios(): AxiosInstance {
   if (!_commissionAxios) {
     _commissionAxios = axios.create({
@@ -298,4 +319,136 @@ export async function syncStoreProductCommissionRate(params: {
     dryRun: false,
     rawResponse: estimate.rawResponse,
   };
+}
+
+/**
+ * 批量同步指定店铺的 commissionRate。
+ * - 只处理有 emagOfferId 的 StoreProduct。
+ * - 优先处理 commissionRate 为 null 的产品（排前面）。
+ * - dryRun=true 只返回计划，不写库。
+ * - 并发限制 3，单个失败不中断整体。
+ */
+export async function batchSyncCommissionRate(params: {
+  shopId: number;
+  dryRun?: boolean;
+  limit?: number;
+}): Promise<BatchSyncCommissionRateResult> {
+  const { shopId } = params;
+  const dryRun = params.dryRun !== false;
+  const limit = Math.max(1, Math.min(params.limit ?? 50, 200));
+  const CONCURRENCY = 3;
+
+  // 查询：有 emagOfferId 的产品，commissionRate 为 null 的排前面
+  const candidates = await prisma.storeProduct.findMany({
+    where: {
+      shopId,
+      isArchived: false,
+      emagOfferId: { not: null },
+    },
+    select: {
+      id: true,
+      sku: true,
+      emagOfferId: true,
+      commissionRate: true,
+    },
+    orderBy: [
+      // null 排前：用 asc nulls first 等价逻辑——commissionRate 为 null 时 isNull 标记为 0，有值为 1
+      { commissionRate: 'asc' },
+    ],
+    take: limit,
+  });
+
+  const result: BatchSyncCommissionRateResult = {
+    shopId,
+    dryRun,
+    totalScanned: candidates.length,
+    planned: 0,
+    success: 0,
+    skipped: 0,
+    failed: 0,
+    items: [],
+  };
+
+  if (candidates.length === 0) return result;
+
+  // 并发限流器：每次最多 CONCURRENCY 个并行请求
+  const tasks = [...candidates];
+  while (tasks.length > 0) {
+    const batch = tasks.splice(0, CONCURRENCY);
+    await Promise.all(
+      batch.map(async (sp) => {
+        const extId = sp.emagOfferId ? normalizeExtId(sp.emagOfferId) : null;
+        if (!extId) {
+          result.skipped++;
+          result.items.push({
+            storeProductId: sp.id,
+            sku: sp.sku,
+            emagOfferId: sp.emagOfferId,
+            oldCommissionRate: sp.commissionRate,
+            newCommissionRate: null,
+            status: 'SKIPPED',
+            message: 'emagOfferId 缺失或无效',
+          });
+          return;
+        }
+
+        const estimate = await fetchCommissionEstimate(shopId, extId);
+        if (!estimate.ok || estimate.commissionRate == null) {
+          result.failed++;
+          result.items.push({
+            storeProductId: sp.id,
+            sku: sp.sku,
+            emagOfferId: sp.emagOfferId,
+            oldCommissionRate: sp.commissionRate,
+            newCommissionRate: null,
+            status: 'FAILED',
+            message: estimate.errorMessage ?? `commission/estimate 失败 [${estimate.errorCode}]`,
+          });
+          return;
+        }
+
+        if (dryRun) {
+          result.planned++;
+          result.items.push({
+            storeProductId: sp.id,
+            sku: sp.sku,
+            emagOfferId: sp.emagOfferId,
+            oldCommissionRate: sp.commissionRate,
+            newCommissionRate: estimate.commissionRate,
+            status: 'PLANNED',
+          });
+          return;
+        }
+
+        try {
+          await prisma.storeProduct.update({
+            where: { id: sp.id },
+            data: { commissionRate: estimate.commissionRate },
+          });
+          result.success++;
+          result.items.push({
+            storeProductId: sp.id,
+            sku: sp.sku,
+            emagOfferId: sp.emagOfferId,
+            oldCommissionRate: sp.commissionRate,
+            newCommissionRate: estimate.commissionRate,
+            status: 'SUCCESS',
+          });
+        } catch (dbErr: any) {
+          result.failed++;
+          result.items.push({
+            storeProductId: sp.id,
+            sku: sp.sku,
+            emagOfferId: sp.emagOfferId,
+            oldCommissionRate: sp.commissionRate,
+            newCommissionRate: estimate.commissionRate,
+            status: 'FAILED',
+            message: `数据库写入失败: ${dbErr?.message ?? String(dbErr)}`,
+          });
+        }
+      }),
+    );
+  }
+
+  return result;
 }

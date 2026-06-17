@@ -166,6 +166,10 @@ export interface NormalizedProduct {
   buyButtonRank: number | null;
   offerValidationStatus: unknown | null;
   brand: string | null;
+  /** eMAG vat_id，原始整数 */
+  vatId: number | null;
+  /** VAT 税率，归一化为小数（0.19 代表 19%）。eMAG 若返回 19 则自动转换。 */
+  vatRate: number | null;
 }
 
 function extractBrand(raw: Record<string, unknown>): string | null {
@@ -418,8 +422,33 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
   const brand = extractBrand(raw);
   const skuDisplay = sku ?? vendorSku ?? pnk;
 
+  // ─── VAT 解析 ─────────────────────────────────────────────────────
+  // vatId: 直接读取 raw.vat_id，保证为整数或 null
+  const rawVatId = raw?.vat_id ?? raw?.vatId;
+  const vatId: number | null =
+    rawVatId != null && Number.isInteger(Number(rawVatId)) && Number(rawVatId) >= 0
+      ? Number(rawVatId)
+      : null;
+
+  // vatRate: 归一化为小数（0.19 表示 19%）
+  // eMAG API 有时返回整数形式（如 19），有时返回小数（如 0.19）
+  // 规则：> 1 则除以 100；[0,1] 则直接使用；其余忽略
+  let vatRate: number | null = null;
+  const rawVatRate = raw?.vat_rate ?? raw?.vatRate;
+  if (rawVatRate != null && rawVatRate !== '') {
+    const n = Number(rawVatRate);
+    if (Number.isFinite(n) && n >= 0) {
+      vatRate = n > 1 ? n / 100 : n;
+    }
+  }
+
+  // vatRate 缺失但 vatId === 0 → 免税（零税率是安全确定的）
+  if (vatRate === null && vatId === 0) {
+    vatRate = 0;
+  }
+
   if (options?.logOutput !== false) {
-    console.log(`[Pipeline Output] SKU: ${skuDisplay}, Image: ${mainImage ?? '(空)'}, Currency: ${currency}`);
+    console.log(`[Pipeline Output] SKU: ${skuDisplay}, Image: ${mainImage ?? '(空)'}, Currency: ${currency}, vatId: ${vatId}, vatRate: ${vatRate}`);
   }
 
   return {
@@ -447,5 +476,7 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
     buyButtonRank,
     offerValidationStatus: compactOfferValidationStatus,
     brand,
+    vatId,
+    vatRate,
   };
 }
