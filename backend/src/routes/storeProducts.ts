@@ -76,6 +76,7 @@ import { syncStoreProductCommissionRate } from '../services/emagCommission';
 import { buildGrabCartPreview, buildPricePreview, dryRunBuildPriceUpdate, executeGrabCartPriceChange, executePriceChange } from '../services/emagPrice';
 import {
   batchExecuteGrabCart,
+  buildGrabCartReadiness,
   GRAB_CART_CANDIDATES_MAX_PAGE_SIZE,
   listGrabCartCandidates,
   normalizeGrabCartBatchReason,
@@ -1798,6 +1799,35 @@ router.post('/:id/commission/sync', async (req: Request, res: Response) => {
     });
   }
 });
+
+/**
+ * GET /api/store-products/grab-cart/readiness
+ * Phase B-13b 抢车候选准备漏斗：只读诊断当前店铺为什么没有可抢车候选。
+ */
+router.get(
+  '/grab-cart/readiness',
+  requireStrictPermission(STORE_PRODUCT_PRICE_PERMISSIONS.GRAB_CART, '无权限查看抢车候选准备状态'),
+  async (req: Request, res: Response) => {
+    try {
+      const shopId = Number(req.query.shopId);
+      if (!Number.isInteger(shopId) || shopId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+        return;
+      }
+
+      const result = await buildGrabCartReadiness({ shopId });
+      res.json({ code: 200, data: result, message: 'grab-cart readiness generated, no eMAG write executed' });
+    } catch (err: any) {
+      console.error('[GET /api/store-products/grab-cart/readiness]', err?.message ?? err);
+      const status = err?.code === 'EMAG_PROXY_REQUIRED' ? 503 : 500;
+      res.status(status).json({
+        code: status,
+        data: null,
+        message: err?.message ?? 'grab-cart readiness 生成失败',
+      });
+    }
+  },
+);
 
 /**
  * GET /api/store-products/grab-cart/candidates

@@ -85,6 +85,69 @@ export type GrabCartBatchExecuteResult = {
   items: GrabCartBatchItemResult[];
 };
 
+export type GrabCartReadinessBlockerCode =
+  | 'NOT_RESELL'
+  | 'NO_STOCK'
+  | 'ALREADY_WON'
+  | 'MISSING_PRODUCT_MAPPING'
+  | 'MISSING_FBE_FEE'
+  | 'MISSING_LOGISTICS'
+  | 'MISSING_COMMISSION'
+  | 'CART_PRICE_TAX_MODE_UNKNOWN'
+  | 'OFFER_NOT_SELLABLE'
+  | 'BELOW_FINAL_MIN_PRICE'
+  | 'OTHER';
+
+export type GrabCartReadinessBlocker = {
+  code: GrabCartReadinessBlockerCode;
+  count: number;
+  message: string;
+};
+
+export type GrabCartReadinessResult = {
+  shopId: number;
+  summary: {
+    totalStoreProducts: number;
+    resellCount: number;
+    resellWithStockCount: number;
+    hasOfferPnkSkuCount: number;
+    notWonCount: number;
+    mappedProductCount: number;
+    fbeFeeReadyCount: number;
+    logisticsReadyCount: number;
+    commissionReadyCount: number;
+    cartPriceTaxModeReady: boolean;
+    cartPriceTaxMode: string;
+    previewOkCount: number;
+    candidateCount: number;
+    scannedCount: number;
+    scanLimit: number;
+  };
+  blockers: GrabCartReadinessBlocker[];
+  nextActions: string[];
+  autoIntegration: {
+    codeLayerAutoSupported: boolean;
+    dataReady: boolean;
+    configReady: boolean;
+    candidateReady: boolean;
+    message: string;
+  };
+};
+
+const READINESS_BLOCKER_MESSAGES: Record<GrabCartReadinessBlockerCode, string> = {
+  NOT_RESELL: '不是 RESELL 跟卖产品',
+  NO_STOCK: 'RESELL 产品库存为 0',
+  ALREADY_WON: '已获得购物车，无需抢车',
+  MISSING_PRODUCT_MAPPING: '未绑定库存 Product',
+  MISSING_FBE_FEE: 'Product.fbeFee 未维护',
+  MISSING_LOGISTICS: 'Product 尺寸或重量不完整',
+  MISSING_COMMISSION: 'StoreProduct.commissionRate 未同步',
+  CART_PRICE_TAX_MODE_UNKNOWN: 'StorePriceStrategyConfig.cartPriceTaxMode 未配置',
+  OFFER_NOT_SELLABLE: 'eMAG offer 当前不可售',
+  BELOW_FINAL_MIN_PRICE: '建议抢车价低于最终保护价',
+  OTHER: '其他 preview 阻塞原因',
+};
+
 export function normalizeGrabCartBatchReason(reason: unknown): { ok: true; value: string } | { ok: false; message: string } {
   if (typeof reason !== 'string') {
     return { ok: false, message: '执行原因必填' };
@@ -162,6 +225,41 @@ function isQualifiedGrabCartPreview(
   return true;
 }
 
+function isCompleteLogisticsProduct(product: {
+  length: unknown;
+  width: unknown;
+  height: unknown;
+  actualWeight: unknown;
+} | undefined): boolean {
+  return Number(product?.length) > 0
+    && Number(product?.width) > 0
+    && Number(product?.height) > 0
+    && Number(product?.actualWeight) > 0;
+}
+
+function toReadinessBlockers(counts: Record<GrabCartReadinessBlockerCode, number>): GrabCartReadinessBlocker[] {
+  return (Object.keys(READINESS_BLOCKER_MESSAGES) as GrabCartReadinessBlockerCode[])
+    .map((code) => ({
+      code,
+      count: counts[code] ?? 0,
+      message: READINESS_BLOCKER_MESSAGES[code],
+    }))
+    .filter((row) => row.count > 0);
+}
+
+function mapPreviewCodeToReadinessBlocker(code: string): GrabCartReadinessBlockerCode | null {
+  if (code === PRICE_ERROR_CODES.OFFER_NOT_SELLABLE) return 'OFFER_NOT_SELLABLE';
+  if (code === PRICE_ERROR_CODES.BELOW_FINAL_MIN_PRICE) return 'BELOW_FINAL_MIN_PRICE';
+  if (code === PRICE_ERROR_CODES.CART_PRICE_TAX_MODE_UNKNOWN) return 'CART_PRICE_TAX_MODE_UNKNOWN';
+  if (code === PRICE_ERROR_CODES.ALREADY_WON) return 'ALREADY_WON';
+  if (code === PRICE_ERROR_CODES.OUT_OF_STOCK) return 'NO_STOCK';
+  if (code === PRICE_ERROR_CODES.LINK_TYPE_NOT_ALLOWED) return 'NOT_RESELL';
+  if (code === PRICE_ERROR_CODES.MISSING_LOGISTICS) return 'MISSING_LOGISTICS';
+  if (code === PRICE_ERROR_CODES.MISSING_COMMISSION) return 'MISSING_COMMISSION';
+  if (code === 'OK') return null;
+  return 'OTHER';
+}
+
 function buildCandidateFromPreview(
   row: {
     id: number;
@@ -203,6 +301,164 @@ function buildCandidateFromPreview(
     unselectableReason: qualified ? null : elig.message,
     lastPriceAdjustedAt: row.lastPriceAdjustedAt?.toISOString() ?? null,
     lastPriceAdjustmentMode: row.lastPriceAdjustmentMode,
+  };
+}
+
+export async function buildGrabCartReadiness(params: { shopId: number }): Promise<GrabCartReadinessResult> {
+  const baseWhere = { shopId: params.shopId, isArchived: false };
+  const resellWhere = { ...baseWhere, emagLinkType: 'RESELL' };
+  const resellWithStockWhere = { ...resellWhere, stock: { gt: 0 } };
+  const hasOfferPnkSkuWhere = {
+    ...resellWithStockWhere,
+    emagOfferId: { not: null },
+    pnk: { not: '' },
+    sku: { not: '' },
+  };
+  const notWonWhere = {
+    ...hasOfferPnkSkuWhere,
+    AND: [
+      { OR: [{ buyBoxStatus: null }, { buyBoxStatus: { not: 'WON' } }] },
+      { OR: [{ buyButtonRank: null }, { buyButtonRank: { not: 1 } }] },
+    ],
+  };
+
+  const [
+    totalStoreProducts,
+    resellCount,
+    resellWithStockCount,
+    hasOfferPnkSkuCount,
+    notWonCount,
+    strategyConfig,
+    notWonRows,
+  ] = await Promise.all([
+    prisma.storeProduct.count({ where: baseWhere }),
+    prisma.storeProduct.count({ where: resellWhere }),
+    prisma.storeProduct.count({ where: resellWithStockWhere }),
+    prisma.storeProduct.count({ where: hasOfferPnkSkuWhere }),
+    prisma.storeProduct.count({ where: notWonWhere }),
+    prisma.storePriceStrategyConfig.findUnique({
+      where: { shopId: params.shopId },
+      select: { cartPriceTaxMode: true },
+    }),
+    prisma.storeProduct.findMany({
+      where: notWonWhere,
+      select: {
+        id: true,
+        mappedInventorySku: true,
+        commissionRate: true,
+      },
+      orderBy: { id: 'asc' },
+      take: GRAB_CART_CANDIDATES_SCAN_LIMIT,
+    }),
+  ]);
+
+  const mappedSkus = [...new Set(notWonRows.map((row) => row.mappedInventorySku).filter(Boolean))] as string[];
+  const products = mappedSkus.length > 0
+    ? await prisma.product.findMany({
+        where: { sku: { in: mappedSkus } },
+        select: { sku: true, fbeFee: true, length: true, width: true, height: true, actualWeight: true },
+      })
+    : [];
+  const productBySku = new Map(products.map((product) => [product.sku, product]));
+
+  const mappedProductCount = notWonRows.filter((row) => row.mappedInventorySku && productBySku.has(row.mappedInventorySku)).length;
+  const fbeFeeReadyCount = notWonRows.filter((row) => {
+    const product = row.mappedInventorySku ? productBySku.get(row.mappedInventorySku) : undefined;
+    return product?.fbeFee != null;
+  }).length;
+  const logisticsReadyCount = notWonRows.filter((row) => {
+    const product = row.mappedInventorySku ? productBySku.get(row.mappedInventorySku) : undefined;
+    return product != null && isCompleteLogisticsProduct(product);
+  }).length;
+  const commissionReadyCount = notWonRows.filter((row) => row.commissionRate != null).length;
+  const cartPriceTaxMode = strategyConfig?.cartPriceTaxMode ?? DEFAULT_PRICE_STRATEGY.cartPriceTaxMode;
+  const cartPriceTaxModeReady = cartPriceTaxMode !== 'UNKNOWN';
+
+  const blockerCounts: Record<GrabCartReadinessBlockerCode, number> = {
+    NOT_RESELL: Math.max(totalStoreProducts - resellCount, 0),
+    NO_STOCK: Math.max(resellCount - resellWithStockCount, 0),
+    ALREADY_WON: Math.max(hasOfferPnkSkuCount - notWonCount, 0),
+    MISSING_PRODUCT_MAPPING: Math.max(notWonRows.length - mappedProductCount, 0),
+    MISSING_FBE_FEE: Math.max(mappedProductCount - fbeFeeReadyCount, 0),
+    MISSING_LOGISTICS: Math.max(mappedProductCount - logisticsReadyCount, 0),
+    MISSING_COMMISSION: Math.max(notWonRows.length - commissionReadyCount, 0),
+    CART_PRICE_TAX_MODE_UNKNOWN: cartPriceTaxModeReady ? 0 : notWonRows.length,
+    OFFER_NOT_SELLABLE: 0,
+    BELOW_FINAL_MIN_PRICE: 0,
+    OTHER: 0,
+  };
+
+  let previewOkCount = 0;
+  for (const row of notWonRows) {
+    try {
+      const preview = await buildGrabCartPreview({ shopId: params.shopId, storeProductId: row.id });
+      const code = preview.grabCartEligibility.code;
+      if (preview.grabCartEligibility.canGrab && code === 'OK' && preview.costStatus === 'COMPLETE') {
+        previewOkCount += 1;
+        continue;
+      }
+      const blockerCode = mapPreviewCodeToReadinessBlocker(code);
+      if (blockerCode) blockerCounts[blockerCode] += 1;
+    } catch (err) {
+      blockerCounts.OTHER += 1;
+      console.error(`[buildGrabCartReadiness] preview failed storeProductId=${row.id}:`, err instanceof Error ? err.message : err);
+    }
+  }
+
+  const candidates = await listGrabCartCandidates({ shopId: params.shopId, page: 1, pageSize: GRAB_CART_CANDIDATES_MAX_PAGE_SIZE });
+  const candidateCount = candidates.total;
+  const dataReady = resellWithStockCount > 0
+    && mappedProductCount > 0
+    && fbeFeeReadyCount > 0
+    && logisticsReadyCount > 0
+    && commissionReadyCount > 0;
+  const configReady = cartPriceTaxModeReady;
+  const candidateReady = candidateCount > 0;
+  const nextActions: string[] = [];
+
+  if (resellCount === 0) nextActions.push('同步/识别 RESELL 跟卖产品');
+  if (resellWithStockCount === 0 && resellCount > 0) nextActions.push('确认 RESELL 产品库存');
+  if (mappedProductCount < notWonRows.length) nextActions.push('绑定库存 SKU / Product 映射');
+  if (fbeFeeReadyCount < mappedProductCount || mappedProductCount === 0) nextActions.push('补齐 Product.fbeFee');
+  if (logisticsReadyCount < mappedProductCount || mappedProductCount === 0) nextActions.push('补齐 Product 长宽高和重量');
+  if (commissionReadyCount < notWonRows.length) nextActions.push('执行 commission/sync');
+  if (!cartPriceTaxModeReady) nextActions.push('配置 StorePriceStrategyConfig.cartPriceTaxMode');
+  if (previewOkCount === 0 && dataReady && configReady) nextActions.push('根据 preview 阻塞原因处理 offer 可售状态或保护价');
+  if (candidateReady) nextActions.push('可进入候选池勾选与批量抢车确认');
+
+  const missingParts = nextActions.filter((action) => action !== '可进入候选池勾选与批量抢车确认');
+  const message = candidateReady
+    ? '代码已支持该店铺，当前已有可执行抢车候选。'
+    : `代码已支持该店铺，但当前${missingParts.length > 0 ? `需要：${missingParts.join('、')}` : '暂无可执行抢车候选'}。`;
+
+  return {
+    shopId: params.shopId,
+    summary: {
+      totalStoreProducts,
+      resellCount,
+      resellWithStockCount,
+      hasOfferPnkSkuCount,
+      notWonCount,
+      mappedProductCount,
+      fbeFeeReadyCount,
+      logisticsReadyCount,
+      commissionReadyCount,
+      cartPriceTaxModeReady,
+      cartPriceTaxMode,
+      previewOkCount,
+      candidateCount,
+      scannedCount: candidates.scannedCount,
+      scanLimit: GRAB_CART_CANDIDATES_SCAN_LIMIT,
+    },
+    blockers: toReadinessBlockers(blockerCounts),
+    nextActions: [...new Set(nextActions)],
+    autoIntegration: {
+      codeLayerAutoSupported: true,
+      dataReady,
+      configReady,
+      candidateReady,
+      message,
+    },
   };
 }
 
