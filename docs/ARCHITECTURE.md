@@ -1962,6 +1962,27 @@ eMAG `product_offer/read` 响应中包含 `vat_id`（整数）和 `vat_rate`（�
 - `isQualifiedGrabCartPreview()` 允许 `costStatus === ESTIMATED` 展示；若店铺策略不允许估算成本执行，则候选仍带 warning 且不可直接执行。
 - 硬 blocker 保留：未映射 Product、采购价缺失、尺寸/重量缺失、commissionRate 缺失、`cartPriceTaxMode=UNKNOWN`、库存不足、非 RESELL、已赢购物车。
 
+### 17.5 指定 StoreProduct 精准补齐
+
+**改动文件**: `backend/src/services/emagCommission.ts`, `backend/src/services/profitCalculator.ts`, `backend/src/routes/storeProducts.ts`
+
+`POST /api/store-products/commission/batch-sync` 新增精准模式：
+- 请求体：`{ storeProductIds: number[], dryRun?: boolean }`。
+- 一次最多 50 个 ID；去重并过滤非正整数；空数组返回 400。
+- 与 `allShops=true` 互斥，避免误触发全店铺真实写库。
+- 店铺之间串行；店铺内并发限制 3；单个商品失败不影响其他商品。
+- `dryRun=true` 默认只返回 `PLANNED`；`dryRun=false` 只写 `StoreProduct.commissionRate`。
+- 无 `emagOfferId` 返回 `SKIPPED`；不存在 ID 返回 `FAILED + STORE_PRODUCT_NOT_FOUND`。
+- 禁止发送 `product_offer/save`，禁止修改 `salePrice / vatId / vatRate / Product.fbeFee / Product.purchasePrice / SKU 映射 / 尺寸重量`。
+
+`POST /api/store-products/recalc-profit` 新增精准模式：
+- 请求体：`{ storeProductIds: number[], dryRun?: boolean }`。
+- 一次最多 100 个 ID；进入该模式后不会落入 `shopId` 或全量重算分支。
+- 复用 `profitCalculator.ts` 统一利润口径；`Product.fbeFee=null` 时使用 `DEFAULT_FBE_CNY=7`，并在 `profitBreakdown.warnings` 标记估算。
+- `dryRun=true` 只返回重算结果，不写库。
+- `dryRun=false` 只写 `StoreProduct.estimatedProfit / estimatedProfitCny / profitMarginPct / profitCalculatedAt / profitBreakdown`。
+- 禁止修改 `salePrice / vatId / vatRate / commissionRate / Product.fbeFee / Product.purchasePrice / SKU 映射 / 尺寸重量`。
+
 ### 12.6 PurchaseOrderItem.productIds（JSON）铁律与坏账修复（2026-04-23）
 
 - **唯一关联桥**：子表无 `productId` 外键，必须通过 `product_ids` 存 `"[123]"` 形式 JSON；列表/详情 Mapper 由此解析出顶层 `items[].productId` 供前端调用 `PUT /api/alibaba/bind`。

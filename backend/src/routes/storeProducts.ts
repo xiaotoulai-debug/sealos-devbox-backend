@@ -14,7 +14,7 @@ import { getEmagCredentials, resolveRegion, REGION_CURRENCY, REGION_DOMAIN } fro
 import { getSalesStatsByShop, getSalesForProduct, logZeroSalesDiagnostic } from '../services/salesStats';
 import { tryAcquireLock, releaseLock } from '../lib/syncStatus';
 import { backfillProductUrls, backfillProductImages, syncStoreProducts, backfillComprehensiveSales } from '../services/storeProductSync';
-import { recalcProfitForShop, recalcProfitForAllShops } from '../services/profitCalculator';
+import { recalcProfitForShop, recalcProfitForAllShops, recalcProfitForStoreProductsDetailed } from '../services/profitCalculator';
 import { syncExchangeRates } from '../services/exchangeRateSync';
 import { resolveEffectiveStockSignals, scheduleStockSignalBackfill } from '../services/firstAvailableAt';
 import { generateOperationAdvices } from '../services/operationAdvice';
@@ -72,7 +72,7 @@ import {
   type BuyBoxStatusConfidence,
   type BuyBoxStatusSource,
 } from '../services/emagBuyBox';
-import { batchSyncCommissionRate, batchSyncCommissionRateForAllShops, syncStoreProductCommissionRate } from '../services/emagCommission';
+import { batchSyncCommissionRate, batchSyncCommissionRateByStoreProductIds, batchSyncCommissionRateForAllShops, syncStoreProductCommissionRate } from '../services/emagCommission';
 import { backfillVatData } from '../services/priceDataBackfill';
 import { buildGrabCartPreview, buildPricePreview, dryRunBuildPriceUpdate, executeGrabCartPriceChange, executePriceChange } from '../services/emagPrice';
 import {
@@ -100,6 +100,28 @@ function normalizeExecuteReason(reason: unknown): { ok: true; value: string } | 
     return { ok: false, message: '执行原因必填，长度需在 5-500 字之间' };
   }
   return { ok: true, value: trimmed };
+}
+
+function normalizePositiveIdArray(
+  value: unknown,
+  fieldName: string,
+  maxCount: number,
+): { ok: true; ids: number[] } | { ok: false; message: string } {
+  if (!Array.isArray(value)) {
+    return { ok: false, message: `${fieldName} 必须是数组` };
+  }
+  const ids = [...new Set(
+    value
+      .map((item) => Number(item))
+      .filter((id) => Number.isInteger(id) && id > 0),
+  )];
+  if (ids.length === 0) {
+    return { ok: false, message: `${fieldName} 不能为空` };
+  }
+  if (ids.length > maxCount) {
+    return { ok: false, message: `${fieldName} 一次最多 ${maxCount} 个` };
+  }
+  return { ok: true, ids };
 }
 
 const router = Router();
@@ -1704,6 +1726,29 @@ router.get('/', async (req: Request, res: Response) => {
  */
 router.post('/recalc-profit', async (req: Request, res: Response) => {
   try {
+    if (req.body?.storeProductIds != null) {
+      const normalized = normalizePositiveIdArray(req.body.storeProductIds, 'storeProductIds', 100);
+      if (!normalized.ok) {
+        res.status(400).json({ code: 400, data: null, message: normalized.message });
+        return;
+      }
+
+      const dryRun = req.body?.dryRun !== false;
+      const result = await recalcProfitForStoreProductsDetailed({
+        storeProductIds: normalized.ids,
+        dryRun,
+      });
+
+      res.json({
+        code: 200,
+        data: result,
+        message: dryRun
+          ? `指定 StoreProduct 利润重算 dry-run 完成，计划更新 ${result.planned} 条，未写库`
+          : `指定 StoreProduct 利润重算完成，更新 ${result.updated} 条，失败 ${result.failed}，跳过 ${result.skipped}`,
+      });
+      return;
+    }
+
     const rawShopId = req.body?.shopId ?? req.query?.shopId;
     if (rawShopId != null) {
       const shopId = Number(rawShopId);
@@ -1821,6 +1866,31 @@ router.post('/commission/batch-sync', async (req: Request, res: Response) => {
   try {
     const allShops = req.body?.allShops === true;
     const dryRun = req.body?.dryRun !== false;
+    if (req.body?.storeProductIds != null) {
+      if (allShops) {
+        res.status(400).json({ code: 400, data: null, message: 'storeProductIds 模式禁止同时传 allShops=true' });
+        return;
+      }
+      const normalized = normalizePositiveIdArray(req.body.storeProductIds, 'storeProductIds', 50);
+      if (!normalized.ok) {
+        res.status(400).json({ code: 400, data: null, message: normalized.message });
+        return;
+      }
+
+      const result = await batchSyncCommissionRateByStoreProductIds({
+        storeProductIds: normalized.ids,
+        dryRun,
+      });
+      res.json({
+        code: 200,
+        data: result,
+        message: dryRun
+          ? `commission targeted dry-run 完成，共扫描 ${result.totalScanned} 条，计划更新 ${result.planned} 条，未写库`
+          : `commission targeted sync 完成，成功 ${result.success}，失败 ${result.failed}，跳过 ${result.skipped}`,
+      });
+      return;
+    }
+
     const limit = req.body?.limit != null ? Number(req.body.limit) : undefined;
     const limitPerShop = req.body?.limitPerShop != null ? Number(req.body.limitPerShop) : undefined;
     if (limit != null && (!Number.isInteger(limit) || limit < 1)) {

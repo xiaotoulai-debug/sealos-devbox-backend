@@ -35,6 +35,7 @@ export type SyncStoreProductCommissionRateResult = {
 
 export type BatchSyncCommissionItemResult = {
   storeProductId: number;
+  shopId?: number | null;
   sku: string | null;
   emagOfferId: string | null;
   oldCommissionRate: number | null;
@@ -59,6 +60,17 @@ export type BatchSyncCommissionAllShopsResult = {
   dryRun: boolean;
   allShops: true;
   shops: BatchSyncCommissionRateResult[];
+};
+
+export type BatchSyncCommissionByStoreProductIdsResult = {
+  dryRun: boolean;
+  mode: 'STORE_PRODUCT_IDS';
+  totalScanned: number;
+  planned: number;
+  success: number;
+  skipped: number;
+  failed: number;
+  items: BatchSyncCommissionItemResult[];
 };
 
 function getCommissionAxios(): AxiosInstance {
@@ -458,6 +470,177 @@ export async function batchSyncCommissionRate(params: {
     );
   }
 
+  return result;
+}
+
+const TARGETED_COMMISSION_MAX_IDS = 50;
+const TARGETED_COMMISSION_CONCURRENCY = 3;
+
+function normalizeStoreProductIds(ids: number[]): number[] {
+  return [...new Set(ids.filter((id) => Number.isInteger(id) && id > 0))];
+}
+
+export async function batchSyncCommissionRateByStoreProductIds(params: {
+  storeProductIds: number[];
+  dryRun?: boolean;
+}): Promise<BatchSyncCommissionByStoreProductIdsResult> {
+  const dryRun = params.dryRun !== false;
+  const uniqueIds = normalizeStoreProductIds(params.storeProductIds);
+  if (uniqueIds.length === 0) throw new Error('storeProductIds 不能为空');
+  if (uniqueIds.length > TARGETED_COMMISSION_MAX_IDS) {
+    throw new Error(`storeProductIds 一次最多 ${TARGETED_COMMISSION_MAX_IDS} 个`);
+  }
+
+  const rows = await prisma.storeProduct.findMany({
+    where: { id: { in: uniqueIds } },
+    select: {
+      id: true,
+      shopId: true,
+      sku: true,
+      emagOfferId: true,
+      commissionRate: true,
+      isArchived: true,
+    },
+    orderBy: [{ shopId: 'asc' }, { id: 'asc' }],
+  });
+
+  const rowById = new Map(rows.map((row) => [row.id, row]));
+  const result: BatchSyncCommissionByStoreProductIdsResult = {
+    dryRun,
+    mode: 'STORE_PRODUCT_IDS',
+    totalScanned: uniqueIds.length,
+    planned: 0,
+    success: 0,
+    skipped: 0,
+    failed: 0,
+    items: [],
+  };
+
+  for (const id of uniqueIds) {
+    if (!rowById.has(id)) {
+      result.failed++;
+      result.items.push({
+        storeProductId: id,
+        shopId: null,
+        sku: null,
+        emagOfferId: null,
+        oldCommissionRate: null,
+        newCommissionRate: null,
+        status: 'FAILED',
+        message: 'STORE_PRODUCT_NOT_FOUND',
+      });
+    }
+  }
+
+  const activeRows = rows.filter((row) => {
+    if (row.isArchived) {
+      result.skipped++;
+      result.items.push({
+        storeProductId: row.id,
+        shopId: row.shopId,
+        sku: row.sku,
+        emagOfferId: row.emagOfferId,
+        oldCommissionRate: row.commissionRate,
+        newCommissionRate: null,
+        status: 'SKIPPED',
+        message: 'StoreProduct 已归档',
+      });
+      return false;
+    }
+    return true;
+  });
+
+  const byShop = new Map<number, typeof activeRows>();
+  for (const row of activeRows) {
+    const list = byShop.get(row.shopId) ?? [];
+    list.push(row);
+    byShop.set(row.shopId, list);
+  }
+
+  for (const [shopId, shopRows] of [...byShop.entries()].sort((a, b) => a[0] - b[0])) {
+    const tasks = [...shopRows];
+    while (tasks.length > 0) {
+      const batch = tasks.splice(0, TARGETED_COMMISSION_CONCURRENCY);
+      await Promise.all(batch.map(async (sp) => {
+        const extId = sp.emagOfferId ? normalizeExtId(sp.emagOfferId) : null;
+        if (!extId) {
+          result.skipped++;
+          result.items.push({
+            storeProductId: sp.id,
+            shopId: sp.shopId,
+            sku: sp.sku,
+            emagOfferId: sp.emagOfferId,
+            oldCommissionRate: sp.commissionRate,
+            newCommissionRate: null,
+            status: 'SKIPPED',
+            message: 'emagOfferId 缺失或无效',
+          });
+          return;
+        }
+
+        const estimate = await fetchCommissionEstimate(shopId, extId);
+        if (!estimate.ok || estimate.commissionRate == null) {
+          result.failed++;
+          result.items.push({
+            storeProductId: sp.id,
+            shopId: sp.shopId,
+            sku: sp.sku,
+            emagOfferId: sp.emagOfferId,
+            oldCommissionRate: sp.commissionRate,
+            newCommissionRate: null,
+            status: 'FAILED',
+            message: estimate.errorMessage ?? `commission/estimate 失败 [${estimate.errorCode}]`,
+          });
+          return;
+        }
+
+        if (dryRun) {
+          result.planned++;
+          result.items.push({
+            storeProductId: sp.id,
+            shopId: sp.shopId,
+            sku: sp.sku,
+            emagOfferId: sp.emagOfferId,
+            oldCommissionRate: sp.commissionRate,
+            newCommissionRate: estimate.commissionRate,
+            status: 'PLANNED',
+          });
+          return;
+        }
+
+        try {
+          await prisma.storeProduct.update({
+            where: { id: sp.id },
+            data: { commissionRate: estimate.commissionRate },
+          });
+          result.success++;
+          result.items.push({
+            storeProductId: sp.id,
+            shopId: sp.shopId,
+            sku: sp.sku,
+            emagOfferId: sp.emagOfferId,
+            oldCommissionRate: sp.commissionRate,
+            newCommissionRate: estimate.commissionRate,
+            status: 'SUCCESS',
+          });
+        } catch (dbErr: any) {
+          result.failed++;
+          result.items.push({
+            storeProductId: sp.id,
+            shopId: sp.shopId,
+            sku: sp.sku,
+            emagOfferId: sp.emagOfferId,
+            oldCommissionRate: sp.commissionRate,
+            newCommissionRate: estimate.commissionRate,
+            status: 'FAILED',
+            message: `数据库写入失败: ${dbErr?.message ?? String(dbErr)}`,
+          });
+        }
+      }));
+    }
+  }
+
+  result.items.sort((a, b) => a.storeProductId - b.storeProductId);
   return result;
 }
 
