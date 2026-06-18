@@ -12,6 +12,8 @@ export type CartPriceTaxMode = 'UNKNOWN' | 'EX_VAT' | 'INC_VAT';
 
 const CART_PRICE_TAX_MODES = new Set<CartPriceTaxMode>(['UNKNOWN', 'EX_VAT', 'INC_VAT']);
 
+export const DEFAULT_FBE_CNY = 7;
+
 export function normalizeCartPriceTaxMode(value: unknown): CartPriceTaxMode {
   const normalized = String(value ?? 'UNKNOWN').trim().toUpperCase();
   if (CART_PRICE_TAX_MODES.has(normalized as CartPriceTaxMode)) {
@@ -157,7 +159,7 @@ export function calculateCostStatus(input: CalculateCostStatusInput): CalculateC
 
   if (input.hasCompleteLogisticsDimensions === false) warnings.push('重量或体积信息不完整，物流成本为估算');
   if (input.isEstimatedLogistics) warnings.push('物流成本使用估算值');
-  if (input.isEstimatedFbeFee) warnings.push('FBE 费用使用默认值估算');
+  if (input.isEstimatedFbeFee) warnings.push(`FBE 费用使用 ${DEFAULT_FBE_CNY} RMB 默认估算`);
   if (input.isEstimatedCommission) warnings.push('佣金率来自字典或默认配置');
   if (input.isEstimatedVat) warnings.push('VAT 税率来自默认配置');
 

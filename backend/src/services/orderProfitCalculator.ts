@@ -4,13 +4,14 @@ import { loadExchangeRateMap } from './exchangeRateSync';
 import { calcHeadFreightCny } from './freightCalculator';
 import { guessCommissionRate } from '../utils/commissionMatcher';
 import { DEFAULT_COMMISSION_RATE } from '../config/commissionMap';
+import { DEFAULT_FBE_CNY } from './priceProtection';
 
 export const SALES_TAX_MODE = 'ex_vat' as const;
 export const PROFIT_FORMULA_VERSION = 'order_profit_v2_ex_vat_full_cost_phase3b' as const;
 
 export type CostStatus = 'complete' | 'partial' | 'missing';
 export type CostReliabilityStatus = 'complete' | 'estimated' | 'partial' | 'missing';
-export type FbeFeeSource = 'store_product_profit_breakdown' | 'product_fbe_fee' | 'missing';
+export type FbeFeeSource = 'store_product_profit_breakdown' | 'product_fbe_fee' | 'default_fbe_cny' | 'missing';
 
 export type OrderProfitOrder = {
   id: number;
@@ -62,6 +63,8 @@ export type ItemProfitBreakdown = {
   productCost: number;
   firstLegCost: number;
   fulfillmentCost: number;
+  fbeFeeCny: number | null;
+  isEstimatedFbe: boolean;
   fbeFeeSource: FbeFeeSource;
   returnLossCost: number;
   grossProfit: number;
@@ -378,6 +381,8 @@ export async function calculateOrderProfitBreakdowns(params: {
       let itemProductCost = 0;
       let itemFirstLegCost = 0;
       let itemFulfillmentCost = 0;
+      let itemFbeFeeCny: number | null = null;
+      let isEstimatedFbe = false;
       let fbeFeeSource: FbeFeeSource = 'missing';
       let itemReturnLossCost = 0;
       const purchasePriceCny = product?.purchasePrice != null ? Number(product.purchasePrice) : null;
@@ -413,15 +418,21 @@ export async function calculateOrderProfitBreakdowns(params: {
         if (storeProductFbe) {
           itemFulfillmentCost = storeProductFbe.fee * qty;
           fbeFeeSource = 'store_product_profit_breakdown';
+          isEstimatedFbe = storeProductFbe.isEstimated;
           if (storeProductFbe.isEstimated) {
             reliabilityStatus = resolveReliabilityStatus([reliabilityStatus, 'estimated']);
           }
         } else if (fbeFeeCny != null && fbeFeeCny > 0) {
           itemFulfillmentCost = fbeFeeCny * cnyToCurrency * qty;
+          itemFbeFeeCny = fbeFeeCny;
           fbeFeeSource = 'product_fbe_fee';
         } else {
+          itemFbeFeeCny = DEFAULT_FBE_CNY;
+          itemFulfillmentCost = DEFAULT_FBE_CNY * cnyToCurrency * qty;
+          fbeFeeSource = 'default_fbe_cny';
+          isEstimatedFbe = true;
           reliabilityStatus = resolveReliabilityStatus([reliabilityStatus, 'estimated']);
-          addWarning(itemWarnings, '缺少 FBE 运费，fulfillmentCost 已按 0 估算');
+          addWarning(itemWarnings, `FBE 费用使用 ${DEFAULT_FBE_CNY} RMB 默认估算`);
         }
         addWarning(itemWarnings, 'Product.fbeFee 按 CNY 存储，已换算为订单站点本地币种');
 
@@ -458,6 +469,8 @@ export async function calculateOrderProfitBreakdowns(params: {
         productCost: round2(itemProductCost),
         firstLegCost: round2(itemFirstLegCost),
         fulfillmentCost: round2(itemFulfillmentCost),
+        fbeFeeCny: itemFbeFeeCny != null ? round2(itemFbeFeeCny) : null,
+        isEstimatedFbe,
         fbeFeeSource,
         returnLossCost: round2(itemReturnLossCost),
         grossProfit: round2(itemGrossProfit),

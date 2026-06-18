@@ -45,6 +45,7 @@ export type BatchSyncCommissionItemResult = {
 
 export type BatchSyncCommissionRateResult = {
   shopId: number;
+  shopName?: string | null;
   dryRun: boolean;
   totalScanned: number;
   planned: number;
@@ -52,6 +53,12 @@ export type BatchSyncCommissionRateResult = {
   skipped: number;
   failed: number;
   items: BatchSyncCommissionItemResult[];
+};
+
+export type BatchSyncCommissionAllShopsResult = {
+  dryRun: boolean;
+  allShops: true;
+  shops: BatchSyncCommissionRateResult[];
 };
 
 function getCommissionAxios(): AxiosInstance {
@@ -330,6 +337,7 @@ export async function syncStoreProductCommissionRate(params: {
  */
 export async function batchSyncCommissionRate(params: {
   shopId: number;
+  shopName?: string | null;
   dryRun?: boolean;
   limit?: number;
 }): Promise<BatchSyncCommissionRateResult> {
@@ -344,7 +352,6 @@ export async function batchSyncCommissionRate(params: {
     where: {
       shopId,
       isArchived: false,
-      emagOfferId: { not: null },
     },
     select: {
       id: true,
@@ -360,6 +367,7 @@ export async function batchSyncCommissionRate(params: {
 
   const result: BatchSyncCommissionRateResult = {
     shopId,
+    shopName: params.shopName ?? null,
     dryRun,
     totalScanned: candidates.length,
     planned: 0,
@@ -451,4 +459,34 @@ export async function batchSyncCommissionRate(params: {
   }
 
   return result;
+}
+
+const COMMISSION_ALL_SHOPS_DELAY_MS = 800;
+
+const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+export async function batchSyncCommissionRateForAllShops(params: {
+  dryRun?: boolean;
+  limitPerShop?: number;
+}): Promise<BatchSyncCommissionAllShopsResult> {
+  const dryRun = params.dryRun !== false;
+  const limitPerShop = Math.max(1, Math.min(params.limitPerShop ?? 50, 200));
+  const shops = await prisma.shopAuthorization.findMany({
+    where: { platform: { equals: 'emag', mode: 'insensitive' }, status: 'active' },
+    select: { id: true, shopName: true },
+    orderBy: { id: 'asc' },
+  });
+
+  const results: BatchSyncCommissionRateResult[] = [];
+  for (const shop of shops) {
+    results.push(await batchSyncCommissionRate({
+      shopId: shop.id,
+      shopName: shop.shopName,
+      dryRun,
+      limit: limitPerShop,
+    }));
+    await sleep(COMMISSION_ALL_SHOPS_DELAY_MS);
+  }
+
+  return { dryRun, allShops: true, shops: results };
 }

@@ -72,7 +72,8 @@ import {
   type BuyBoxStatusConfidence,
   type BuyBoxStatusSource,
 } from '../services/emagBuyBox';
-import { batchSyncCommissionRate, syncStoreProductCommissionRate } from '../services/emagCommission';
+import { batchSyncCommissionRate, batchSyncCommissionRateForAllShops, syncStoreProductCommissionRate } from '../services/emagCommission';
+import { backfillVatData } from '../services/priceDataBackfill';
 import { buildGrabCartPreview, buildPricePreview, dryRunBuildPriceUpdate, executeGrabCartPriceChange, executePriceChange } from '../services/emagPrice';
 import {
   batchExecuteGrabCart,
@@ -1760,6 +1761,57 @@ router.post('/:id/price/preview', async (req: Request, res: Response) => {
 });
 
 /**
+ * POST /api/store-products/price-data/vat-backfill
+ * Phase 2 VAT 回填：分页读取 product_offer/read，默认 dryRun，只计划不写库。
+ */
+router.post('/price-data/vat-backfill', async (req: Request, res: Response) => {
+  try {
+    const allShops = req.body?.allShops === true;
+    const dryRun = req.body?.dryRun !== false;
+
+    if (!allShops) {
+      const shopId = Number(req.body?.shopId);
+      if (!Number.isInteger(shopId) || shopId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'shopId 必须为正整数，或传 allShops=true' });
+        return;
+      }
+    }
+
+    const limit = req.body?.limit != null ? Number(req.body.limit) : undefined;
+    const limitPerShop = req.body?.limitPerShop != null ? Number(req.body.limitPerShop) : undefined;
+    if (limit != null && (!Number.isInteger(limit) || limit < 1)) {
+      res.status(400).json({ code: 400, data: null, message: 'limit 必须为正整数' });
+      return;
+    }
+    if (limitPerShop != null && (!Number.isInteger(limitPerShop) || limitPerShop < 1)) {
+      res.status(400).json({ code: 400, data: null, message: 'limitPerShop 必须为正整数' });
+      return;
+    }
+
+    const result = await backfillVatData({
+      shopId: allShops ? undefined : Number(req.body?.shopId),
+      allShops,
+      dryRun,
+      limit,
+      limitPerShop,
+    });
+
+    res.json({
+      code: 200,
+      data: result,
+      message: dryRun ? 'VAT backfill dry-run completed, no database write executed' : 'VAT backfill completed',
+    });
+  } catch (err: any) {
+    console.error('[POST /api/store-products/price-data/vat-backfill]', err?.message ?? err);
+    res.status(500).json({
+      code: 500,
+      data: null,
+      message: err?.message ?? 'VAT backfill 失败',
+    });
+  }
+});
+
+/**
  * POST /api/store-products/commission/batch-sync
  * Phase 1 批量佣金同步：按 shopId 批量调用 commission/estimate，更新 StoreProduct.commissionRate。
  * 必须注册在 /:id 路由之前，否则 Express 会把 "commission" 误匹配为 :id。
@@ -1767,20 +1819,38 @@ router.post('/:id/price/preview', async (req: Request, res: Response) => {
  */
 router.post('/commission/batch-sync', async (req: Request, res: Response) => {
   try {
-    const shopId = Number(req.body?.shopId);
-    if (!Number.isInteger(shopId) || shopId <= 0) {
-      res.status(400).json({ code: 400, data: null, message: 'shopId 必须为正整数' });
-      return;
-    }
-
+    const allShops = req.body?.allShops === true;
     const dryRun = req.body?.dryRun !== false;
-    const limit = req.body?.limit != null ? Number(req.body.limit) : 50;
-    if (!Number.isInteger(limit) || limit < 1) {
+    const limit = req.body?.limit != null ? Number(req.body.limit) : undefined;
+    const limitPerShop = req.body?.limitPerShop != null ? Number(req.body.limitPerShop) : undefined;
+    if (limit != null && (!Number.isInteger(limit) || limit < 1)) {
       res.status(400).json({ code: 400, data: null, message: 'limit 必须为正整数' });
       return;
     }
+    if (limitPerShop != null && (!Number.isInteger(limitPerShop) || limitPerShop < 1)) {
+      res.status(400).json({ code: 400, data: null, message: 'limitPerShop 必须为正整数' });
+      return;
+    }
 
-    const result = await batchSyncCommissionRate({ shopId, dryRun, limit });
+    if (allShops) {
+      const result = await batchSyncCommissionRateForAllShops({ dryRun, limitPerShop: limitPerShop ?? limit ?? 50 });
+      res.json({
+        code: 200,
+        data: result,
+        message: dryRun
+          ? 'commission batch-sync allShops dry-run completed, no database write executed'
+          : 'commission batch-sync allShops completed',
+      });
+      return;
+    }
+
+    const shopId = Number(req.body?.shopId);
+    if (!Number.isInteger(shopId) || shopId <= 0) {
+      res.status(400).json({ code: 400, data: null, message: 'shopId 必须为正整数，或传 allShops=true' });
+      return;
+    }
+
+    const result = await batchSyncCommissionRate({ shopId, dryRun, limit: limit ?? 50 });
     res.json({
       code: 200,
       data: result,

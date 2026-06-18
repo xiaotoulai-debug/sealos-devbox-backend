@@ -32,6 +32,7 @@ export type GrabCartCandidateItem = {
   buyBoxStatus: string | null;
   costStatus: GrabCartPreviewResult['costStatus'];
   costWarnings: string[];
+  isEstimatedFbe: boolean;
   canGrab: boolean;
   code: string;
   riskLevel: GrabCartCandidateRiskLevel;
@@ -116,6 +117,9 @@ export type GrabCartReadinessResult = {
     notWonCount: number;
     mappedProductCount: number;
     fbeFeeReadyCount: number;
+    realFbeReadyCount: number;
+    estimatedFbeCount: number;
+    fbeMissingButFallbackCount: number;
     logisticsReadyCount: number;
     commissionReadyCount: number;
     cartPriceTaxModeReady: boolean;
@@ -234,11 +238,26 @@ function isQualifiedGrabCartPreview(
 ): boolean {
   const elig = preview.grabCartEligibility;
   if (!elig.canGrab || elig.code !== 'OK') return false;
-  if (preview.costStatus !== 'COMPLETE') return false;
+  if (preview.costStatus !== 'COMPLETE' && preview.costStatus !== 'ESTIMATED') return false;
   if (preview.suggestedGrabPriceExVat == null || preview.finalMinPrice == null) return false;
   if (preview.suggestedGrabPriceExVat < preview.finalMinPrice) return false;
   if (preview.profitMarginPctAfter == null || preview.profitMarginPctAfter < targetMinMarginPct * 100) return false;
   return true;
+}
+
+function isDisplayableEstimatedGrabCartPreview(
+  preview: GrabCartPreviewResult,
+  targetMinMarginPct: number,
+): boolean {
+  if (preview.costStatus !== 'ESTIMATED') return false;
+  if (preview.suggestedGrabPriceExVat == null || preview.finalMinPrice == null) return false;
+  if (preview.suggestedGrabPriceExVat < preview.finalMinPrice) return false;
+  if (preview.profitMarginPctAfter == null || preview.profitMarginPctAfter < targetMinMarginPct * 100) return false;
+  return true;
+}
+
+function isEstimatedFbePreview(preview: GrabCartPreviewResult): boolean {
+  return preview.costWarnings.some((warning) => warning.includes('FBE 费用使用') && warning.includes('默认估算'));
 }
 
 function isCompleteLogisticsProduct(product: {
@@ -320,6 +339,7 @@ function buildCandidateFromPreview(
     buyBoxStatus: row.buyBoxStatus,
     costStatus: preview.costStatus,
     costWarnings: preview.costWarnings,
+    isEstimatedFbe: isEstimatedFbePreview(preview),
     canGrab: elig.canGrab,
     code: elig.code,
     riskLevel: computeRiskLevel(preview.currentSalePriceExVat, preview.suggestedGrabPriceExVat),
@@ -392,6 +412,12 @@ export async function buildGrabCartReadiness(params: { shopId: number; includePr
     const product = row.mappedInventorySku ? productBySku.get(row.mappedInventorySku) : undefined;
     return product?.fbeFee != null;
   }).length;
+  const realFbeReadyCount = fbeFeeReadyCount;
+  const fbeMissingButFallbackCount = notWonRows.filter((row) => {
+    const product = row.mappedInventorySku ? productBySku.get(row.mappedInventorySku) : undefined;
+    return product != null && product.fbeFee == null;
+  }).length;
+  const estimatedFbeCount = fbeMissingButFallbackCount;
   const logisticsReadyCount = notWonRows.filter((row) => {
     const product = row.mappedInventorySku ? productBySku.get(row.mappedInventorySku) : undefined;
     return product != null && isCompleteLogisticsProduct(product);
@@ -405,7 +431,6 @@ export async function buildGrabCartReadiness(params: { shopId: number; includePr
     const product = row.mappedInventorySku ? productBySku.get(row.mappedInventorySku) : undefined;
     return product != null
       && product.purchasePrice != null
-      && product.fbeFee != null
       && isCompleteLogisticsProduct(product)
       && row.commissionRate != null;
   }).length;
@@ -418,7 +443,7 @@ export async function buildGrabCartReadiness(params: { shopId: number; includePr
     OUT_OF_STOCK: Math.max(resellCount - resellWithStockCount, 0),
     ALREADY_WON: Math.max(hasOfferPnkSkuCount - notWonCount, 0),
     MISSING_PRODUCT_MAPPING: Math.max(notWonRows.length - mappedProductCount, 0),
-    MISSING_FBE_FEE: Math.max(mappedProductCount - fbeFeeReadyCount, 0),
+    MISSING_FBE_FEE: 0,
     MISSING_LOGISTICS: Math.max(mappedProductCount - logisticsReadyCount, 0),
     MISSING_COMMISSION: Math.max(notWonRows.length - commissionReadyCount, 0),
     CART_PRICE_TAX_MODE_UNKNOWN: cartPriceTaxModeReady ? 0 : notWonRows.length,
@@ -437,7 +462,7 @@ export async function buildGrabCartReadiness(params: { shopId: number; includePr
       try {
         const preview = await buildGrabCartPreview({ shopId: params.shopId, storeProductId: row.id });
         const code = preview.grabCartEligibility.code;
-        if (preview.grabCartEligibility.canGrab && code === 'OK' && preview.costStatus === 'COMPLETE') {
+        if (preview.grabCartEligibility.canGrab && code === 'OK' && (preview.costStatus === 'COMPLETE' || preview.costStatus === 'ESTIMATED')) {
           previewOkCount += 1;
           continue;
         }
@@ -455,7 +480,6 @@ export async function buildGrabCartReadiness(params: { shopId: number; includePr
   }
   const dataReady = resellWithStockCount > 0
     && mappedProductCount > 0
-    && fbeFeeReadyCount > 0
     && logisticsReadyCount > 0
     && commissionReadyCount > 0
     && costReadyCount > 0;
@@ -474,9 +498,6 @@ export async function buildGrabCartReadiness(params: { shopId: number; includePr
   }
   if (costReadyCount < mappedProductCount || mappedProductCount === 0) {
     nextActions.push(toReadinessAction('FILL_PURCHASE_COST', '补齐 Product.purchasePrice，确保价格保护能计算采购成本。', 'HIGH'));
-  }
-  if (fbeFeeReadyCount < mappedProductCount || mappedProductCount === 0) {
-    nextActions.push(toReadinessAction('FILL_FBE_FEE', '补齐 Product.fbeFee，避免 FBE 费用缺失导致成本不完整。', 'HIGH'));
   }
   if (logisticsReadyCount < mappedProductCount || mappedProductCount === 0) {
     nextActions.push(toReadinessAction('FILL_LOGISTICS_DIMENSIONS', '补齐 Product 长宽高和实际重量，用于计算头程物流成本。', 'MEDIUM'));
@@ -512,6 +533,9 @@ export async function buildGrabCartReadiness(params: { shopId: number; includePr
       notWonCount,
       mappedProductCount,
       fbeFeeReadyCount,
+      realFbeReadyCount,
+      estimatedFbeCount,
+      fbeMissingButFallbackCount,
       logisticsReadyCount,
       commissionReadyCount,
       cartPriceTaxModeReady,
@@ -589,17 +613,8 @@ export async function listGrabCartCandidates(params: {
     take: GRAB_CART_CANDIDATES_SCAN_LIMIT,
   });
 
-  const mappedSkus = [...new Set(dbRows.map((row) => row.mappedInventorySku).filter(Boolean))] as string[];
-  const productsWithFbe = mappedSkus.length > 0
-    ? await prisma.product.findMany({
-        where: { sku: { in: mappedSkus }, fbeFee: { not: null } },
-        select: { sku: true },
-      })
-    : [];
-  const fbeSkuSet = new Set(productsWithFbe.map((p) => p.sku));
   const prefilteredRows = dbRows.filter(
     (row) => row.mappedInventorySku
-      && fbeSkuSet.has(row.mappedInventorySku)
       && Boolean(row.sku?.trim())
       && Boolean(row.pnk?.trim()),
   );
@@ -608,8 +623,9 @@ export async function listGrabCartCandidates(params: {
   for (const row of prefilteredRows) {
     try {
       const preview = await buildGrabCartPreview({ shopId: params.shopId, storeProductId: row.id });
-      if (isQualifiedGrabCartPreview(preview, targetMinMarginPct)) {
-        qualified.push(buildCandidateFromPreview(row, preview, true));
+      const selectable = isQualifiedGrabCartPreview(preview, targetMinMarginPct);
+      if (selectable || isDisplayableEstimatedGrabCartPreview(preview, targetMinMarginPct)) {
+        qualified.push(buildCandidateFromPreview(row, preview, selectable));
       }
     } catch (err) {
       console.error(`[listGrabCartCandidates] preview failed storeProductId=${row.id}:`, err instanceof Error ? err.message : err);

@@ -1908,6 +1908,58 @@ eMAG `product_offer/read` 响应中包含 `vat_id`（整数）和 `vat_rate`（�
 - 禁止发送 `product_offer/save` / `price/execute` / `grab-cart/execute`。
 - 禁止修改 FBE 策略 / `DEFAULT_FBE_CNY`。
 
+## 17. 价格基础资料补齐 Phase 2（全店铺 VAT / 佣金 / FBE 兜底）
+
+### 17.1 VAT backfill
+
+**改动文件**: `backend/src/services/priceDataBackfill.ts`, `backend/src/routes/storeProducts.ts`, `backend/src/services/emagProductNormalizer.ts`
+
+新增 `POST /api/store-products/price-data/vat-backfill`：
+- 默认 `dryRun=true`，仅返回计划，不写库。
+- 支持 `{ shopId, dryRun, limit }` 单店与 `{ allShops: true, dryRun, limitPerShop }` 全店小批量模式。
+- 只处理 active eMAG 店铺；allShops 店铺之间串行执行，店铺间 sleep 800ms。
+- 通过 `product_offer/read` 分页读取，`itemsPerPage=50`，每页失败对 429/5xx/timeout 最多退避重试 2 次。
+- 本地匹配优先级固定为 `emagOfferId -> pnk -> sku/vendorSku`，且始终限定 `shopId`。
+- VAT 统一归一化为小数：`19 -> 0.19`，`20 -> 0.20`。
+- 安全映射集中在 `emagProductNormalizer.ts`：`0 -> 0`、`22004 -> 0.19`。
+- 未知 `vatId` 不猜税率，返回 `unknownVatIds` 与明细状态。
+- `dryRun=false` 才写 `StoreProduct.vatId / vatRate`；不会修改价格、SKU 映射、Product 成本或 FBE。
+
+### 17.2 commission batch-sync allShops
+
+**改动文件**: `backend/src/services/emagCommission.ts`, `backend/src/routes/storeProducts.ts`
+
+`POST /api/store-products/commission/batch-sync` 保留单店能力，并新增 allShops：
+- 单店继续支持 `{ shopId, dryRun, limit }`。
+- 全店新增 `{ allShops: true, dryRun, limitPerShop }`，按 active eMAG 店铺串行执行。
+- 默认 `dryRun=true`，不写 `StoreProduct.commissionRate`。
+- `commissionRate=null` 继续通过 Prisma `nulls: 'first'` 优先处理。
+- 店铺内并发限制 3；单商品失败只计入 failed，不中断整批。
+- 无 `emagOfferId` 的产品进入 skipped 明细，不调用 eMAG。
+- 只调用 `commission/estimate/{emagOfferId}`，不发送 `product_offer/save`，不修改 `salePrice`。
+
+### 17.3 FBE 7 RMB 兜底口径
+
+**改动文件**: `backend/src/services/priceProtection.ts`, `backend/src/services/profitCalculator.ts`, `backend/src/services/orderProfitCalculator.ts`
+
+价格保护层导出统一常量 `DEFAULT_FBE_CNY=7`：
+- `Product.fbeFee` 缺失时，平台产品页毛利预估与订单毛利均按 7 RMB 参与计算；手动价格 preview / 抢车 preview 已有 7 RMB 兜底逻辑，本轮通过共享 warning 文案保持口径一致。
+- 不写 `Product.fbeFee=7`，不把估算值伪装成真实 FBE。
+- preview / profit breakdown 透出 `isEstimatedFbe=true`。
+- 成本状态由 `calculateCostStatus()` 统一降为 `ESTIMATED`，warning 固定说明：`FBE 费用使用 7 RMB 默认估算`。
+
+### 17.4 readiness / 候选池
+
+**改动文件**: `backend/src/services/grabCartBatch.ts`
+
+抢车准备度与候选池对 FBE 缺失的处理改为“可估算 warning”：
+- `Product.fbeFee` 缺失不再写入硬 blocker `MISSING_FBE_FEE`，也不会进入 `topBlockers`。
+- summary 新增 `realFbeReadyCount`、`estimatedFbeCount`、`fbeMissingButFallbackCount`，保留 `fbeFeeReadyCount` 兼容前端。
+- `dataReadyCount` 不再要求 `Product.fbeFee != null`。
+- `listGrabCartCandidates()` 去掉 `productsWithFbe` 预筛，允许其他资料完整但 FBE 缺失的估算候选进入 preview。
+- `isQualifiedGrabCartPreview()` 允许 `costStatus === ESTIMATED` 展示；若店铺策略不允许估算成本执行，则候选仍带 warning 且不可直接执行。
+- 硬 blocker 保留：未映射 Product、采购价缺失、尺寸/重量缺失、commissionRate 缺失、`cartPriceTaxMode=UNKNOWN`、库存不足、非 RESELL、已赢购物车。
+
 ### 12.6 PurchaseOrderItem.productIds（JSON）铁律与坏账修复（2026-04-23）
 
 - **唯一关联桥**：子表无 `productId` 外键，必须通过 `product_ids` 存 `"[123]"` 形式 JSON；列表/详情 Mapper 由此解析出顶层 `items[].productId` 供前端调用 `PUT /api/alibaba/bind`。

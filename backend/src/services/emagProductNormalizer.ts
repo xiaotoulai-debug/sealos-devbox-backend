@@ -189,6 +189,31 @@ export interface NormalizeOptions {
   logOutput?: boolean;
 }
 
+export const KNOWN_VAT_ID_TO_RATE: Record<number, number> = {
+  0: 0,
+  22004: 0.19,
+};
+
+export function normalizeVatId(rawVatId: unknown): number | null {
+  return rawVatId != null && Number.isInteger(Number(rawVatId)) && Number(rawVatId) >= 0
+    ? Number(rawVatId)
+    : null;
+}
+
+export function normalizeVatRate(rawVatRate: unknown): number | null {
+  if (rawVatRate == null || rawVatRate === '') return null;
+  const n = Number(rawVatRate);
+  if (!Number.isFinite(n) || n < 0) return null;
+  return n > 1 ? n / 100 : n;
+}
+
+export function resolveKnownVatRate(vatId: number | null, rawVatRate: unknown): number | null {
+  const normalizedRawRate = normalizeVatRate(rawVatRate);
+  if (normalizedRawRate !== null) return normalizedRawRate;
+  if (vatId !== null && vatId in KNOWN_VAT_ID_TO_RATE) return KNOWN_VAT_ID_TO_RATE[vatId];
+  return null;
+}
+
 /**
  * 标准数据清洗管线入口（单一数据源，无硬编码）
  * 图片: attachments(type===1) > images > main_url > description
@@ -425,33 +450,13 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
   // ─── VAT 解析 ─────────────────────────────────────────────────────
   // vatId: 直接读取 raw.vat_id，保证为整数或 null
   const rawVatId = raw?.vat_id ?? raw?.vatId;
-  const vatId: number | null =
-    rawVatId != null && Number.isInteger(Number(rawVatId)) && Number(rawVatId) >= 0
-      ? Number(rawVatId)
-      : null;
+  const vatId = normalizeVatId(rawVatId);
 
   // vatRate: 归一化为小数（0.19 表示 19%）
   // eMAG API 有时返回整数形式（如 19），有时返回小数（如 0.19）
   // 规则：> 1 则除以 100；[0,1] 则直接使用；其余忽略
-  let vatRate: number | null = null;
   const rawVatRate = raw?.vat_rate ?? raw?.vatRate;
-  if (rawVatRate != null && rawVatRate !== '') {
-    const n = Number(rawVatRate);
-    if (Number.isFinite(n) && n >= 0) {
-      vatRate = n > 1 ? n / 100 : n;
-    }
-  }
-
-  // vatRate 缺失但 vatId 已知 → 使用安全映射补充（仅收录经实测确认的 vatId）
-  // vatId=0    → 0%   免税（eMAG 通用）
-  // vatId=22004 → 19%  罗马尼亚标准税率（shopId=9 实测 96 条全部为此 vatId，vat_rate 字段 eMAG 不下发）
-  const KNOWN_VAT_ID_TO_RATE: Record<number, number> = {
-    0: 0,
-    22004: 0.19,
-  };
-  if (vatRate === null && vatId !== null && vatId in KNOWN_VAT_ID_TO_RATE) {
-    vatRate = KNOWN_VAT_ID_TO_RATE[vatId];
-  }
+  const vatRate = resolveKnownVatRate(vatId, rawVatRate);
 
   if (options?.logOutput !== false) {
     console.log(`[Pipeline Output] SKU: ${skuDisplay}, Image: ${mainImage ?? '(空)'}, Currency: ${currency}, vatId: ${vatId}, vatRate: ${vatRate}`);

@@ -18,6 +18,7 @@ import { loadExchangeRateMap } from './exchangeRateSync';
 import { calcHeadFreightCny } from './freightCalculator';
 import { guessCommissionRate } from '../utils/commissionMatcher';
 import { DEFAULT_COMMISSION_RATE } from '../config/commissionMap';
+import { DEFAULT_FBE_CNY } from './priceProtection';
 
 /**
  * FBE 冷启动兜底（CNY）：当 Product.fbeFee 为 null 时，以此 CNY 金额换算为当地货币兜底。
@@ -25,8 +26,6 @@ import { DEFAULT_COMMISSION_RATE } from '../config/commissionMap';
  * 业务基准：eMAG FBE 仓储费市场均值约 7 CNY（≈ 5 RON / ≈ 1 EUR / ≈ 2 000 HUF），后续
  * 录入真实 fbeFee 后此兜底自动失效。
  */
-const DEFAULT_FBE_CNY = 7;
-
 /** 四舍五入至两位小数 */
 const round2 = (n: number) => Math.round(n * 100) / 100;
 
@@ -170,6 +169,12 @@ function computePendingProfitUpdates(params: {
     const profitCny = localToCny != null ? profitLocal * localToCny : null;
     const marginPct = salePrice > 0 ? (profitLocal / salePrice) * 100 : null;
 
+    const warnings = [
+      ...(isEstimatedFbe ? [`FBE 费用使用 ${DEFAULT_FBE_CNY} RMB 默认估算`] : []),
+      ...(isEstimatedCommission ? ['佣金率来自字典或默认配置'] : []),
+      ...(isMissingVolumeWeight ? ['缺少尺寸或重量，头程成本按 0 估算'] : []),
+    ];
+
     pending.push({
       id: sp.id,
       estimatedProfit: round2(profitLocal),
@@ -188,6 +193,7 @@ function computePendingProfitUpdates(params: {
         fbeFeeCny: round2(fbeFeeCny),
         isEstimatedFbe,
         isMissingVolumeWeight,
+        warnings,
         headFreightCny: round2(headFreightCny ?? 0),
         headFreightLocal: round2(headFreightLocal),
         purchaseCostCny: round2(purchasePriceCny),
