@@ -1,7 +1,7 @@
 import { prisma } from '../lib/prisma';
-import { getEmagCredentials, type EmagCredentials } from './emagClient';
+import { emagApiCall, getEmagCredentials, type EmagCredentials } from './emagClient';
 import { readProductOffers } from './emagProduct';
-import { normalizeEmagProduct, normalizeVatId, resolveKnownVatRate } from './emagProductNormalizer';
+import { normalizeEmagProduct, normalizeVatId, normalizeVatRate, resolveKnownVatRate } from './emagProductNormalizer';
 
 const VAT_BACKFILL_ITEMS_PER_PAGE = 50;
 const VAT_BACKFILL_MAX_LIMIT_PER_SHOP = 500;
@@ -11,6 +11,8 @@ const VAT_BACKFILL_PAGE_DELAY_MS = 350;
 const VAT_BACKFILL_MAX_RETRIES = 2;
 
 const sleep = (ms: number) => new Promise<void>((resolve) => setTimeout(resolve, ms));
+
+type VatReadStatus = 'SUCCESS' | 'FAILED';
 
 export type VatBackfillItemStatus = 'PLANNED' | 'UPDATED' | 'SKIPPED' | 'FAILED';
 
@@ -29,6 +31,8 @@ export type VatBackfillItem = {
 export type VatBackfillShopResult = {
   shopId: number;
   shopName?: string | null;
+  vatReadStatus: VatReadStatus;
+  vatReadError?: string | null;
   scanned: number;
   planned: number;
   updated: number;
@@ -54,6 +58,12 @@ type StoreProductVatMatch = {
   vatRate: unknown;
 };
 
+type VatReadResult = {
+  status: VatReadStatus;
+  rates: Map<number, number>;
+  error?: string | null;
+};
+
 function extractOfferBatch(results: unknown): Record<string, unknown>[] {
   if (Array.isArray(results)) return results.filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item));
   if (results && typeof results === 'object') {
@@ -68,6 +78,63 @@ function numericString(value: unknown): string | null {
   if (value == null || value === '') return null;
   const text = String(value).trim();
   return /^\d+$/.test(text) ? text : null;
+}
+
+function extractVatReadRows(results: unknown): Record<string, unknown>[] {
+  if (Array.isArray(results)) return results.filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item));
+  if (results && typeof results === 'object') {
+    const obj = results as Record<string, unknown>;
+    const items = obj.items ?? obj.results ?? obj.vats ?? obj.vat;
+    if (Array.isArray(items)) return items.filter((item): item is Record<string, unknown> => !!item && typeof item === 'object' && !Array.isArray(item));
+  }
+  return [];
+}
+
+async function fetchVatRatesForCredentials(creds: EmagCredentials): Promise<VatReadResult> {
+  try {
+    const res = await emagApiCall(creds, 'vat', 'read', {}, { timeout: 60_000 });
+    if (res.isError) {
+      return {
+        status: 'FAILED',
+        rates: new Map(),
+        error: res.messages?.join('; ') ?? JSON.stringify(res.errors ?? res).slice(0, 300),
+      };
+    }
+
+    const rates = new Map<number, number>();
+    for (const row of extractVatReadRows(res.results)) {
+      const vatId = normalizeVatId(row.vat_id ?? row.vatId ?? row.id);
+      const vatRate = normalizeVatRate(row.vat_rate ?? row.vatRate ?? row.rate);
+      if (vatId !== null && vatRate !== null) rates.set(vatId, vatRate);
+    }
+
+    return { status: 'SUCCESS', rates, error: null };
+  } catch (err: any) {
+    return {
+      status: 'FAILED',
+      rates: new Map(),
+      error: err?.message ?? String(err),
+    };
+  }
+}
+
+export async function fetchVatRatesForShop(shopId: number): Promise<Map<number, number>> {
+  const creds = await getEmagCredentials(shopId);
+  const result = await fetchVatRatesForCredentials(creds);
+  return result.rates;
+}
+
+function resolveBackfillVatRate(params: {
+  vatId: number | null;
+  rawVatRate: unknown;
+  shopVatRates: Map<number, number>;
+}): number | null {
+  const rawRate = normalizeVatRate(params.rawVatRate);
+  if (rawRate !== null) return rawRate;
+  if (params.vatId !== null && params.shopVatRates.has(params.vatId)) {
+    return params.shopVatRates.get(params.vatId)!;
+  }
+  return resolveKnownVatRate(params.vatId, null);
 }
 
 async function readProductOffersWithRetry(
@@ -125,14 +192,23 @@ async function runVatBackfillForShop(params: {
   shop: { id: number; shopName?: string | null };
   dryRun: boolean;
   limit: number;
+  vatReadCache: Map<number, Promise<VatReadResult>>;
 }): Promise<VatBackfillShopResult> {
   const { shop, dryRun } = params;
   const limit = Math.max(1, Math.min(params.limit, VAT_BACKFILL_MAX_LIMIT_PER_SHOP));
   const creds = await getEmagCredentials(shop.id);
+  let vatReadPromise = params.vatReadCache.get(shop.id);
+  if (!vatReadPromise) {
+    vatReadPromise = fetchVatRatesForCredentials(creds);
+    params.vatReadCache.set(shop.id, vatReadPromise);
+  }
+  const vatRead = await vatReadPromise;
 
   const result: VatBackfillShopResult = {
     shopId: shop.id,
     shopName: shop.shopName ?? null,
+    vatReadStatus: vatRead.status,
+    vatReadError: vatRead.error ?? null,
     scanned: 0,
     planned: 0,
     updated: 0,
@@ -170,7 +246,11 @@ async function runVatBackfillForShop(params: {
         const normalized = normalizeEmagProduct(raw, creds.region, { logOutput: false });
         const rawVatId = raw.vat_id ?? raw.vatId;
         const newVatId = normalizeVatId(rawVatId);
-        const newVatRate = resolveKnownVatRate(newVatId, raw.vat_rate ?? raw.vatRate);
+        const newVatRate = resolveBackfillVatRate({
+          vatId: newVatId,
+          rawVatRate: raw.vat_rate ?? raw.vatRate,
+          shopVatRates: vatRead.rates,
+        });
 
         const match = resolveStoreProductMatch(normalized, raw, storeProducts);
         if (!match) {
@@ -317,11 +397,13 @@ export async function backfillVatData(params: {
   }
 
   const results: VatBackfillShopResult[] = [];
+  const vatReadCache = new Map<number, Promise<VatReadResult>>();
   for (const shop of shops) {
     results.push(await runVatBackfillForShop({
       shop,
       dryRun,
       limit: allShops ? limitPerShop : limit,
+      vatReadCache,
     }));
     if (allShops) await sleep(VAT_BACKFILL_SHOP_DELAY_MS);
   }

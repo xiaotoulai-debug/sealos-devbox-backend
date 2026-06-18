@@ -1921,7 +1921,9 @@ eMAG `product_offer/read` 响应中包含 `vat_id`（整数）和 `vat_rate`（�
 - 通过 `product_offer/read` 分页读取，`itemsPerPage=50`，每页失败对 429/5xx/timeout 最多退避重试 2 次。
 - 本地匹配优先级固定为 `emagOfferId -> pnk -> sku/vendorSku`，且始终限定 `shopId`。
 - VAT 统一归一化为小数：`19 -> 0.19`，`20 -> 0.20`。
-- 安全映射集中在 `emagProductNormalizer.ts`：`0 -> 0`、`22004 -> 0.19`。
+- VAT rate 优先级：`product_offer/read` 直接返回的 `vat_rate` > 当前店铺 `vat/read` 返回的 `vat_id -> vat_rate` > 极少数静态安全兜底。
+- `vat/read` 按店铺执行并在单次 backfill 请求内缓存，响应返回 `vatReadStatus / vatReadError`，便于审计映射来源。
+- 安全静态兜底集中在 `emagProductNormalizer.ts`，当前仅保留 `0 -> 0`；禁止使用全局固定 `22004 -> 0.19/0.20` 覆盖店铺级 `vat/read`。
 - 未知 `vatId` 不猜税率，返回 `unknownVatIds` 与明细状态。
 - `dryRun=false` 才写 `StoreProduct.vatId / vatRate`；不会修改价格、SKU 映射、Product 成本或 FBE。
 

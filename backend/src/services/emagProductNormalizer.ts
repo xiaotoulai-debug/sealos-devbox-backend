@@ -191,7 +191,6 @@ export interface NormalizeOptions {
 
 export const KNOWN_VAT_ID_TO_RATE: Record<number, number> = {
   0: 0,
-  22004: 0.19,
 };
 
 export function normalizeVatId(rawVatId: unknown): number | null {
