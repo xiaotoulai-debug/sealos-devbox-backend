@@ -339,6 +339,7 @@ export async function batchSyncCommissionRate(params: {
   const CONCURRENCY = 3;
 
   // 查询：有 emagOfferId 的产品，commissionRate 为 null 的排前面
+  // PostgreSQL 默认 ASC 是 nulls last，必须显式指定 nulls: 'first'
   const candidates = await prisma.storeProduct.findMany({
     where: {
       shopId,
@@ -352,8 +353,7 @@ export async function batchSyncCommissionRate(params: {
       commissionRate: true,
     },
     orderBy: [
-      // null 排前：用 asc nulls first 等价逻辑——commissionRate 为 null 时 isNull 标记为 0，有值为 1
-      { commissionRate: 'asc' },
+      { commissionRate: { sort: 'asc', nulls: 'first' } },
     ],
     take: limit,
   });

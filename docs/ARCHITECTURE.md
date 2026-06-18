@@ -1856,6 +1856,58 @@ WHERE product_id = :productId
 
 其中 `fenxiaoChannel=kuajing` 对齐 1688 官方 fastCreateOrder 的下游平台枚举“跨境-kuajing”。
 
+---
+
+## 16. 价格基础资料自动补齐（Phase 1，2026-06-17）
+
+### 16.1 VAT 同步入库管线
+
+**改动文件**: `emagProductNormalizer.ts`, `storeProductSync.ts`
+
+eMAG `product_offer/read` 响应中包含 `vat_id`（整数）和 `vat_rate`（可能为整数 19 或小数 0.19）。
+
+- `NormalizedProduct` 接口新增 `vatId: number | null` 和 `vatRate: number | null`。
+- `normalizeProductOffer` 中提取 `raw.vat_id` / `raw.vatId` 得到整数 `vatId`。
+- `raw.vat_rate` 归一化规则：`> 1` 时除以 100（19 → 0.19），`[0,1]` 直接保留，无效值置 null。
+- `vatId === 0` 时，`vatRate` 安全补 `0`（零税率确定）；其他 vat_id 无已知映射则保持 null，不猜测。
+- `storeProductSync` upsert data 使用展开运算符：**仅当本次 eMAG 返回非 null 值时才写入**，防止以 null 覆盖旧有效值。
+
+### 16.2 新店铺价格策略安全初始化
+
+**改动文件**: `routes/shop.ts`
+
+`POST /api/shops` 创建 eMAG 店铺后，立即 `upsert` `StorePriceStrategyConfig`：
+- `cartPriceTaxMode = 'UNKNOWN'`（禁止默认 EX_VAT / INC_VAT）
+- `grabCartAllowEstimatedCost = false`
+- `manualPriceAllowEstimatedCost = true`
+- 使用 `upsert` 保证幂等，已有配置不会被覆盖（`update: {}`）。
+- `readiness` API 继续提示 `CART_PRICE_TAX_MODE_UNKNOWN` 直到老板手动配置。
+
+### 16.3 批量佣金同步能力
+
+**改动文件**: `emagCommission.ts`, `routes/storeProducts.ts`
+
+新增 `POST /api/store-products/commission/batch-sync`（**注意：必须注册在 `/:id` 系列路由之前**）。
+
+请求体：`{ shopId: number, dryRun?: boolean, limit?: number }`
+
+核心行为：
+- 只处理 `shopId` 指定店铺、有 `emagOfferId`、未归档的 `StoreProduct`。
+- `commissionRate` 为 null 的产品优先排前（Prisma `orderBy: { commissionRate: 'asc' }`）。
+- 并发限制 3（分批 splice 处理），单个失败不中断整体。
+- `dryRun=true`（默认）：仅调用 `commission/estimate` 取值，返回 `PLANNED` 状态，不写库。
+- `dryRun=false`：调用成功后写入 `StoreProduct.commissionRate`，返回 `SUCCESS`。
+- 返回字段：`totalScanned / planned / success / skipped / failed / items[]`。
+- 禁止调用 `product_offer/save`，禁止修改价格。
+
+### 16.4 安全红线
+
+本 Phase 所有改动均遵守以下安全红线：
+- 禁止修改数据库结构 / schema.prisma / 执行 migration。
+- 禁止写 `Product.fbeFee` / `Product.purchasePrice`。
+- 禁止发送 `product_offer/save` / `price/execute` / `grab-cart/execute`。
+- 禁止修改 FBE 策略 / `DEFAULT_FBE_CNY`。
+
 ### 12.6 PurchaseOrderItem.productIds（JSON）铁律与坏账修复（2026-04-23）
 
 - **唯一关联桥**：子表无 `productId` 外键，必须通过 `product_ids` 存 `"[123]"` 形式 JSON；列表/详情 Mapper 由此解析出顶层 `items[].productId` 供前端调用 `PUT /api/alibaba/bind`。

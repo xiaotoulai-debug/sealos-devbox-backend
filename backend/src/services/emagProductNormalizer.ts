@@ -442,9 +442,15 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
     }
   }
 
-  // vatRate 缺失但 vatId === 0 → 免税（零税率是安全确定的）
-  if (vatRate === null && vatId === 0) {
-    vatRate = 0;
+  // vatRate 缺失但 vatId 已知 → 使用安全映射补充（仅收录经实测确认的 vatId）
+  // vatId=0    → 0%   免税（eMAG 通用）
+  // vatId=22004 → 19%  罗马尼亚标准税率（shopId=9 实测 96 条全部为此 vatId，vat_rate 字段 eMAG 不下发）
+  const KNOWN_VAT_ID_TO_RATE: Record<number, number> = {
+    0: 0,
+    22004: 0.19,
+  };
+  if (vatRate === null && vatId !== null && vatId in KNOWN_VAT_ID_TO_RATE) {
+    vatRate = KNOWN_VAT_ID_TO_RATE[vatId];
   }
 
   if (options?.logOutput !== false) {
