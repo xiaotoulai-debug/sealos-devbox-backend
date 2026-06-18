@@ -1919,6 +1919,7 @@ eMAG `product_offer/read` 响应中包含 `vat_id`（整数）和 `vat_rate`（�
 - 支持 `{ shopId, dryRun, limit }` 单店与 `{ allShops: true, dryRun, limitPerShop }` 全店小批量模式。
 - 只处理 active eMAG 店铺；allShops 店铺之间串行执行，店铺间 sleep 800ms。
 - 通过 `product_offer/read` 分页读取，`itemsPerPage=50`，每页失败对 429/5xx/timeout 最多退避重试 2 次。
+- VAT backfill 单店扫描上限尊重请求 `limit`（安全上限 5000），不再固定截断到 500；返回 `pagesRead / reachedLimit` 便于确认是否读取超过第 10 页。
 - 本地匹配优先级固定为 `emagOfferId -> pnk -> sku/vendorSku`，且始终限定 `shopId`。
 - VAT 统一归一化为小数：`19 -> 0.19`，`20 -> 0.20`。
 - VAT rate 优先级：`product_offer/read` 直接返回的 `vat_rate` > 当前店铺 `vat/read` 返回的 `vat_id -> vat_rate` > 极少数静态安全兜底。

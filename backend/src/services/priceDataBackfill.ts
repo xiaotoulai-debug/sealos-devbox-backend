@@ -4,7 +4,7 @@ import { readProductOffers } from './emagProduct';
 import { normalizeEmagProduct, normalizeVatId, normalizeVatRate, resolveKnownVatRate } from './emagProductNormalizer';
 
 const VAT_BACKFILL_ITEMS_PER_PAGE = 50;
-const VAT_BACKFILL_MAX_LIMIT_PER_SHOP = 500;
+const VAT_BACKFILL_MAX_LIMIT_PER_SHOP = 5_000;
 const VAT_BACKFILL_PAGE_TIMEOUT_MS = 180_000;
 const VAT_BACKFILL_SHOP_DELAY_MS = 800;
 const VAT_BACKFILL_PAGE_DELAY_MS = 350;
@@ -34,6 +34,8 @@ export type VatBackfillShopResult = {
   vatReadStatus: VatReadStatus;
   vatReadError?: string | null;
   scanned: number;
+  pagesRead: number;
+  reachedLimit: boolean;
   planned: number;
   updated: number;
   skipped: number;
@@ -210,6 +212,8 @@ async function runVatBackfillForShop(params: {
     vatReadStatus: vatRead.status,
     vatReadError: vatRead.error ?? null,
     scanned: 0,
+    pagesRead: 0,
+    reachedLimit: false,
     planned: 0,
     updated: 0,
     skipped: 0,
@@ -237,6 +241,7 @@ async function runVatBackfillForShop(params: {
       currentPage: page,
       itemsPerPage: Math.min(VAT_BACKFILL_ITEMS_PER_PAGE, limit - result.scanned),
     });
+    result.pagesRead++;
     if (batch.length === 0) break;
 
     for (const raw of batch) {
@@ -361,6 +366,10 @@ async function runVatBackfillForShop(params: {
       }
     }
 
+    if (result.scanned >= limit) {
+      result.reachedLimit = true;
+      break;
+    }
     if (batch.length < VAT_BACKFILL_ITEMS_PER_PAGE) break;
     page++;
     await sleep(VAT_BACKFILL_PAGE_DELAY_MS);
