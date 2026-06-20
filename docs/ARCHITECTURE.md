@@ -524,17 +524,20 @@ Phase 1-A 只提供后端基础能力和 preview，不开放真实 execute，不
 
 Phase 1-B1 新增 execute 代码框架；Phase B-7 将源码硬编码开关升级为 **环境变量 + 三层白名单**，默认仍禁止真实改价。
 
-**安全开关（Phase B-7）：**
+**安全开关（Phase B-7；2026-06-20 手动改价正式开放 / 抢车独立关闭）：**
 
 - 统一闸门：`services/emagPriceWriteGuard.ts` → `canExecuteEmagPriceWrite({ shopId, storeProductId, mode })`。
 - 环境变量（**默认 fail-closed，缺失/空值/拼写错误均禁止写价**）：
   - `EMAG_PRICE_WRITE_ENABLED` — 必须为 `true` 才允许真实写价（默认 false）。
   - `EMAG_PRICE_WRITE_ALLOWED_SHOP_IDS` — 逗号分隔 shopId 白名单。
-  - `EMAG_PRICE_WRITE_ALLOWED_STORE_PRODUCT_IDS` — 逗号分隔 storeProductId 白名单。
-  - `EMAG_PRICE_WRITE_ALLOWED_MODES` — 逗号分隔模式白名单，如 `GRAB_CART_MANUAL,MANUAL_PRICE_CHANGE`。
-- **仅当** `ENABLED=true` 且 shopId / storeProductId / mode **三者均命中白名单**时，`updateProductOfferPrice()` 才会调用 `product_offer/save`。
+  - `EMAG_PRICE_WRITE_ALLOWED_STORE_PRODUCT_IDS` — 逗号分隔 storeProductId 白名单；当 `EMAG_PRICE_WRITE_MANUAL_PRICE_ALL_PRODUCTS=true` 且 mode=`MANUAL_PRICE_CHANGE` 时可留空，表示店内全部符合业务校验的 own offer 均可写价。
+  - `EMAG_PRICE_WRITE_ALLOWED_MODES` — 逗号分隔模式白名单，如 `MANUAL_PRICE_CHANGE`。
+  - `EMAG_PRICE_WRITE_MANUAL_PRICE_ALL_PRODUCTS` — 为 `true` 时，`MANUAL_PRICE_CHANGE` 不再要求 storeProductId 单商品白名单；为 false/缺失时沿用旧逻辑。
+  - `EMAG_GRAB_CART_WRITE_ENABLED` — 必须为 `true` 才允许 `GRAB_CART_MANUAL` 真实写价；当前正式环境固定 `false`，即使 modes 误含 `GRAB_CART_MANUAL` 也会被 `GRAB_CART_DISABLED` 拒绝。
+- **手动改价（MANUAL_PRICE_CHANGE）**：`ENABLED=true` + shopId 命中 + mode 命中；若 `MANUAL_PRICE_ALL_PRODUCTS=true` 则跳过 storeProductId 白名单，否则仍需 storeProductId 命中。通过后仍会走 own offer / 可售 / 保护价 / 成本 / 权限 / readBack 等业务校验。
+- **抢购物车（GRAB_CART_MANUAL）**：除上述通用开关外，还必须 `EMAG_GRAB_CART_WRITE_ENABLED=true`；当前未开放时一律 `GRAB_CART_DISABLED`，preview 可保留，execute 禁止真实写价。
 - 不暴露给前端，**不允许** body/query/header 打开；闸门只读 `process.env`。
-- 开关关闭时于 `getEmagCredentials / emagApiCall` 之前直接返回 `DRY_RUN_ONLY`；execute 响应含 `writeGuardReasonCode`（`DISABLED` / `SHOP_NOT_ALLOWED` / `STORE_PRODUCT_NOT_ALLOWED` / `MODE_NOT_ALLOWED`），不泄露完整白名单配置。
+- 开关关闭时于 `getEmagCredentials / emagApiCall` 之前直接返回 `DRY_RUN_ONLY`；execute 响应含 `writeGuardReasonCode`（`DISABLED` / `SHOP_NOT_ALLOWED` / `STORE_PRODUCT_NOT_ALLOWED` / `MODE_NOT_ALLOWED` / `GRAB_CART_DISABLED`），不泄露完整白名单配置。
 
 **新增服务：**
 
@@ -599,9 +602,9 @@ Phase 1-B2.1 在 `executePriceChange` 真实 save 成功后增加 readBack 对�
 - 远端仍旧价、空值或读取失败：日志保持 `PENDING_VERIFY`，刷新 `emagResponse.readBack` 和 `errorMessage`，不更新本地价格、不重算利润、不重发 save。
 - 远端价格与目标价冲突同样保持 `PENDING_VERIFY`，由人工决定是否重新发起新的改价流程。
 
-### 4.5.2.9 eMAG 真实写价安全闸门（Phase B-7，2026-06-16）
+### 4.5.2.9 eMAG 真实写价安全闸门（Phase B-7，2026-06-16；2026-06-20 正式开放手动改价）
 
-Phase B-7 补齐 B-6c 评审阻塞项：env 开关 + 白名单 + grab-cart readBack。
+Phase B-7 补齐 B-6c 评审阻塞项：env 开关 + 白名单 + grab-cart readBack。2026-06-20 起正式开放全部 active eMAG 店铺的 `MANUAL_PRICE_CHANGE`，抢购物车 `GRAB_CART_MANUAL` 继续关闭。
 
 **闸门 reasonCode：**
 
@@ -609,20 +612,34 @@ Phase B-7 补齐 B-6c 评审阻塞项：env 开关 + 白名单 + grab-cart readB
 |------------|------|
 | DISABLED | `EMAG_PRICE_WRITE_ENABLED` 不为 true |
 | SHOP_NOT_ALLOWED | shopId 未命中白名单或白名单为空 |
-| STORE_PRODUCT_NOT_ALLOWED | storeProductId 未命中白名单或白名单为空 |
+| STORE_PRODUCT_NOT_ALLOWED | storeProductId 未命中白名单或白名单为空（`MANUAL_PRICE_ALL_PRODUCTS=true` 的手动改价除外） |
 | MODE_NOT_ALLOWED | mode 未命中白名单或白名单为空 |
+| GRAB_CART_DISABLED | `GRAB_CART_MANUAL` 且 `EMAG_GRAB_CART_WRITE_ENABLED` 不为 true |
 | ALLOWED | 已通过闸门（仍会走 preview / 保护价 / 权限校验） |
 
-**灰度示例（仅文档，生产需老板授权后配置）：**
+**正式开放示例（手动改价全开 / 抢车关闭，仅文档）：**
 
 ```text
 EMAG_PRICE_WRITE_ENABLED=true
-EMAG_PRICE_WRITE_ALLOWED_SHOP_IDS=9
-EMAG_PRICE_WRITE_ALLOWED_STORE_PRODUCT_IDS=15636
-EMAG_PRICE_WRITE_ALLOWED_MODES=GRAB_CART_MANUAL
+EMAG_PRICE_WRITE_ALLOWED_SHOP_IDS=1,2,3,5,6,7,9,10,11,12
+EMAG_PRICE_WRITE_ALLOWED_MODES=MANUAL_PRICE_CHANGE
+EMAG_PRICE_WRITE_MANUAL_PRICE_ALL_PRODUCTS=true
+EMAG_GRAB_CART_WRITE_ENABLED=false
+EMAG_PRICE_WRITE_ALLOWED_STORE_PRODUCT_IDS=
 ```
 
-**安全边界：** 未配置或未全开时，任何 execute 均 `SKIPPED` / `DRY_RUN_ONLY`，不发送 `product_offer/save`，不触发 readBack。
+**单商品灰度示例（回退 / 局部验证）：**
+
+```text
+EMAG_PRICE_WRITE_ENABLED=true
+EMAG_PRICE_WRITE_ALLOWED_SHOP_IDS=1
+EMAG_PRICE_WRITE_ALLOWED_STORE_PRODUCT_IDS=2564
+EMAG_PRICE_WRITE_ALLOWED_MODES=MANUAL_PRICE_CHANGE
+EMAG_PRICE_WRITE_MANUAL_PRICE_ALL_PRODUCTS=false
+EMAG_GRAB_CART_WRITE_ENABLED=false
+```
+
+**安全边界：** 未配置或未全开时，任何 execute 均 `SKIPPED` / `DRY_RUN_ONLY`，不发送 `product_offer/save`，不触发 readBack。批量真实改价 / 批量真实抢车仍禁止；闸门开放不绕过 linkType、成本、保护价等业务校验。
 
 ### 4.5.2.10 批量抢车后端 MVP（Phase B-13a，2026-06-17）
 

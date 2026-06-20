@@ -10,6 +10,7 @@ export type EmagPriceWriteGuardReasonCode =
   | 'SHOP_NOT_ALLOWED'
   | 'STORE_PRODUCT_NOT_ALLOWED'
   | 'MODE_NOT_ALLOWED'
+  | 'GRAB_CART_DISABLED'
   | 'ALLOWED';
 
 export type EmagPriceWriteGuardResult = {
@@ -51,6 +52,15 @@ function parseModeList(value: string | undefined): Set<EmagPriceWriteMode> {
   return modes;
 }
 
+function shouldRequireStoreProductWhitelist(params: {
+  mode: EmagPriceWriteMode;
+  manualPriceAllProducts: boolean;
+}): boolean {
+  if (params.mode === 'GRAB_CART_MANUAL') return true;
+  if (params.mode === 'MANUAL_PRICE_CHANGE' && params.manualPriceAllProducts) return false;
+  return true;
+}
+
 export function canExecuteEmagPriceWrite(params: {
   shopId: number;
   storeProductId: number;
@@ -64,6 +74,14 @@ export function canExecuteEmagPriceWrite(params: {
     };
   }
 
+  if (params.mode === 'GRAB_CART_MANUAL' && !parseEnvBoolean(process.env.EMAG_GRAB_CART_WRITE_ENABLED)) {
+    return {
+      allowed: false,
+      reasonCode: 'GRAB_CART_DISABLED',
+      message: '抢购物车真实写价当前未开放',
+    };
+  }
+
   const allowedShopIds = parsePositiveIntegerList(process.env.EMAG_PRICE_WRITE_ALLOWED_SHOP_IDS);
   if (allowedShopIds.size === 0 || !allowedShopIds.has(params.shopId)) {
     return {
@@ -73,13 +91,21 @@ export function canExecuteEmagPriceWrite(params: {
     };
   }
 
-  const allowedStoreProductIds = parsePositiveIntegerList(process.env.EMAG_PRICE_WRITE_ALLOWED_STORE_PRODUCT_IDS);
-  if (allowedStoreProductIds.size === 0 || !allowedStoreProductIds.has(params.storeProductId)) {
-    return {
-      allowed: false,
-      reasonCode: 'STORE_PRODUCT_NOT_ALLOWED',
-      message: '当前平台产品不在真实写价白名单内',
-    };
+  const manualPriceAllProducts = parseEnvBoolean(process.env.EMAG_PRICE_WRITE_MANUAL_PRICE_ALL_PRODUCTS);
+  if (
+    shouldRequireStoreProductWhitelist({
+      mode: params.mode,
+      manualPriceAllProducts,
+    })
+  ) {
+    const allowedStoreProductIds = parsePositiveIntegerList(process.env.EMAG_PRICE_WRITE_ALLOWED_STORE_PRODUCT_IDS);
+    if (allowedStoreProductIds.size === 0 || !allowedStoreProductIds.has(params.storeProductId)) {
+      return {
+        allowed: false,
+        reasonCode: 'STORE_PRODUCT_NOT_ALLOWED',
+        message: '当前平台产品不在真实写价白名单内',
+      };
+    }
   }
 
   const allowedModes = parseModeList(process.env.EMAG_PRICE_WRITE_ALLOWED_MODES);
