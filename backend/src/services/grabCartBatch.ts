@@ -8,6 +8,7 @@ import {
   type PriceExecuteResult,
 } from './emagPrice';
 import { PRICE_ERROR_CODES } from './priceErrors';
+import { resolveFbeFee } from './fbeFeeResolver';
 
 export const GRAB_CART_BATCH_MAX_ITEMS = 5;
 export const GRAB_CART_CANDIDATES_MAX_PAGE_SIZE = 100;
@@ -32,7 +33,10 @@ export type GrabCartCandidateItem = {
   buyBoxStatus: string | null;
   costStatus: GrabCartPreviewResult['costStatus'];
   costWarnings: string[];
+  fbeFeeCny: number | null;
+  fbeSource: string | null;
   isEstimatedFbe: boolean;
+  fbeBlockReason: string | null;
   canGrab: boolean;
   code: string;
   riskLevel: GrabCartCandidateRiskLevel;
@@ -242,7 +246,8 @@ function isQualifiedGrabCartPreview(
 ): boolean {
   const elig = preview.grabCartEligibility;
   if (!elig.canGrab || elig.code !== 'OK') return false;
-  if (preview.costStatus !== 'COMPLETE' && preview.costStatus !== 'ESTIMATED') return false;
+  if (preview.costStatus !== 'COMPLETE') return false;
+  if (preview.isEstimatedFbe) return false;
   if (preview.suggestedGrabPriceExVat == null || preview.finalMinPrice == null) return false;
   if (preview.suggestedGrabPriceExVat < preview.finalMinPrice) return false;
   if (preview.profitMarginPctAfter == null || preview.profitMarginPctAfter < targetMinMarginPct * 100) return false;
@@ -261,7 +266,15 @@ function isDisplayableEstimatedGrabCartPreview(
 }
 
 function isEstimatedFbePreview(preview: GrabCartPreviewResult): boolean {
-  return preview.costWarnings.some((warning) => warning.includes('FBE 费用使用') && warning.includes('默认估算'));
+  return preview.isEstimatedFbe === true;
+}
+
+function resolveFbeBlockReason(preview: GrabCartPreviewResult): string | null {
+  if (!preview.isEstimatedFbe) return null;
+  if (preview.grabCartEligibility.code === PRICE_ERROR_CODES.MISSING_FBE_FEE) {
+    return preview.grabCartEligibility.message;
+  }
+  return 'FBE 费用未维护或为默认估算，抢车候选要求真实 FBE';
 }
 
 function isCompleteLogisticsProduct(product: {
@@ -297,6 +310,7 @@ function mapPreviewCodeToReadinessBlocker(code: string): GrabCartReadinessBlocke
   if (code === PRICE_ERROR_CODES.MISSING_LOGISTICS) return 'MISSING_LOGISTICS';
   if (code === PRICE_ERROR_CODES.MISSING_COMMISSION) return 'MISSING_COMMISSION';
   if (code === PRICE_ERROR_CODES.MISSING_COST) return 'MISSING_COST';
+  if (code === PRICE_ERROR_CODES.MISSING_FBE_FEE) return 'MISSING_FBE_FEE';
   if (code === 'OK') return null;
   return 'OTHER';
 }
@@ -343,7 +357,10 @@ function buildCandidateFromPreview(
     buyBoxStatus: row.buyBoxStatus,
     costStatus: preview.costStatus,
     costWarnings: preview.costWarnings,
+    fbeFeeCny: preview.fbeFeeCny,
+    fbeSource: preview.fbeSource,
     isEstimatedFbe: isEstimatedFbePreview(preview),
+    fbeBlockReason: resolveFbeBlockReason(preview),
     canGrab: elig.canGrab,
     code: elig.code,
     riskLevel: computeRiskLevel(preview.currentSalePriceExVat, preview.suggestedGrabPriceExVat),
@@ -396,6 +413,11 @@ export async function buildGrabCartReadiness(params: { shopId: number; includePr
         id: true,
         mappedInventorySku: true,
         commissionRate: true,
+        pnk: true,
+        fbeFeeOverrideCny: true,
+        fbeFeeOverrideSource: true,
+        fbeFeeOverrideUpdatedAt: true,
+        fbeFeeOverrideNote: true,
       },
       orderBy: { id: 'asc' },
       take: GRAB_CART_CANDIDATES_SCAN_LIMIT,
@@ -406,7 +428,19 @@ export async function buildGrabCartReadiness(params: { shopId: number; includePr
   const products = mappedSkus.length > 0
     ? await prisma.product.findMany({
         where: { sku: { in: mappedSkus } },
-        select: { sku: true, purchasePrice: true, fbeFee: true, length: true, width: true, height: true, actualWeight: true },
+        select: {
+          sku: true,
+          pnk: true,
+          purchasePrice: true,
+          fbeFee: true,
+          fbeFeeSource: true,
+          fbeFeeUpdatedAt: true,
+          fbeFeeNote: true,
+          length: true,
+          width: true,
+          height: true,
+          actualWeight: true,
+        },
       })
     : [];
   const productBySku = new Map(products.map((product) => [product.sku, product]));
@@ -414,12 +448,14 @@ export async function buildGrabCartReadiness(params: { shopId: number; includePr
   const mappedProductCount = notWonRows.filter((row) => row.mappedInventorySku && productBySku.has(row.mappedInventorySku)).length;
   const fbeFeeReadyCount = notWonRows.filter((row) => {
     const product = row.mappedInventorySku ? productBySku.get(row.mappedInventorySku) : undefined;
-    return product?.fbeFee != null;
+    const resolved = resolveFbeFee({ storeProduct: row, product });
+    return !resolved.isEstimatedFbe;
   }).length;
   const realFbeReadyCount = fbeFeeReadyCount;
   const fbeMissingButFallbackCount = notWonRows.filter((row) => {
     const product = row.mappedInventorySku ? productBySku.get(row.mappedInventorySku) : undefined;
-    return product != null && product.fbeFee == null;
+    const resolved = resolveFbeFee({ storeProduct: row, product });
+    return resolved.isEstimatedFbe;
   }).length;
   const estimatedFbeCount = fbeMissingButFallbackCount;
   const logisticsReadyCount = notWonRows.filter((row) => {
@@ -447,7 +483,7 @@ export async function buildGrabCartReadiness(params: { shopId: number; includePr
     OUT_OF_STOCK: Math.max(resellCount - resellWithStockCount, 0),
     ALREADY_WON: Math.max(hasOfferPnkSkuCount - notWonCount, 0),
     MISSING_PRODUCT_MAPPING: Math.max(notWonRows.length - mappedProductCount, 0),
-    MISSING_FBE_FEE: 0,
+    MISSING_FBE_FEE: Math.max(mappedProductCount - fbeFeeReadyCount, 0),
     MISSING_LOGISTICS: Math.max(mappedProductCount - logisticsReadyCount, 0),
     MISSING_COMMISSION: Math.max(notWonRows.length - commissionReadyCount, 0),
     CART_PRICE_TAX_MODE_UNKNOWN: cartPriceTaxModeReady ? 0 : notWonRows.length,
@@ -466,7 +502,7 @@ export async function buildGrabCartReadiness(params: { shopId: number; includePr
       try {
         const preview = await buildGrabCartPreview({ shopId: params.shopId, storeProductId: row.id });
         const code = preview.grabCartEligibility.code;
-        if (preview.grabCartEligibility.canGrab && code === 'OK' && (preview.costStatus === 'COMPLETE' || preview.costStatus === 'ESTIMATED')) {
+        if (preview.grabCartEligibility.canGrab && code === 'OK' && preview.costStatus === 'COMPLETE' && !preview.isEstimatedFbe) {
           previewOkCount += 1;
           continue;
         }

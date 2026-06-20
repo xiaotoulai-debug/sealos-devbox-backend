@@ -79,6 +79,7 @@ backend/
 │   │   ├── analytics.ts       # 运营分析接口（订单日报）
 │   │   ├── translate.ts       # 翻译代理（MyMemory API 转发，ro→zh 等）
 │   │   ├── fbeShipment.ts     # FBE 发货单管理（在途库存闭环；GET /counts 须在 /:id 前；PUT /:id 严格校验 items）
+│   │   ├── fbeFees.ts         # FBE 真实费用管理 V1（summary/records/batch preview|execute）
 │   │   ├── inventory.ts       # 进销存核心（POST batch-adjust / PUT purchase-orders receive / GET logs）
 │   │   ├── warehouse.ts       # 仓库管理（GET/POST /api/warehouses，PUT /:id — 含 skuCount 聚合、名称唯一性校验）
 │   │   ├── alibaba.ts         # 1688 OAuth、规格解析、下单、子单同步
@@ -92,6 +93,8 @@ backend/
 │   │   ├── emagPriceWriteGuard.ts # eMAG 真实写价 env 闸门与白名单（fail-closed，只读 process.env）
 │   │   ├── priceAdjustmentLogs.ts # 调价日志写入、脱敏与状态流转
 │   │   ├── priceProtection.ts # 最低保护价、成本完整度、默认价格策略
+│   │   ├── fbeFeeResolver.ts  # 统一 FBE 优先级解析（店铺覆盖 > SKU 默认 > 7 RMB fallback）
+│   │   ├── fbeFeeManagement.ts # FBE 概览/列表/批量维护/变更日志/利润重算触发
 │   │   ├── priceErrors.ts     # 价格模块统一错误码与文案
 │   │   ├── emagProductNormalizer.ts  # 唯一 Normalizer：解析、图片提纯、输出统一结构
 │   │   ├── storeProductSync.ts       # 两段式同步编排（补全 mainImage）
@@ -740,39 +743,66 @@ Phase B-4 新增 eMAG `GET /api/v1/commission/estimate/{extId}` 只读调用能�
 - 同步成功后 `isEstimatedCommission=false`，可消除「佣金率来自字典或默认配置」warning。
 - FBE 估算仍可能阻断抢车 preview，留 Phase B-5。
 
-### 4.5.2.8 Product.fbeFee 统一 CNY 口径（Phase B-5b，2026-06-16）
+### 4.5.2.8 Product.fbeFee 统一 CNY 口径（Phase B-5b，2026-06-16；2026-06-20 FBE 真实费用管理 V1 升级）
 
-Phase B-5a.1 审计确认：`Product.fbeFee` 业务原意为 **CNY**，但非空时部分代码曾直接当作站点币种（RON/EUR/HUF）使用，与 `DEFAULT_FBE_CNY=7` 兜底路径口径分裂。Phase B-5b 统一修复。
+Phase B-5a.1 审计确认：`Product.fbeFee` 业务原意为 **CNY**，但非空时部分代码曾直接当作站点币种（RON/EUR/HUF）使用，与 `DEFAULT_FBE_CNY=7` 兜底路径口径分裂。Phase B-5b 统一修复；2026-06-20 V1 引入店铺覆盖与统一解析器。
 
 **字段定义：**
 
-- `products.fbe_fee`：FBE 履约费，**单位 CNY**，与 `purchase_price`、`freight_cost` 一致。
-- `DEFAULT_FBE_CNY = 7`：仅当 `fbe_fee IS NULL` 时的缺省估算值（≈5 RON / ≈1 EUR / ≈2000 HUF），`isEstimatedFbe=true`。
+- `products.fbe_fee`：SKU 默认 FBE 履约费，**单位 CNY**（历史数据保留，迁移后补 `fbe_fee_source=LEGACY_PRODUCT_DEFAULT`）。
+- `products.fbe_fee_source / fbe_fee_updated_at / fbe_fee_note`：SKU 默认来源、更新时间、备注。
+- `store_products.fbe_fee_override_cny / fbe_fee_override_source / fbe_fee_override_updated_at / fbe_fee_override_note`：店铺/站点专用 FBE 覆盖。
+- `fbe_fee_change_logs`：FBE 变更审计（scope=`PRODUCT_DEFAULT|STORE_PRODUCT_OVERRIDE`，source=`MANUAL|IMPORT|LEGACY_PRODUCT_DEFAULT`）。
+- `DEFAULT_FBE_CNY = 7`：仅当店铺覆盖与 SKU 默认均缺失时的缺省估算，`isEstimatedFbe=true`。
+
+**统一优先级（`services/fbeFeeResolver.ts` → `resolveFbeFee()`，profitCalculator / emagPrice / grabCartBatch 共用）：**
+
+```text
+1. StoreProduct.fbeFeeOverrideCny（店铺覆盖，isEstimatedFbe=false）
+2. Product.fbeFee（SKU 默认，isEstimatedFbe=false）
+3. DEFAULT_FBE_CNY=7（fallback，isEstimatedFbe=true）
+```
 
 **换算规则（全链路统一）：**
 
 ```text
-fbeFeeCny = Product.fbeFee != null ? Number(Product.fbeFee) : DEFAULT_FBE_CNY
-fbeLocal  = fbeFeeCny * exchange_rates(CNY→站点币种)
+resolved = resolveFbeFee({ storeProduct, product })
+fbeLocal = resolved.fbeFeeCny * exchange_rates(CNY→站点币种)
 logisticsCost = headFreightLocal + fbeLocal
+profitBreakdown 额外保留：fbeFeeCny / fbeSource / fbeScope / isEstimatedFbe
 ```
 
 **涉及服务：**
 
 | 服务 | 行为 |
 |------|------|
-| `profitCalculator.ts` | 利润预计算；`profitBreakdown` 保留 `fbeFeeCny`、`fbeLocal`、`fbe`（当地币，兼容旧字段）、`isEstimatedFbe` |
-| `emagPrice.ts` | 手动改价 / 抢购物车 preview / 价格保护；preview 额外返回 `fbeFeeCny`、`fbeLocal`、`commissionRate` |
-| `orderProfitCalculator.ts` | 订单毛利 fallback：`profitBreakdown.fbe` 已是当地币不二次换算；直接读 `Product.fbeFee` 时按 CNY→订单币种换算 |
+| `fbeFeeResolver.ts` | 统一 FBE 优先级解析，禁止各模块各算各的 |
+| `fbeFeeManagement.ts` | FBE 概览、列表、批量 preview/execute、变更日志、触发利润重算 |
+| `profitCalculator.ts` | 利润预计算；`profitBreakdown` 保留 `fbeFeeCny`、`fbeSource`、`isEstimatedFbe` |
+| `emagPrice.ts` | 手动改价 / 抢购物车 preview；手动改价允许估算 FBE 但保留 warning；抢车 preview 在 `isEstimatedFbe=true` 时返回 `MISSING_FBE_FEE` |
+| `grabCartBatch.ts` | readiness / candidates 返回 FBE 费用、来源、是否估算、阻断原因；候选要求 `costStatus=COMPLETE && isEstimatedFbe=false` |
+| `orderProfitCalculator.ts` | 订单毛利 fallback 逻辑不变 |
+
+**FBE 管理 API（`/api/fbe-fees`，2026-06-20 V1）：**
+
+| 方法 | 路径 | 权限 | 说明 |
+|------|------|------|------|
+| GET | `/api/fbe-fees/summary` | `ACTION_STORE_PRODUCT_PRICE_LOG_VIEW` | 全店 FBE 覆盖率、估算数、抢车候选 FBE 阻断统计 |
+| GET | `/api/fbe-fees/records` | 同上 | 分页列表，支持 shopId/keyword/status |
+| POST | `/api/fbe-fees/batch/preview` | `ACTION_STORE_PRODUCT_PRICE_CHANGE` | 最多 500 行，preview 不写库 |
+| POST | `/api/fbe-fees/batch/execute` | 同上 | 重新校验后写入 FBE + 日志 + 受影响 StoreProduct 利润重算 |
+
+**批量规则：** `feeCny>0`；SKU 精确匹配优先，SKU 不存在时才允许 PNK；SKU/PNK 歧义或同批重复目标报错；未变化标记 `UNCHANGED` 不写日志不重算。
 
 **FBE 账单 API 边界（Phase B-5）：**
 
-- eMAG `invoice/read` 可见账期 FBE 费用汇总，但无法精确关联 SKU/PNK/EAN/orderId，**暂不做自动回填** `Product.fbeFee`；当前仍建议人工维护或规则估算。
+- eMAG `invoice/read` 可见账期 FBE 费用汇总，但无法精确关联 SKU/PNK/EAN/orderId，**暂不做自动回填** `Product.fbeFee`；当前通过 `/api/fbe-fees/batch/*` 人工/导入维护。
 
 **抢购物车安全边界：**
 
-- `grabCartAllowEstimatedCost` 默认 `false`；`costStatus=ESTIMATED`（含 FBE 缺省估算）时 preview / execute 阻断。
-- `grab-cart/execute` 禁止在估算 FBE 成本下执行真实改价。
+- 抢车候选必须 `costStatus=COMPLETE` 且 `isEstimatedFbe=false`；估算 FBE 商品在 readiness/candidates 中标记 `fbeBlockReason`。
+- `EMAG_GRAB_CART_WRITE_ENABLED=false` 保持不变；真实抢车 execute 仍返回 `GRAB_CART_DISABLED`。
+- 手动改价仍允许估算 FBE（店铺策略 `manualPriceAllowEstimatedCost`），但必须保留 warning。
 
 **运营动作建议 operationAdvice（实时 DTO，不落库）**：`GET /api/store-products` 每行返回双命名 `operationAdvice/operation_advice`，用于回答“运营接下来做什么”，与 `purchaseSuggestion` 的供应链采购动作分离。规则引擎实时使用四类主分类与风险标签含义：主推款优先保供、补货和广告；成长款观察趋势并适度加广告；常规款正常维护；清理款降价、清仓或停止采购。动作集合：`REPLENISH_NOW/URGENT_REPLENISH/STILL_NEED_REPLENISH/RAISE_PRICE/LOWER_PRICE/JOIN_CAMPAIGN/ADVERTISE/CLEARANCE/PAUSE_PURCHASE/WAIT_FOR_ARRIVAL/OBSERVE`；优先级：`P0/P1/P2/P3`。断货补货规则优先于普通调价、广告、活动和观察兜底：`stock=0 && replenishReferenceDailySales>0 && coverageStock<=0` 返回立即/紧急补货，`coverageStock<targetStock` 返回仍需补货，`coverageStock>=targetStock` 返回等待到货。其他规则按顺序短路：负毛利动销异常、清仓处理、暂停采购、等待到货、建议涨价、建议降价、加广告、参加活动、观察即可。阈值集中配置为 `lowProfitMarginPct=15`、`goodProfitMarginPct=25`、`lowStockDays=30`、`warningStockDays=60`、`overstockDays=120`、`clearanceStockThreshold=10`；`profitMarginPct` 单位是百分数（`15` 表示 15%）。因当前缺少竞品价格、价格历史、广告 ROI、曝光点击转化数据，涨价/降价/广告/活动文案必须表达为“可考虑/测试”，不能作为强结论。
 

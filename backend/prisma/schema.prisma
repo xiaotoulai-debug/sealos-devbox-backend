@@ -34,6 +34,7 @@ model User {
   employeeWeeklyAiSummaries EmployeeWeeklyAiSummary[]
   employeeWeeklyPlans       EmployeeWeeklyPlan[]
   priceAdjustmentLogs StoreProductPriceAdjustmentLog[]
+  fbeFeeChangeLogs      FbeFeeChangeLog[]
   role           Role       @relation(fields: [roleId], references: [id])
 
   @@map("users")
@@ -104,6 +105,9 @@ model Product {
   actualWeight      Decimal?       @map("actual_weight") @db.Decimal(10, 3)
   freightCost       Decimal?       @map("freight_cost") @db.Decimal(10, 2)
   fbeFee            Decimal?       @map("fbe_fee") @db.Decimal(10, 2)
+  fbeFeeSource      String?        @map("fbe_fee_source") @db.VarChar(32)
+  fbeFeeUpdatedAt   DateTime?      @map("fbe_fee_updated_at")
+  fbeFeeNote        String?        @map("fbe_fee_note") @db.Text
   margin            Decimal?       @map("margin") @db.Decimal(6, 2)
   collectedAt       DateTime?      @map("collected_at")
   length            Decimal?       @map("length") @db.Decimal(10, 2)
@@ -164,6 +168,7 @@ model Product {
   fbeShipmentItems  FbeShipmentItem[]
   inventoryLogs     InventoryLog[]
   warehouseStocks   WarehouseStock[]
+  fbeFeeChangeLogs  FbeFeeChangeLog[]
 }
 
 /// 采购单（主单）
@@ -264,6 +269,7 @@ model ShopAuthorization {
   dailyReminderTemplates DailyReminderTemplate[]
   priceAdjustmentLogs StoreProductPriceAdjustmentLog[]
   priceStrategyConfig StorePriceStrategyConfig?
+  fbeFeeChangeLogs    FbeFeeChangeLog[]
 
   @@index([platform])
   @@index([status])
@@ -354,6 +360,10 @@ model StoreProduct {
   buyBoxRank             Int?      @map("buy_box_rank")
   buyBoxActionTips       Json?     @map("buy_box_action_tips")       // 购物车状态动作提醒数组
   buyBoxMeta             Json?     @map("buy_box_meta")              // compact meta，不保存完整 raw response
+  fbeFeeOverrideCny       Decimal?  @map("fbe_fee_override_cny") @db.Decimal(10, 2)
+  fbeFeeOverrideSource    String?   @map("fbe_fee_override_source") @db.VarChar(32)
+  fbeFeeOverrideUpdatedAt DateTime? @map("fbe_fee_override_updated_at")
+  fbeFeeOverrideNote      String?   @map("fbe_fee_override_note") @db.Text
   isArchived      Boolean  @default(false) @map("is_archived") // eMAG 变更 PNK/SKU 后保留审计用的归档标记；列表默认过滤
   firstAvailableAt DateTime? @map("first_available_at") // 当前店铺下首次平台库存 > 0 的时间（新品观察期基准）
   firstStockSignalAt DateTime? @map("first_stock_signal_at") // 首次平台库存>0 或 FBE/ERP 在途>0 的时间
@@ -364,6 +374,7 @@ model StoreProduct {
   purchasePlanProducts Product[] @relation("ProductSourceStoreProduct")
   fbeShipmentItems FbeShipmentItem[]
   priceAdjustmentLogs StoreProductPriceAdjustmentLog[]
+  fbeFeeChangeLogs    FbeFeeChangeLog[]
 
   @@unique([shopId, pnk])
   @@unique([shopId, sku])
@@ -422,6 +433,35 @@ model StoreProductPriceAdjustmentLog {
   @@index([status, createdAt])
   @@index([operatorUserId, createdAt])
   @@map("store_product_price_adjustment_logs")
+}
+
+/// FBE 费用变更审计日志（SKU 默认 / 店铺覆盖）
+model FbeFeeChangeLog {
+  id             Int      @id @default(autoincrement())
+  productId      Int?     @map("product_id")
+  storeProductId Int?     @map("store_product_id")
+  shopId         Int?     @map("shop_id")
+  sku            String?
+  pnk            String?
+  scope          String   @db.VarChar(32)
+  oldFeeCny      Decimal? @map("old_fee_cny") @db.Decimal(10, 2)
+  newFeeCny      Decimal  @map("new_fee_cny") @db.Decimal(10, 2)
+  source         String   @db.VarChar(32)
+  note           String?  @db.Text
+  operatorUserId Int?     @map("operator_user_id")
+  createdAt      DateTime @default(now()) @map("created_at")
+
+  product      Product?           @relation(fields: [productId], references: [id], onDelete: SetNull)
+  storeProduct StoreProduct?      @relation(fields: [storeProductId], references: [id], onDelete: SetNull)
+  shop         ShopAuthorization? @relation(fields: [shopId], references: [id], onDelete: SetNull)
+  operator     User?              @relation(fields: [operatorUserId], references: [id], onDelete: SetNull)
+
+  @@index([productId, createdAt])
+  @@index([storeProductId, createdAt])
+  @@index([shopId, createdAt])
+  @@index([sku, createdAt])
+  @@index([scope, createdAt])
+  @@map("fbe_fee_change_logs")
 }
 
 /// 店铺级价格策略配置：无配置时后端走 DEFAULT_PRICE_STRATEGY

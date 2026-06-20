@@ -37,6 +37,7 @@ import {
   type CartPriceTaxMode,
   type CostStatus,
 } from './priceProtection';
+import { resolveFbeFee, type FbeFeeSourceKind } from './fbeFeeResolver';
 import { PRICE_ERROR_CODES, PRICE_ERROR_MESSAGES, type PriceErrorCode } from './priceErrors';
 
 export interface BuildPriceUpdatePayloadInput {
@@ -131,6 +132,8 @@ type PriceContext = {
     vatRate: number | null;
     fbeFeeCny: number | null;
     fbeLocal: number | null;
+    fbeSource: FbeFeeSourceKind | null;
+    fbeScope: string | null;
     isEstimatedFbe: boolean;
     exchangeRateCnyToLocal: number | null;
   };
@@ -177,6 +180,8 @@ export type GrabCartPreviewResult = {
   commissionRate: number | null;
   fbeFeeCny: number | null;
   fbeLocal: number | null;
+  fbeSource: FbeFeeSourceKind | null;
+  isEstimatedFbe: boolean;
   warnings: string[];
 };
 
@@ -1605,6 +1610,10 @@ export async function loadPriceContext(params: { shopId: number; storeProductId:
       buyButtonRank: true,
       commissionRate: true,
       manualMinPrice: true,
+      fbeFeeOverrideCny: true,
+      fbeFeeOverrideSource: true,
+      fbeFeeOverrideUpdatedAt: true,
+      fbeFeeOverrideNote: true,
     },
   });
 
@@ -1633,11 +1642,11 @@ export async function loadPriceContext(params: { shopId: number; storeProductId:
   const localProduct = storeProduct.mappedInventorySku
     ? await prisma.product.findFirst({
         where: { sku: storeProduct.mappedInventorySku },
-        select: { sku: true, pnk: true, purchasePrice: true, fbeFee: true, length: true, width: true, height: true, actualWeight: true, category: true, returnLossRate: true, vat: true },
+        select: { sku: true, pnk: true, purchasePrice: true, fbeFee: true, fbeFeeSource: true, fbeFeeUpdatedAt: true, fbeFeeNote: true, length: true, width: true, height: true, actualWeight: true, category: true, returnLossRate: true, vat: true },
       })
     : await prisma.product.findFirst({
         where: { pnk: storeProduct.pnk },
-        select: { sku: true, pnk: true, purchasePrice: true, fbeFee: true, length: true, width: true, height: true, actualWeight: true, category: true, returnLossRate: true, vat: true },
+        select: { sku: true, pnk: true, purchasePrice: true, fbeFee: true, fbeFeeSource: true, fbeFeeUpdatedAt: true, fbeFeeNote: true, length: true, width: true, height: true, actualWeight: true, category: true, returnLossRate: true, vat: true },
       });
 
   const currency = fresh.currency ?? storeProduct.currency ?? 'RON';
@@ -1658,12 +1667,9 @@ export async function loadPriceContext(params: { shopId: number; storeProductId:
       )
     : null;
   const headFreightLocal = headFreightCny != null && cnyToLocal != null ? headFreightCny * cnyToLocal : null;
-  const isEstimatedFbe = localProduct?.fbeFee == null;
-  const fbeFeeCny = localProduct?.fbeFee != null
-    ? Number(localProduct.fbeFee)
-    : cnyToLocal != null
-      ? DEFAULT_FBE_CNY
-      : null;
+  const resolvedFbe = resolveFbeFee({ storeProduct, product: localProduct });
+  const isEstimatedFbe = resolvedFbe.isEstimatedFbe;
+  const fbeFeeCny = cnyToLocal != null ? resolvedFbe.fbeFeeCny : null;
   const fbeLocal = fbeFeeCny != null && cnyToLocal != null ? fbeFeeCny * cnyToLocal : null;
   const logisticsCost = headFreightLocal != null && fbeLocal != null ? headFreightLocal + fbeLocal : null;
 
@@ -1749,6 +1755,8 @@ export async function loadPriceContext(params: { shopId: number; storeProductId:
       vatRate: vatResolution.vatRate,
       fbeFeeCny: fbeFeeCny != null ? roundPrice(fbeFeeCny) : null,
       fbeLocal: fbeLocal != null ? roundPrice(fbeLocal) : null,
+      fbeSource: resolvedFbe.fbeSource,
+      fbeScope: resolvedFbe.fbeScope,
       isEstimatedFbe,
       exchangeRateCnyToLocal: cnyToLocal,
     },
@@ -1933,6 +1941,8 @@ export async function buildGrabCartPreview(params: {
       commissionRate: null,
       fbeFeeCny: null,
       fbeLocal: null,
+      fbeSource: null,
+      isEstimatedFbe: true,
       warnings: [],
     };
   }
@@ -1965,6 +1975,8 @@ export async function buildGrabCartPreview(params: {
     grabCartEligibility = grabEligibility(false, cart.blockCode, cart.warnings[0]);
   } else if (context.cost.costStatus !== 'COMPLETE' && !context.strategy.grabCartAllowEstimatedCost) {
     grabCartEligibility = grabEligibility(false, costBlockCode(context.cost.costStatus), '成本资料不完整，当前店铺策略不允许抢购物车');
+  } else if (context.rawLocalCost.isEstimatedFbe) {
+    grabCartEligibility = grabEligibility(false, PRICE_ERROR_CODES.MISSING_FBE_FEE);
   } else if (context.minPrices.blockCode) {
     grabCartEligibility = grabEligibility(false, context.minPrices.blockCode, context.minPrices.warnings[0]);
   } else if (suggestedGrabPriceExVat == null || suggestedGrabPriceExVat <= 0) {
@@ -1985,6 +1997,8 @@ export async function buildGrabCartPreview(params: {
     commissionRate: context.rawLocalCost.commissionRate,
     fbeFeeCny: context.rawLocalCost.fbeFeeCny,
     fbeLocal: context.rawLocalCost.fbeLocal,
+    fbeSource: context.rawLocalCost.fbeSource,
+    isEstimatedFbe: context.rawLocalCost.isEstimatedFbe,
     estimatedProfitAfter: profit.estimatedProfitAfter,
     profitMarginPctAfter: profit.profitMarginPctAfter,
     warnings: [...context.minPrices.warnings, ...cart.warnings],

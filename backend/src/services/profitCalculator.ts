@@ -19,6 +19,7 @@ import { calcHeadFreightCny } from './freightCalculator';
 import { guessCommissionRate } from '../utils/commissionMatcher';
 import { DEFAULT_COMMISSION_RATE } from '../config/commissionMap';
 import { DEFAULT_FBE_CNY } from './priceProtection';
+import { buildFbeEstimatedWarning, resolveFbeFee } from './fbeFeeResolver';
 
 /**
  * FBE 冷启动兜底（CNY）：当 Product.fbeFee 为 null 时，以此 CNY 金额换算为当地货币兜底。
@@ -44,6 +45,10 @@ type StoreProductProfitRow = {
   mappedInventorySku: string | null;
   pnk: string;
   name: string;
+  fbeFeeOverrideCny: unknown;
+  fbeFeeOverrideSource: string | null;
+  fbeFeeOverrideUpdatedAt: Date | null;
+  fbeFeeOverrideNote: string | null;
 };
 
 type LocalProductRow = {
@@ -51,6 +56,9 @@ type LocalProductRow = {
   pnk: string | null;
   purchasePrice: unknown;
   fbeFee: unknown;
+  fbeFeeSource: string | null;
+  fbeFeeUpdatedAt: Date | null;
+  fbeFeeNote: string | null;
   length: unknown;
   width: unknown;
   height: unknown;
@@ -181,8 +189,12 @@ function computePendingProfitUpdates(params: {
     const isMissingVolumeWeight = headFreightCny === null;
     const headFreightLocal = (headFreightCny ?? 0) * cnyToLocal;
 
-    const isEstimatedFbe = local.fbeFee == null;
-    const fbeFeeCny = local.fbeFee != null ? Number(local.fbeFee) : DEFAULT_FBE_CNY;
+    const resolvedFbe = resolveFbeFee({
+      storeProduct: sp,
+      product: local,
+    });
+    const isEstimatedFbe = resolvedFbe.isEstimatedFbe;
+    const fbeFeeCny = resolvedFbe.fbeFeeCny;
     const fbeLocal = fbeFeeCny * cnyToLocal;
 
     const returnLossRate = local.returnLossRate ?? 0;
@@ -195,7 +207,7 @@ function computePendingProfitUpdates(params: {
     const marginPct = salePrice > 0 ? (profitLocal / salePrice) * 100 : null;
 
     const warnings = [
-      ...(isEstimatedFbe ? [`FBE 费用使用 ${DEFAULT_FBE_CNY} RMB 默认估算`] : []),
+      ...(isEstimatedFbe ? [buildFbeEstimatedWarning(resolvedFbe)] : []),
       ...(isEstimatedCommission ? ['佣金率来自字典或默认配置'] : []),
       ...(isMissingVolumeWeight ? ['缺少尺寸或重量，头程成本按 0 估算'] : []),
     ];
@@ -216,6 +228,8 @@ function computePendingProfitUpdates(params: {
         fbe: round2(fbeLocal),
         fbeLocal: round2(fbeLocal),
         fbeFeeCny: round2(fbeFeeCny),
+        fbeSource: resolvedFbe.fbeSource,
+        fbeScope: resolvedFbe.fbeScope,
         isEstimatedFbe,
         isMissingVolumeWeight,
         warnings,
@@ -276,7 +290,11 @@ export async function recalcProfitForShop(shopId: number): Promise<number> {
     select: {
       id: true, shopId: true, salePrice: true, currency: true,
       commissionRate: true, mappedInventorySku: true, pnk: true,
-      name: true,   // 用于 commissionMatcher 关键词匹配
+      name: true,
+      fbeFeeOverrideCny: true,
+      fbeFeeOverrideSource: true,
+      fbeFeeOverrideUpdatedAt: true,
+      fbeFeeOverrideNote: true,
     },
   });
 
@@ -331,9 +349,9 @@ export async function recalcProfitForShop(shopId: number): Promise<number> {
           where: { sku: { in: allSkus } },
           select: {
             sku: true, pnk: true, purchasePrice: true, fbeFee: true,
+            fbeFeeSource: true, fbeFeeUpdatedAt: true, fbeFeeNote: true,
             length: true, width: true, height: true, actualWeight: true,
-            category: true,         // 用于 commissionMatcher 类目关键词匹配
-            returnLossRate: true,   // 退货损耗率（0.03 = 3%）
+            category: true, returnLossRate: true,
           },
         })
       : [],
@@ -342,9 +360,9 @@ export async function recalcProfitForShop(shopId: number): Promise<number> {
           where: { pnk: { in: pnks } },
           select: {
             sku: true, pnk: true, purchasePrice: true, fbeFee: true,
+            fbeFeeSource: true, fbeFeeUpdatedAt: true, fbeFeeNote: true,
             length: true, width: true, height: true, actualWeight: true,
-            category: true,
-            returnLossRate: true,
+            category: true, returnLossRate: true,
           },
         })
       : [],
@@ -460,6 +478,10 @@ export async function recalcProfitForStoreProductsDetailed(params: {
       estimatedProfit: true,
       profitMarginPct: true,
       profitBreakdown: true,
+      fbeFeeOverrideCny: true,
+      fbeFeeOverrideSource: true,
+      fbeFeeOverrideUpdatedAt: true,
+      fbeFeeOverrideNote: true,
     },
     orderBy: { id: 'asc' },
   });
@@ -528,6 +550,10 @@ export async function recalcProfitForStoreProductsDetailed(params: {
     mappedInventorySku: row.mappedInventorySku,
     pnk: row.pnk,
     name: row.name,
+    fbeFeeOverrideCny: row.fbeFeeOverrideCny,
+    fbeFeeOverrideSource: row.fbeFeeOverrideSource,
+    fbeFeeOverrideUpdatedAt: row.fbeFeeOverrideUpdatedAt,
+    fbeFeeOverrideNote: row.fbeFeeOverrideNote,
   }));
 
   const ownSkus = products
@@ -544,6 +570,7 @@ export async function recalcProfitForStoreProductsDetailed(params: {
           where: { sku: { in: allSkus } },
           select: {
             sku: true, pnk: true, purchasePrice: true, fbeFee: true,
+            fbeFeeSource: true, fbeFeeUpdatedAt: true, fbeFeeNote: true,
             length: true, width: true, height: true, actualWeight: true,
             category: true, returnLossRate: true,
           },
@@ -554,6 +581,7 @@ export async function recalcProfitForStoreProductsDetailed(params: {
           where: { pnk: { in: pnks } },
           select: {
             sku: true, pnk: true, purchasePrice: true, fbeFee: true,
+            fbeFeeSource: true, fbeFeeUpdatedAt: true, fbeFeeNote: true,
             length: true, width: true, height: true, actualWeight: true,
             category: true, returnLossRate: true,
           },

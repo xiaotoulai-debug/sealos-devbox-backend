@@ -30,6 +30,7 @@ import operationDailyRouter from './routes/operationDaily';
 import employeeTasksRouter from './routes/employeeTasks';
 import dailyRemindersRouter from './routes/dailyReminders';
 import workdayCalendarRouter from './routes/workdayCalendar';
+import fbeFeesRouter from './routes/fbeFees';
 import { startSyncCrons } from './services/syncCron';
 import { startWeeklyAiSummaryCron } from './services/weeklyAiSummaryCron';
 import { backfillProductImages } from './services/storeProductSync';
@@ -72,6 +73,7 @@ app.use('/api/emag',    emagRouter);    // eMAG 核心业务 API
 app.use('/api/dashboard', dashboardRouter); // 实时业绩看板
 app.use('/api/analytics', analyticsRouter); // 订单日报 / 运营看板聚合接口
 app.use('/api/store-products', storeProductsRouter); // 店铺在售产品（仅 StoreProduct，不混公海）
+app.use('/api/fbe-fees', fbeFeesRouter);             // FBE 真实费用管理
 app.use('/api/translate', translateRouter);          // 翻译代理（MyMemory API 转发）
 app.use('/api/fbe-shipments', fbeShipmentRouter);   // FBE 发货单管理（在途库存闭环）
 app.use('/api/inventory',    inventoryRouter);      // 进销存：batch-adjust / purchase-orders receive / logs
