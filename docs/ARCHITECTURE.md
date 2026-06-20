@@ -560,23 +560,24 @@ Phase 1-B1 新增 execute 代码框架；Phase B-7 将源码硬编码开关升�
 - 初始日志 create 失败会阻断 execute。
 - 真实 SKU 测试必须等待老板下一轮明确授权后再开启写开关。
 
-### 4.5.2.5 eMAG 改价 readBack 对账（Phase 1-B2.1，2026-06-16）
+### 4.5.2.5 eMAG 改价 readBack 对账（Phase 1-B2.1，2026-06-16；2026-06-20 传播延迟优化）
 
-Phase 1-B2.1 在 `executePriceChange` 真实 save 成功后增加 readBack 对账，解决 eMAG `product_offer/read` 传播延迟导致的假对账失败感知。
+Phase 1-B2.1 在 `executePriceChange` 真实 save 成功后增加 readBack 对账；2026-06-20 起明确区分 eMAG save 成功与 readBack 最终确认，避免传播延迟时把未确认结果伪装为最终 `SUCCESS`。
 
 **流程：**
 
-1. `product_offer/save` 成功 → 事务更新本地 `sale_price` / `vatId` / `vatRate`（不回滚）。
-2. `performPriceReadBackWithRetry`：`product_offer/read`，最多 3 次、间隔 5s，`requireProxy=true`。
-3. 合并 `{ save, readBack }` 写入 `StoreProductPriceAdjustmentLog.emagResponse` Json（不新增 DB 字段）。
-4. 日志 `status` 仍 **SUCCESS**；API 响应增加 `readBackStatus` / `readBackPrice` / `readBackWarning`。
+1. `product_offer/save` 成功返回后，先执行 `performPriceReadBackWithRetry`，只调用 `product_offer/read`，禁止再次发送 `product_offer/save`。
+2. readBack 最多 6 次：第 1 次立即读取，后续退避等待 `3s / 5s / 8s / 12s / 15s`，总等待控制在 60 秒以内；任一次读到目标价立即停止。
+3. `readBackStatus=CONFIRMED` 时，日志标记 `SUCCESS`，再更新本地 `StoreProduct.salePrice/vatId/vatRate/lastPriceAdjustedAt/lastPriceAdjustmentMode` 并触发单品利润重算。
+4. `readBackStatus=UNCONFIRMED` 或 `READBACK_FAILED` 时，日志标记 `PENDING_VERIFY`，`emagResponse` 合并 `{ save, readBack }`，记录目标价、最后读到的价格、尝试次数、最后回读时间和原因；不更新本地价格、不重算利润、不重复写价。
+5. eMAG save 明确失败时，日志标记 `FAILED`，不更新本地价格、不重算利润。
 
 **readBackStatus 语义：**
 
 | 状态 | 含义 |
 |------|------|
 | CONFIRMED | readBack `sale_price` 与目标价一致（容差 0.005） |
-| UNCONFIRMED | save 成功但 read 暂不一致，**不等于改价失败**，不回滚本地价 |
+| UNCONFIRMED | save 成功但 read 暂不一致，API 返回 `PENDING_VERIFY`，需后续人工或只读同步复查 |
 | READBACK_FAILED | 多次 read 无有效 `sale_price`，需人工或 sync 对账 |
 
 **价格字段口径：**
@@ -586,7 +587,7 @@ Phase 1-B2.1 在 `executePriceChange` 真实 save 成功后增加 readBack 对�
 
 **readBack 查询优先级：** `emagOfferId/id` → `pnk/part_number_key` → `sku/part_number`；**禁止单独用 EAN**（可能命中其他 offer）。
 
-**范围：** Phase B-7 已将同一套 readBack 接入 `executeGrabCartPriceChange` 真实 SUCCESS 路径；`SKIPPED` / `DRY_RUN_ONLY` 不触发 readBack。
+**范围：** Phase B-7 已将同一套 readBack 接入 `executeGrabCartPriceChange` 真实写价路径；`SKIPPED` / `DRY_RUN_ONLY` 不触发 readBack。`UNCONFIRMED` 不自动重复 execute，仅作为 `PENDING_VERIFY` 留痕。
 
 ### 4.5.2.9 eMAG 真实写价安全闸门（Phase B-7，2026-06-16）
 

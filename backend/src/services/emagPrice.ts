@@ -188,8 +188,8 @@ const FORBIDDEN_PRICE_PAYLOAD_FIELDS = new Set([
   'documentation',
 ]);
 
-const READBACK_MAX_ATTEMPTS = 3;
-const READBACK_RETRY_INTERVAL_MS = 5000;
+export const READBACK_RETRY_DELAYS_MS = [0, 3000, 5000, 8000, 12000, 15000] as const;
+const READBACK_MAX_ATTEMPTS = READBACK_RETRY_DELAYS_MS.length;
 const READBACK_PRICE_TOLERANCE = 0.005;
 
 const ALLOWED_PRICE_PAYLOAD_KEYS = new Set(['id', 'sale_price', 'vat_id']);
@@ -228,6 +228,8 @@ export type PriceExecuteResult = {
   profitRecalcWarning?: string | null;
   readBackStatus?: ReadBackStatus | null;
   readBackPrice?: number | null;
+  readBackAt?: string | null;
+  readBackAttempts?: number | null;
   readBackWarning?: string | null;
   writeGuardReasonCode?: EmagPriceWriteGuardReasonCode | null;
   noEmagWriteExecuted: boolean;
@@ -509,6 +511,11 @@ export async function performPriceReadBackWithRetry(params: {
   let lastFilterUsed: 'id' | 'part_number_key' | 'sku' | null = null;
 
   for (let attempt = 1; attempt <= READBACK_MAX_ATTEMPTS; attempt += 1) {
+    const delayMs = READBACK_RETRY_DELAYS_MS[attempt - 1] ?? 0;
+    if (delayMs > 0) {
+      await sleep(delayMs);
+    }
+
     const readResult = await readBackOfferSalePrice({
       shopId: params.shopId,
       emagOfferId: params.emagOfferId,
@@ -531,10 +538,6 @@ export async function performPriceReadBackWithRetry(params: {
           priceFieldUsed: 'sale_price',
         };
       }
-    }
-
-    if (attempt < READBACK_MAX_ATTEMPTS) {
-      await sleep(READBACK_RETRY_INTERVAL_MS);
     }
   }
 
@@ -640,6 +643,44 @@ export async function updateProductOfferPrice(params: {
       errorMessage: message,
     };
   }
+}
+
+function pendingVerifyMessage(readBack: PriceReadBackResult): string {
+  return readBack.readBackWarning ?? PRICE_ERROR_MESSAGES.PENDING_VERIFY;
+}
+
+export function resolveReadBackExecutionOutcome(readBack: PriceReadBackResult): {
+  status: 'SUCCESS' | 'PENDING_VERIFY';
+  code: 'OK' | typeof PRICE_ERROR_CODES.PENDING_VERIFY;
+  message: string;
+  shouldCommitLocalPrice: boolean;
+} {
+  if (readBack.readBackStatus === 'CONFIRMED') {
+    return {
+      status: 'SUCCESS',
+      code: 'OK',
+      message: 'price execute success',
+      shouldCommitLocalPrice: true,
+    };
+  }
+
+  return {
+    status: 'PENDING_VERIFY',
+    code: PRICE_ERROR_CODES.PENDING_VERIFY,
+    message: pendingVerifyMessage(readBack),
+    shouldCommitLocalPrice: false,
+  };
+}
+
+async function markReadBackPendingVerify(
+  logId: number,
+  saveResponse: unknown,
+  readBack: PriceReadBackResult,
+): Promise<void> {
+  await markPriceAdjustmentPendingVerify(logId, {
+    emagResponse: mergeSaveAndReadBackEmagResponse(saveResponse, readBack),
+    errorMessage: pendingVerifyMessage(readBack),
+  });
 }
 
 export async function executePriceChange(params: {
@@ -840,6 +881,43 @@ export async function executePriceChange(params: {
     }
 
     const context = await loadPriceContext({ shopId: params.shopId, storeProductId: params.storeProductId });
+    const readBack = await performPriceReadBackWithRetry({
+      shopId: params.shopId,
+      emagOfferId: payload[0]?.id ?? context?.storeProduct.emagOfferId,
+      pnk: context?.storeProduct.pnk ?? null,
+      sku: (await prisma.storeProduct.findUnique({
+        where: { id: params.storeProductId },
+        select: { sku: true },
+      }))?.sku ?? null,
+      targetPrice: newSalePrice,
+    });
+
+    const emagResponseForLog = mergeSaveAndReadBackEmagResponse(writeResult.rawResponse, readBack);
+    const readBackOutcome = resolveReadBackExecutionOutcome(readBack);
+    if (!readBackOutcome.shouldCommitLocalPrice) {
+      await markReadBackPendingVerify(logId, writeResult.rawResponse, readBack);
+      return {
+        status: readBackOutcome.status,
+        code: readBackOutcome.code,
+        message: readBackOutcome.message,
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        logId,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: newSalePrice,
+        emagOfferId: payload[0]?.id != null ? String(payload[0].id) : null,
+        payloadPreview: payload,
+        profitRecalculated: false,
+        profitRecalcWarning: null,
+        readBackStatus: readBack.readBackStatus,
+        readBackPrice: readBack.readBackPrice,
+        readBackAt: readBack.readBackAt,
+        readBackAttempts: readBack.readBackAttempts,
+        readBackWarning: readBack.readBackWarning,
+        noEmagWriteExecuted: false,
+      };
+    }
+
     const vatId = context?.storeProduct.vatId ?? payload[0]?.vat_id ?? null;
     const vatRate = context?.rawLocalCost.vatRate ?? preview.vatRate ?? null;
 
@@ -855,19 +933,6 @@ export async function executePriceChange(params: {
         },
       }),
     ]);
-
-    const readBack = await performPriceReadBackWithRetry({
-      shopId: params.shopId,
-      emagOfferId: payload[0]?.id ?? context?.storeProduct.emagOfferId,
-      pnk: context?.storeProduct.pnk ?? null,
-      sku: (await prisma.storeProduct.findUnique({
-        where: { id: params.storeProductId },
-        select: { sku: true },
-      }))?.sku ?? null,
-      targetPrice: newSalePrice,
-    });
-
-    const emagResponseForLog = mergeSaveAndReadBackEmagResponse(writeResult.rawResponse, readBack);
 
     await markPriceAdjustmentSuccess(logId, {
       emagResponse: emagResponseForLog,
@@ -905,6 +970,8 @@ export async function executePriceChange(params: {
       profitRecalcWarning,
       readBackStatus: readBack.readBackStatus,
       readBackPrice: readBack.readBackPrice,
+      readBackAt: readBack.readBackAt,
+      readBackAttempts: readBack.readBackAttempts,
       readBackWarning: readBack.readBackWarning,
       noEmagWriteExecuted: false,
     };
@@ -1151,6 +1218,43 @@ export async function executeGrabCartPriceChange(params: {
       };
     }
 
+    const readBack = await performPriceReadBackWithRetry({
+      shopId: params.shopId,
+      emagOfferId: payload[0]?.id ?? context.fresh.emagOfferId,
+      pnk: context.storeProduct.pnk ?? null,
+      sku: (await prisma.storeProduct.findUnique({
+        where: { id: params.storeProductId },
+        select: { sku: true },
+      }))?.sku ?? null,
+      targetPrice: confirmedPrice,
+    });
+
+    const emagResponseForLog = mergeSaveAndReadBackEmagResponse(writeResult.rawResponse, readBack);
+    const readBackOutcome = resolveReadBackExecutionOutcome(readBack);
+    if (!readBackOutcome.shouldCommitLocalPrice) {
+      await markReadBackPendingVerify(logId, writeResult.rawResponse, readBack);
+      return {
+        status: readBackOutcome.status,
+        code: readBackOutcome.code,
+        message: readBackOutcome.message,
+        storeProductId: params.storeProductId,
+        shopId: params.shopId,
+        logId,
+        oldSalePriceExVat: preview.currentSalePriceExVat,
+        newSalePriceExVat: confirmedPrice,
+        emagOfferId: context.fresh.emagOfferId,
+        payloadPreview: payload,
+        profitRecalculated: false,
+        profitRecalcWarning: null,
+        readBackStatus: readBack.readBackStatus,
+        readBackPrice: readBack.readBackPrice,
+        readBackAt: readBack.readBackAt,
+        readBackAttempts: readBack.readBackAttempts,
+        readBackWarning: readBack.readBackWarning,
+        noEmagWriteExecuted: false,
+      };
+    }
+
     const vatId = context.storeProduct.vatId ?? payload[0]?.vat_id ?? null;
     const vatRate = context.rawLocalCost.vatRate ?? preview.vatRate ?? null;
 
@@ -1166,19 +1270,6 @@ export async function executeGrabCartPriceChange(params: {
         },
       }),
     ]);
-
-    const readBack = await performPriceReadBackWithRetry({
-      shopId: params.shopId,
-      emagOfferId: payload[0]?.id ?? context.fresh.emagOfferId,
-      pnk: context.storeProduct.pnk ?? null,
-      sku: (await prisma.storeProduct.findUnique({
-        where: { id: params.storeProductId },
-        select: { sku: true },
-      }))?.sku ?? null,
-      targetPrice: confirmedPrice,
-    });
-
-    const emagResponseForLog = mergeSaveAndReadBackEmagResponse(writeResult.rawResponse, readBack);
 
     await markPriceAdjustmentSuccess(logId, {
       emagResponse: emagResponseForLog,
@@ -1216,6 +1307,8 @@ export async function executeGrabCartPriceChange(params: {
       profitRecalcWarning,
       readBackStatus: readBack.readBackStatus,
       readBackPrice: readBack.readBackPrice,
+      readBackAt: readBack.readBackAt,
+      readBackAttempts: readBack.readBackAttempts,
       readBackWarning: readBack.readBackWarning,
       noEmagWriteExecuted: false,
     };
