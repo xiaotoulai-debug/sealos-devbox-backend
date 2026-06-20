@@ -74,7 +74,18 @@ import {
 } from '../services/emagBuyBox';
 import { batchSyncCommissionRate, batchSyncCommissionRateByStoreProductIds, batchSyncCommissionRateForAllShops, syncStoreProductCommissionRate } from '../services/emagCommission';
 import { backfillVatData } from '../services/priceDataBackfill';
-import { buildGrabCartPreview, buildPricePreview, dryRunBuildPriceUpdate, executeGrabCartPriceChange, executePriceChange } from '../services/emagPrice';
+import {
+  buildGrabCartPreview,
+  buildPricePreview,
+  dryRunBuildPriceUpdate,
+  executeGrabCartPriceChange,
+  executePriceChange,
+  reconcilePendingPriceAdjustmentLog,
+} from '../services/emagPrice';
+import {
+  getPriceAdjustmentLogDetail,
+  listPriceAdjustmentLogsForStoreProduct,
+} from '../services/priceAdjustmentLogs';
 import {
   batchExecuteGrabCart,
   buildGrabCartReadiness,
@@ -1978,6 +1989,125 @@ router.post('/:id/commission/sync', async (req: Request, res: Response) => {
     });
   }
 });
+
+/**
+ * GET /api/store-products/:id/price/logs
+ * 查询单个 StoreProduct 的调价日志列表。
+ */
+router.get(
+  '/:id/price/logs',
+  requireStrictPermission(STORE_PRODUCT_PRICE_PERMISSIONS.LOG_VIEW, '无权限查看调价日志'),
+  async (req: Request, res: Response) => {
+    try {
+      const storeProductId = Number(req.params.id);
+      if (!Number.isInteger(storeProductId) || storeProductId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'storeProductId 无效' });
+        return;
+      }
+
+      const shopId = req.query.shopId != null ? Number(req.query.shopId) : null;
+      if (shopId != null && (!Number.isInteger(shopId) || shopId <= 0)) {
+        res.status(400).json({ code: 400, data: null, message: 'shopId 无效' });
+        return;
+      }
+
+      const page = req.query.page != null ? Number(req.query.page) : 1;
+      const pageSize = req.query.pageSize != null ? Number(req.query.pageSize) : 20;
+      if (!Number.isInteger(page) || page <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'page 无效' });
+        return;
+      }
+      if (!Number.isInteger(pageSize) || pageSize <= 0 || pageSize > 100) {
+        res.status(400).json({ code: 400, data: null, message: 'pageSize 无效，最大 100' });
+        return;
+      }
+
+      const result = await listPriceAdjustmentLogsForStoreProduct({ storeProductId, shopId, page, pageSize });
+      res.json({ code: 200, data: result, message: 'price adjustment logs loaded' });
+    } catch (err: any) {
+      console.error('[GET /api/store-products/:id/price/logs]', err?.message ?? err);
+      res.status(500).json({
+        code: 500,
+        data: null,
+        message: err?.message ?? '调价日志查询失败',
+      });
+    }
+  },
+);
+
+/**
+ * GET /api/store-products/price/logs/:logId
+ * 查询单条调价日志详情。
+ */
+router.get(
+  '/price/logs/:logId',
+  requireStrictPermission(STORE_PRODUCT_PRICE_PERMISSIONS.LOG_VIEW, '无权限查看调价日志'),
+  async (req: Request, res: Response) => {
+    try {
+      const logId = Number(req.params.logId);
+      if (!Number.isInteger(logId) || logId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'logId 无效' });
+        return;
+      }
+
+      const result = await getPriceAdjustmentLogDetail(logId);
+      if (!result) {
+        res.status(404).json({ code: 404, data: null, message: '调价日志不存在' });
+        return;
+      }
+
+      res.json({ code: 200, data: result, message: 'price adjustment log loaded' });
+    } catch (err: any) {
+      console.error('[GET /api/store-products/price/logs/:logId]', err?.message ?? err);
+      res.status(500).json({
+        code: 500,
+        data: null,
+        message: err?.message ?? '调价日志详情查询失败',
+      });
+    }
+  },
+);
+
+/**
+ * POST /api/store-products/price/logs/:logId/reconcile
+ * 对 PENDING_VERIFY 日志执行只读 readBack 核验；禁止再次发送 product_offer/save。
+ */
+router.post(
+  '/price/logs/:logId/reconcile',
+  requireStrictPermission(STORE_PRODUCT_PRICE_PERMISSIONS.PRICE_CHANGE, '无权限核验待确认调价日志'),
+  async (req: Request, res: Response) => {
+    try {
+      const logId = Number(req.params.logId);
+      if (!Number.isInteger(logId) || logId <= 0) {
+        res.status(400).json({ code: 400, data: null, message: 'logId 无效' });
+        return;
+      }
+
+      const result = await reconcilePendingPriceAdjustmentLog({ logId });
+      if (!result) {
+        res.status(404).json({ code: 404, data: null, message: '调价日志不存在' });
+        return;
+      }
+
+      const httpStatus = result.status === 'PENDING_VERIFY' ? 202 : 200;
+      res.status(httpStatus).json({
+        code: httpStatus,
+        data: result,
+        message: result.noEmagWriteExecuted
+          ? `${result.message}；只读核验完成，未发送 eMAG 写请求`
+          : result.message,
+      });
+    } catch (err: any) {
+      console.error('[POST /api/store-products/price/logs/:logId/reconcile]', err?.message ?? err);
+      const status = err?.code === 'EMAG_PROXY_REQUIRED' ? 503 : 500;
+      res.status(status).json({
+        code: status,
+        data: null,
+        message: err?.message ?? '调价日志重新核验失败',
+      });
+    }
+  },
+);
 
 /**
  * GET /api/store-products/grab-cart/readiness

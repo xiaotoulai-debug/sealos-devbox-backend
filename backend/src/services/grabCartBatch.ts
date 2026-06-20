@@ -68,6 +68,8 @@ export type GrabCartBatchItemResult = {
   logId: number | null;
   readBackStatus: string | null;
   readBackPrice: number | null;
+  readBackAt: string | null;
+  readBackAttempts: number | null;
   readBackWarning: string | null;
   noEmagWriteExecuted: boolean;
   writeGuardReasonCode: string | null;
@@ -226,6 +228,8 @@ function mapExecuteToBatchItem(
     logId: result.logId ?? null,
     readBackStatus: result.readBackStatus ?? null,
     readBackPrice: result.readBackPrice ?? null,
+    readBackAt: result.readBackAt ?? null,
+    readBackAttempts: result.readBackAttempts ?? null,
     readBackWarning: result.readBackWarning ?? null,
     noEmagWriteExecuted: result.noEmagWriteExecuted,
     writeGuardReasonCode: result.writeGuardReasonCode ?? null,
@@ -700,6 +704,8 @@ export async function batchExecuteGrabCart(params: {
         logId: null,
         readBackStatus: null,
         readBackPrice: null,
+        readBackAt: null,
+        readBackAttempts: null,
         readBackWarning: null,
         noEmagWriteExecuted: true,
         writeGuardReasonCode: null,
@@ -729,8 +735,9 @@ export async function batchExecuteGrabCart(params: {
   for (const row of results) {
     if (row.status === 'SUCCESS') {
       summary.success += 1;
-      if (row.readBackStatus === 'UNCONFIRMED') summary.pendingConfirm += 1;
-    } else if (row.status === 'FAILED' || row.status === 'PENDING_VERIFY') {
+    } else if (row.status === 'PENDING_VERIFY') {
+      summary.pendingConfirm += 1;
+    } else if (row.status === 'FAILED') {
       summary.failed += 1;
     } else if (row.status === 'BLOCKED') {
       summary.blocked += 1;

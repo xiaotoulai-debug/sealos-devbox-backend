@@ -194,6 +194,102 @@ export type ReadBackLogPayload = {
   priceFieldUsed: 'sale_price';
 };
 
+type PriceAdjustmentLogRow = Awaited<ReturnType<typeof prisma.storeProductPriceAdjustmentLog.findFirst>> & {};
+
+function toNumber(value: unknown): number | null {
+  if (value == null) return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function readBackFromEmagResponse(value: unknown): Partial<ReadBackLogPayload> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return {};
+  const readBack = (value as Record<string, unknown>).readBack;
+  if (!readBack || typeof readBack !== 'object' || Array.isArray(readBack)) return {};
+  return readBack as Partial<ReadBackLogPayload>;
+}
+
+export function toPriceAdjustmentLogDto(row: NonNullable<PriceAdjustmentLogRow>) {
+  const readBack = readBackFromEmagResponse(row.emagResponse);
+  return {
+    logId: row.id,
+    id: row.id,
+    shopId: row.shopId,
+    storeProductId: row.storeProductId,
+    pnk: row.pnk,
+    mode: row.mode,
+    status: row.status,
+    oldSalePriceExVat: toNumber(row.oldSalePriceExVat),
+    newSalePriceExVat: toNumber(row.newSalePriceExVat),
+    currency: row.currency,
+    cartPriceRaw: row.cartPriceRaw ?? null,
+    cartPriceExVat: toNumber(row.cartPriceExVat),
+    vatRate: toNumber(row.vatRate),
+    hardFloorPrice: toNumber(row.hardFloorPrice),
+    suggestedMinPrice: toNumber(row.suggestedMinPrice),
+    manualMinPrice: toNumber(row.manualMinPrice),
+    finalMinPrice: toNumber(row.finalMinPrice),
+    estimatedProfitAfter: toNumber(row.estimatedProfitAfter),
+    profitMarginPctAfter: toNumber(row.profitMarginPctAfter),
+    reason: row.reason,
+    operatorUserId: row.operatorUserId,
+    emagRequestPayload: row.emagRequestPayload ?? null,
+    emagResponse: row.emagResponse ?? null,
+    errorMessage: row.errorMessage,
+    readBackStatus: readBack.readBackStatus ?? null,
+    readBackPrice: toNumber(readBack.readBackPrice),
+    readBackAttempts: toNumber(readBack.readBackAttempts),
+    readBackAt: typeof readBack.readBackAt === 'string' ? readBack.readBackAt : null,
+    readBackWarning: typeof readBack.readBackWarning === 'string' ? readBack.readBackWarning : null,
+    profitRecalculated: row.status === 'SUCCESS',
+    profitRecalcWarning: null,
+    createdAt: row.createdAt,
+    updatedAt: row.updatedAt,
+  };
+}
+
+export async function listPriceAdjustmentLogsForStoreProduct(input: {
+  storeProductId: number;
+  shopId?: number | null;
+  page?: number;
+  pageSize?: number;
+}) {
+  const page = Number.isInteger(input.page) && (input.page ?? 0) > 0 ? input.page! : 1;
+  const pageSize = Math.min(
+    Number.isInteger(input.pageSize) && (input.pageSize ?? 0) > 0 ? input.pageSize! : 20,
+    100,
+  );
+  const where = {
+    storeProductId: input.storeProductId,
+    ...(input.shopId ? { shopId: input.shopId } : {}),
+  };
+  const [total, rows] = await Promise.all([
+    prisma.storeProductPriceAdjustmentLog.count({ where }),
+    prisma.storeProductPriceAdjustmentLog.findMany({
+      where,
+      orderBy: { createdAt: 'desc' },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+    }),
+  ]);
+
+  return {
+    storeProductId: input.storeProductId,
+    shopId: input.shopId ?? null,
+    page,
+    pageSize,
+    total,
+    items: rows.map(toPriceAdjustmentLogDto),
+  };
+}
+
+export async function getPriceAdjustmentLogDetail(logId: number) {
+  const row = await prisma.storeProductPriceAdjustmentLog.findUnique({
+    where: { id: logId },
+  });
+  return row ? toPriceAdjustmentLogDto(row) : null;
+}
+
 /** 合并 save 响应与 readBack 摘要，写入 emagResponse Json（不新增 DB 字段）。 */
 export function mergeSaveAndReadBackEmagResponse(
   saveResponse: unknown,

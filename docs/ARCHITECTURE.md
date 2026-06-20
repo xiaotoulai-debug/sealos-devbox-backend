@@ -546,6 +546,9 @@ Phase 1-B1 新增 execute 代码框架；Phase B-7 将源码硬编码开关升�
 
 - `POST /api/store-products/:id/price/execute`：手动改价执行框架，需 `ACTION_STORE_PRODUCT_PRICE_CHANGE` 权限；默认返回 `DRY_RUN_ONLY/SKIPPED`，message 明确 `no eMAG write executed`。
 - `POST /api/store-products/:id/grab-cart/execute`：手动抢购物车执行框架，需 `ACTION_STORE_PRODUCT_GRAB_CART` 权限；若 preview 后 `ALREADY_WON` 则安全跳过；默认不发送写请求。
+- `GET /api/store-products/:id/price/logs`：单 StoreProduct 调价日志列表，需 `ACTION_STORE_PRODUCT_PRICE_LOG_VIEW`；返回日志状态、价格、readBack 摘要、原因和时间戳。
+- `GET /api/store-products/price/logs/:logId`：单条调价日志详情，需 `ACTION_STORE_PRODUCT_PRICE_LOG_VIEW`；返回 `emagRequestPayload/emagResponse` 脱敏快照。
+- `POST /api/store-products/price/logs/:logId/reconcile`：对 `PENDING_VERIFY` 日志执行只读 readBack 核验，需 `ACTION_STORE_PRODUCT_PRICE_CHANGE`；只调用 `product_offer/read`，禁止再次发送 `product_offer/save`。
 
 **权限码（init-permissions.ts）：**
 
@@ -589,6 +592,13 @@ Phase 1-B2.1 在 `executePriceChange` 真实 save 成功后增加 readBack 对�
 
 **范围：** Phase B-7 已将同一套 readBack 接入 `executeGrabCartPriceChange` 真实写价路径；`SKIPPED` / `DRY_RUN_ONLY` 不触发 readBack。`UNCONFIRMED` 不自动重复 execute，仅作为 `PENDING_VERIFY` 留痕。
 
+**PENDING_VERIFY reconcile（2026-06-20 V1 闭环）：**
+
+- `reconcilePendingPriceAdjustmentLog(logId)` 只处理 `PENDING_VERIFY` 日志，使用日志 payload 的 `id/vat_id` 与 StoreProduct 的 `pnk/sku` 只读调用 `product_offer/read`。
+- 远端 `sale_price` 等于目标价：日志改 `SUCCESS`，更新本地 `StoreProduct.salePrice/vatId/vatRate/lastPriceAdjustedAt/lastPriceAdjustmentMode`，并触发单品利润重算。
+- 远端仍旧价、空值或读取失败：日志保持 `PENDING_VERIFY`，刷新 `emagResponse.readBack` 和 `errorMessage`，不更新本地价格、不重算利润、不重发 save。
+- 远端价格与目标价冲突同样保持 `PENDING_VERIFY`，由人工决定是否重新发起新的改价流程。
+
 ### 4.5.2.9 eMAG 真实写价安全闸门（Phase B-7，2026-06-16）
 
 Phase B-7 补齐 B-6c 评审阻塞项：env 开关 + 白名单 + grab-cart readBack。
@@ -623,7 +633,7 @@ Phase B-13a 从单 SKU 灰度切换为**批次运营后端 MVP**：不新增 bat
 - `listGrabCartCandidates({ shopId, page, pageSize })`：DB 预筛（RESELL、stock>0、commission/fbeFee 齐全、未赢 BuyBox）→ 最多 preview **100** 条 → 过滤 `canGrab=true` / `costStatus=COMPLETE` / margin≥店铺 targetMinMarginPct → 分页返回。
 - `buildGrabCartReadiness({ shopId, includePreview })`（Phase B-13b/B-13c）：默认 **DB-only** 输出候选准备漏斗，统计 RESELL、库存、Product 映射、采购成本、FBE、物流尺寸、佣金、`cartPriceTaxMode` 和 DB 侧候选准备数；仅 `includePreview=true` 时才逐条调用现有 preview / 候选池逻辑做实时 eMAG read 检查。
 - `batchExecuteGrabCart({ shopId, reason, items, operatorUserId })`：生成 `batchId`（UUID），**串行**调用现有 `executeGrabCartPriceChange`；reason 前缀 `[batch:{batchId}]` 写入单条日志；items **1–5**，禁止重复 storeProductId。
-- readBack `UNCONFIRMED` 计为 `pendingConfirm`，**不自动重复 execute**。
+- `PENDING_VERIFY` 计为 `pendingConfirm`，**不自动重复 execute**。
 
 **新 API（`routes/storeProducts.ts`，注册在 `/:id/...` 之前）：**
 

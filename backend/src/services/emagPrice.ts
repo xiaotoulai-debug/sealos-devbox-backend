@@ -19,6 +19,7 @@ import {
   markPriceAdjustmentSkipped,
   markPriceAdjustmentSuccess,
   mergeSaveAndReadBackEmagResponse,
+  toPriceAdjustmentLogDto,
   type PriceAdjustmentMode,
 } from './priceAdjustmentLogs';
 import {
@@ -236,6 +237,21 @@ export type PriceExecuteResult = {
 };
 
 export type PriceExecuteResultStatus = 'SUCCESS' | 'FAILED' | 'PENDING_VERIFY' | 'DRY_RUN_ONLY' | 'SKIPPED' | 'BLOCKED';
+
+export type PriceAdjustmentReconcileResult = {
+  status: 'SUCCESS' | 'PENDING_VERIFY';
+  code: 'OK' | typeof PRICE_ERROR_CODES.PENDING_VERIFY;
+  message: string;
+  log: ReturnType<typeof toPriceAdjustmentLogDto> | null;
+  readBackStatus: ReadBackStatus;
+  readBackPrice: number | null;
+  readBackAt: string;
+  readBackAttempts: number;
+  readBackWarning: string | null;
+  profitRecalculated: boolean;
+  profitRecalcWarning: string | null;
+  noEmagWriteExecuted: true;
+};
 
 // 与 profitCalculator 的 FBE 冷启动兜底保持业务口径一致。
 const DEFAULT_FBE_CNY = 7;
@@ -681,6 +697,148 @@ async function markReadBackPendingVerify(
     emagResponse: mergeSaveAndReadBackEmagResponse(saveResponse, readBack),
     errorMessage: pendingVerifyMessage(readBack),
   });
+}
+
+function getSaveResponseFromLog(value: unknown): unknown {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) return value ?? null;
+  const obj = value as Record<string, unknown>;
+  return Object.prototype.hasOwnProperty.call(obj, 'save') ? obj.save : value;
+}
+
+function firstPayloadItem(value: unknown): Partial<PriceUpdatePayloadItem> | null {
+  if (!Array.isArray(value)) return null;
+  const item = value.find((row) => row && typeof row === 'object' && !Array.isArray(row));
+  return item ? item as Partial<PriceUpdatePayloadItem> : null;
+}
+
+function modeToLastPriceAdjustmentMode(mode: string): 'MANUAL_PRICE_CHANGE' | 'GRAB_CART_MANUAL' {
+  return mode === 'GRAB_CART_MANUAL' ? 'GRAB_CART_MANUAL' : 'MANUAL_PRICE_CHANGE';
+}
+
+export async function reconcilePendingPriceAdjustmentLog(params: {
+  logId: number;
+}): Promise<PriceAdjustmentReconcileResult | null> {
+  const log = await prisma.storeProductPriceAdjustmentLog.findUnique({
+    where: { id: params.logId },
+    include: {
+      storeProduct: {
+        select: {
+          id: true,
+          shopId: true,
+          pnk: true,
+          sku: true,
+          emagOfferId: true,
+          vatId: true,
+          vatRate: true,
+        },
+      },
+    },
+  });
+  if (!log) return null;
+
+  if (log.status !== 'PENDING_VERIFY') {
+    const readBack = {
+      readBackStatus: 'READBACK_FAILED' as ReadBackStatus,
+      readBackPrice: null,
+      readBackAt: new Date().toISOString(),
+      readBackAttempts: 0,
+      readBackWarning: '仅 PENDING_VERIFY 日志允许重新核验',
+      targetPrice: Number(log.newSalePriceExVat),
+      filterUsed: null,
+      priceFieldUsed: 'sale_price' as const,
+    };
+    return {
+      status: 'PENDING_VERIFY',
+      code: PRICE_ERROR_CODES.PENDING_VERIFY,
+      message: readBack.readBackWarning,
+      log: toPriceAdjustmentLogDto(log),
+      readBackStatus: readBack.readBackStatus,
+      readBackPrice: readBack.readBackPrice,
+      readBackAt: readBack.readBackAt,
+      readBackAttempts: readBack.readBackAttempts,
+      readBackWarning: readBack.readBackWarning,
+      profitRecalculated: false,
+      profitRecalcWarning: null,
+      noEmagWriteExecuted: true,
+    };
+  }
+
+  const payloadItem = firstPayloadItem(log.emagRequestPayload);
+  const targetPrice = roundPrice(Number(log.newSalePriceExVat));
+  const readBack = await performPriceReadBackWithRetry({
+    shopId: log.shopId,
+    emagOfferId: payloadItem?.id ?? log.storeProduct.emagOfferId,
+    pnk: log.pnk ?? log.storeProduct.pnk,
+    sku: log.storeProduct.sku,
+    targetPrice,
+  });
+  const saveResponse = getSaveResponseFromLog(log.emagResponse);
+  const outcome = resolveReadBackExecutionOutcome(readBack);
+
+  if (!outcome.shouldCommitLocalPrice) {
+    await markReadBackPendingVerify(log.id, saveResponse, readBack);
+    const updated = await prisma.storeProductPriceAdjustmentLog.findUnique({ where: { id: log.id } });
+    return {
+      status: 'PENDING_VERIFY',
+      code: PRICE_ERROR_CODES.PENDING_VERIFY,
+      message: outcome.message,
+      log: updated ? toPriceAdjustmentLogDto(updated) : null,
+      readBackStatus: readBack.readBackStatus,
+      readBackPrice: readBack.readBackPrice,
+      readBackAt: readBack.readBackAt,
+      readBackAttempts: readBack.readBackAttempts,
+      readBackWarning: readBack.readBackWarning,
+      profitRecalculated: false,
+      profitRecalcWarning: null,
+      noEmagWriteExecuted: true,
+    };
+  }
+
+  const vatId = toPositiveInteger(payloadItem?.vat_id ?? log.storeProduct.vatId);
+  const vatRate = log.vatRate != null ? Number(log.vatRate) : log.storeProduct.vatRate != null ? Number(log.storeProduct.vatRate) : null;
+  await prisma.storeProduct.update({
+    where: { id: log.storeProductId },
+    data: {
+      salePrice: targetPrice,
+      vatId,
+      vatRate,
+      lastPriceAdjustedAt: new Date(),
+      lastPriceAdjustmentMode: modeToLastPriceAdjustmentMode(log.mode),
+    },
+  });
+
+  await markPriceAdjustmentSuccess(log.id, {
+    emagResponse: mergeSaveAndReadBackEmagResponse(saveResponse, readBack),
+    estimatedProfitAfter: log.estimatedProfitAfter != null ? Number(log.estimatedProfitAfter) : undefined,
+    profitMarginPctAfter: log.profitMarginPctAfter != null ? Number(log.profitMarginPctAfter) : undefined,
+  });
+
+  let profitRecalculated = false;
+  let profitRecalcWarning: string | null = null;
+  try {
+    const updatedCount = await recalcProfitForStoreProducts([log.storeProductId]);
+    profitRecalculated = updatedCount > 0;
+    if (updatedCount === 0) profitRecalcWarning = '单品利润重算未更新任何记录';
+  } catch (err: any) {
+    profitRecalcWarning = err?.message ?? '单品利润重算失败';
+    console.error('[reconcilePendingPriceAdjustmentLog] profit recalc failed:', profitRecalcWarning);
+  }
+
+  const updated = await prisma.storeProductPriceAdjustmentLog.findUnique({ where: { id: log.id } });
+  return {
+    status: 'SUCCESS',
+    code: 'OK',
+    message: 'price reconcile success',
+    log: updated ? toPriceAdjustmentLogDto(updated) : null,
+    readBackStatus: readBack.readBackStatus,
+    readBackPrice: readBack.readBackPrice,
+    readBackAt: readBack.readBackAt,
+    readBackAttempts: readBack.readBackAttempts,
+    readBackWarning: readBack.readBackWarning,
+    profitRecalculated,
+    profitRecalcWarning,
+    noEmagWriteExecuted: true,
+  };
 }
 
 export async function executePriceChange(params: {
