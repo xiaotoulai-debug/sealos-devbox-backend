@@ -1926,6 +1926,9 @@ eMAG `product_offer/read` 响应中包含 `vat_id`（整数）和 `vat_rate`（�
 - `vat/read` 按店铺执行并在单次 backfill 请求内缓存，响应返回 `vatReadStatus / vatReadError`，便于审计映射来源。
 - 安全静态兜底集中在 `emagProductNormalizer.ts`，当前仅保留 `0 -> 0`；禁止使用全局固定 `22004 -> 0.19/0.20` 覆盖店铺级 `vat/read`。
 - 未知 `vatId` 不猜税率，返回 `unknownVatIds` 与明细状态。
+- 同一轮 VAT backfill 以 `storeProductId` 作为最终唯一键，扫描阶段先收集 offer 匹配候选，再统一按 `emagOfferId > pnk > sku/vendorSku` 优先级决策，避免 eMAG 返回重复 offer 时同一 `StoreProduct` 被重复 planned/updated。
+- 同优先级重复匹配且 VAT 完全一致时，仅保留一个最终候选，其余明细标记 `SKIPPED_DUPLICATE`，并通过 `duplicateMatchCount / duplicateMatches` 返回审计信息；重复记录不计入 `planned / updated`。
+- 同优先级重复匹配但 `vatId / vatRate` 不一致时，标记 `FAILED_AMBIGUOUS`，计入 `failed`，并通过 `ambiguousMatchCount / ambiguousMatches` 返回冲突明细；存在 ambiguous 时禁止进入安全写入。
 - `dryRun=false` 才写 `StoreProduct.vatId / vatRate`；不会修改价格、SKU 映射、Product 成本或 FBE。
 
 ### 17.2 commission batch-sync allShops
