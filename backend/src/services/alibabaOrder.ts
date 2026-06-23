@@ -1,0 +1,214 @@
+import { callAlibabaAPIPost, getValidAccessToken, AlibabaAPIResult } from '../utils/alibaba';
+
+const DEFAULT_ADDRESS_ID = process.env.ALIBABA_DEFAULT_ADDRESS_ID ?? '';
+
+// ── 类型 ──────────────────────────────────────────────────────
+
+interface CargoParam {
+  offerId: string | number;
+  specId: string; // 1688 强制依赖 32 位 MD5 哈希，不可为空
+  quantity: number;
+}
+
+interface CreateOrderResult {
+  orderId: string;
+  totalAmount: number;
+  raw: unknown;
+}
+
+export interface AlibabaOrderDebugPayload {
+  addressParam: string;
+  cargoParamList: string;
+  flow: string;
+  fenxiaoChannel: string;
+  message: string;
+}
+
+/**
+ * 只有这些“明确表示 offer/spec/sku 不存在或不匹配”的错误，才允许触发本地规格失效处理。
+ * 严禁把余额不足、地址错误、专供品声明、起批量、权限等业务错误误判为规格失效。
+ */
+export function isAlibabaSpecInvalidError(result: Pick<AlibabaAPIResult<unknown>, 'errorCode' | 'errorMessage' | 'raw'>): boolean {
+  const code = String(result.errorCode ?? '').trim();
+  const message = String(result.errorMessage ?? '');
+  const raw = JSON.stringify(result.raw ?? '');
+  const text = `${code} ${message} ${raw}`.toLowerCase();
+
+  const hasSpecKeyword =
+    text.includes('spec_not_found') ||
+    text.includes('spec not found') ||
+    text.includes('invalid_specid') ||
+    text.includes('invalid specid') ||
+    text.includes('cargo_not_match') ||
+    text.includes('cargo not match') ||
+    text.includes('规格不存在') ||
+    text.includes('规格已下架') ||
+    text.includes('不属于商品') ||
+    text.includes('sku不存在') ||
+    text.includes('sku not exist') ||
+    text.includes('offerid empty or not exist') ||
+    text.includes('商品不存在') ||
+    text.includes('商品已下架');
+
+  const hasBusinessOnlyKeyword =
+    text.includes('专供品') ||
+    text.includes('声明') ||
+    text.includes('availablequota') ||
+    text.includes('余额不足') ||
+    text.includes('地址') ||
+    text.includes('起批') ||
+    text.includes('订购量') ||
+    text.includes('权限') ||
+    text.includes('unsupported');
+
+  // 500_003 是 1688 的宽泛业务错误码，必须同时命中规格/商品失效语义才允许重置。
+  return hasSpecKeyword && !hasBusinessOnlyKeyword;
+}
+
+// ── 构建下单 Payload 并调用 1688 创建订单 ─────────────────────
+
+export async function createAlibabaOrder(
+  items: CargoParam[],
+  addressId?: string,
+  alibabaAuthId?: number | null,
+): Promise<AlibabaAPIResult<CreateOrderResult> & { debugPayload?: AlibabaOrderDebugPayload }> {
+  console.log('═══════════════════════════════════════════════════');
+  console.log('[alibabaOrder] ★★★ 开始创建 1688 订单 ★★★');
+  console.log('[alibabaOrder] 商品列表:', JSON.stringify(items));
+
+  const accessToken = await getValidAccessToken({ alibabaAuthId: alibabaAuthId ?? null });
+  if (!accessToken) {
+    console.error('[alibabaOrder] ❌ 无有效 AccessToken');
+    return { success: false, data: null, errorCode: 'NO_TOKEN', errorMessage: '1688 授权已过期，请重新绑定账号' };
+  }
+  console.log('[alibabaOrder] ✅ AccessToken 已获取');
+
+  // 1. 确定收货地址 ID
+  const finalAddressId = addressId || DEFAULT_ADDRESS_ID;
+  if (!finalAddressId) {
+    console.error('[alibabaOrder] ❌ 无收货地址 ID（环境变量 ALIBABA_DEFAULT_ADDRESS_ID 未配置）');
+    return { success: false, data: null, errorCode: 'NO_ADDRESS', errorMessage: '未配置 1688 收货地址 ID，请联系管理员在 .env 中设置 ALIBABA_DEFAULT_ADDRESS_ID' };
+  }
+  console.log(`[alibabaOrder] ✅ 使用收货地址 ID: ${finalAddressId}`);
+
+  // 2. 构建请求参数
+  // ★ addressId 必须为 Number，1688 Java 后端对 Long 类型严格反序列化，String 会触发 500_002
+  const addressParam = JSON.stringify({ addressId: Number(finalAddressId) });
+
+  // ★ offerId/quantity 强转 Number（1688 Java 后端 Long 反序列化，String 会 500_002）
+  // ★ specId 必须为 32 位 MD5 哈希字符串（String），不可为空
+  const cargoItems = items.map((item) => ({
+    offerId: Number(item.offerId),
+    specId: String(item.specId ?? ''),
+    quantity: Number(item.quantity) || 1,
+  }));
+
+  cargoItems.forEach((c, i) => {
+    console.log(`[alibabaOrder] 类型校验 [${i}] offerId=${typeof c.offerId}(${c.offerId}) specId=${typeof c.specId}(${c.specId?.slice?.(-8)}) quantity=${typeof c.quantity}(${c.quantity})`);
+  });
+
+  cargoItems.forEach((c, i) => {
+    console.log(`=== 1688 FINAL PAYLOAD [${i}] ===`, JSON.stringify(c));
+  });
+
+  const cargoParamList = JSON.stringify(cargoItems);
+  console.log('=== FINAL 1688 ORDER PAYLOAD ===', JSON.stringify(JSON.parse(cargoParamList), null, 2));
+
+  // 1688 官方 fastCreateOrder 支持 fenxiaoChannel，下游平台枚举含“跨境-kuajing”。
+  // 对跨境专供货源，补充该声明型参数，避免“专供品购买未勾选声明”类拦截。
+  const orderData = {
+    flow: 'general',
+    fenxiaoChannel: 'kuajing',
+    message: '跨境采购专供品声明已确认',
+    addressParam,
+    cargoParamList,
+  };
+  const debugPayload: AlibabaOrderDebugPayload = {
+    flow: 'general',
+    fenxiaoChannel: 'kuajing',
+    message: '跨境采购专供品声明已确认',
+    addressParam,
+    cargoParamList,
+  };
+
+  console.log('=== 1688 ORDER SUBMIT PAYLOAD ===', JSON.stringify(orderData, null, 2));
+  console.log('[alibabaOrder] addressParam:', addressParam);
+  console.log('[alibabaOrder] cargoParamList:', cargoParamList);
+
+  // 3. 预览订单
+  const previewApiPath = 'param2/1/com.alibaba.trade/alibaba.createOrder.preview';
+  console.log('[alibabaOrder] ── 第一步: 预览订单 ──');
+  const preview = await callAlibabaAPIPost<Record<string, unknown>>(
+    previewApiPath,
+    orderData,
+    accessToken,
+  );
+
+  console.log('[alibabaOrder] 预览结果 success:', preview.success);
+  console.log('[alibabaOrder] 预览完整响应:', JSON.stringify(preview.raw).slice(0, 2000));
+
+  if (!preview.success) {
+    const errMsg = preview.errorMessage ?? '预览订单网关失败';
+    console.error(`[alibabaOrder] ❌ 预览网关失败: ${preview.errorCode} → ${errMsg}`);
+    return { success: false, data: null, errorCode: preview.errorCode ?? 'PREVIEW_GW_FAILED', errorMessage: errMsg, raw: preview.raw, debugPayload };
+  }
+
+  const previewData = preview.data as any;
+  if (previewData?.success === false || previewData?.success === 'false') {
+    const errMsg = previewData.message ?? previewData.errorMsg ?? previewData.resultDesc ?? '预览订单业务失败';
+    const errCode = previewData.errorCode ?? previewData.resultCode ?? 'PREVIEW_BIZ_FAILED';
+    console.error(`[alibabaOrder] ❌ 预览业务失败: ${errCode} → ${errMsg}`);
+    console.error('[alibabaOrder] 预览业务失败完整数据:', JSON.stringify(previewData));
+    return { success: false, data: null, errorCode: String(errCode), errorMessage: errMsg, raw: previewData, debugPayload };
+  }
+
+  console.log('[alibabaOrder] ✅ 预览成功');
+  console.log('[alibabaOrder] ── 第二步: 正式下单 ──');
+
+  // 4. 正式创建订单
+  const createApiPath = 'param2/1/com.alibaba.trade/alibaba.trade.fastCreateOrder';
+  console.log('🔥🔥🔥 1688 CREATE ORDER FULL PAYLOAD 🔥🔥🔥', JSON.stringify(orderData, null, 2));
+  const createResult = await callAlibabaAPIPost<Record<string, unknown>>(
+    createApiPath,
+    orderData,
+    accessToken,
+  );
+
+  console.log('[alibabaOrder] 下单结果 success:', createResult.success);
+  console.log('[alibabaOrder] 下单完整响应:', JSON.stringify(createResult.raw).slice(0, 2000));
+
+  if (!createResult.success) {
+    const errMsg = createResult.errorMessage ?? '1688 下单网关失败';
+    console.error(`[alibabaOrder] ❌ 下单网关失败: ${createResult.errorCode} → ${errMsg}`);
+    console.log('❌❌❌ 1688 RAW ERROR ❌❌❌', JSON.stringify(createResult.raw, null, 2));
+    return {
+      success: false, data: null,
+      errorCode: createResult.errorCode ?? 'CREATE_GW_FAILED',
+      errorMessage: errMsg,
+      raw: createResult.raw,
+      debugPayload,
+    };
+  }
+
+  const rawData = createResult.data as any;
+  if (rawData?.success === false || rawData?.success === 'false') {
+    const errMsg = rawData.message ?? rawData.errorMsg ?? rawData.errorMessage ?? rawData.resultDesc ?? '1688 下单业务失败';
+    const errCode = rawData.errorCode ?? rawData.resultCode ?? 'BIZ_ERROR';
+    console.error(`[alibabaOrder] ❌ 下单业务失败: ${errCode} → ${errMsg}`);
+    console.log('❌❌❌ 1688 RAW ERROR ❌❌❌', JSON.stringify(createResult.raw ?? rawData, null, 2));
+    return { success: false, data: null, errorCode: String(errCode), errorMessage: errMsg, raw: rawData, debugPayload };
+  }
+
+  const orderId = String(rawData.orderId ?? rawData.result?.orderId ?? rawData.result?.id ?? '');
+  const totalAmount = Number(rawData.totalAmount ?? rawData.result?.totalAmount ?? 0);
+
+  console.log('═══════════════════════════════════════════════════');
+  console.log(`[alibabaOrder] ✅✅✅ 下单成功! orderId=${orderId}, totalAmount=${totalAmount}`);
+  console.log('═══════════════════════════════════════════════════');
+
+  return {
+    success: true,
+    data: { orderId, totalAmount, raw: rawData },
+    raw: rawData,
+  };
+}

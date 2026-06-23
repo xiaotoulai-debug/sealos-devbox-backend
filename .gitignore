@@ -1,0 +1,12 @@
+node_modules/
+.env
+*.log
+dist/
+.DS_Store
+
+# ── 本地过程汇报（不提交 GitHub）────────────────────────────
+后端反馈.md
+
+# ── 数据库备份（敏感/大体积，禁止入库）──────────────────────
+backend/backups/
+backups/
