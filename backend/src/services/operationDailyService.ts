@@ -110,9 +110,7 @@ export function isOperationManager(user?: JwtPayload): boolean {
 
 export function canSubmitOperationDaily(user?: JwtPayload): boolean {
   if (!user) return false;
-  const roleName = String(user.roleName ?? '').trim();
-  if (roleName === '运营专员' || roleName === '运营主管') return true;
-  return hasStrictPermission(user, 'ACTION_OPERATION_DAILY_SUBMIT');
+  return String(user.roleName ?? '').trim() === '运营专员';
 }
 
 export function canViewOperationDailyDetail(user?: JwtPayload): boolean {
@@ -154,7 +152,7 @@ function collectRoleLikeValues(user: unknown): unknown[] {
   return values.filter((value) => value != null && String(value).trim() !== '');
 }
 
-export const DAILY_REPORT_ROLE_NAMES = ['运营专员', '运营主管'] as const;
+export const DAILY_REPORT_ROLE_NAMES = ['运营专员'] as const;
 
 export function isDailyReportRole(roleName?: string | null): boolean {
   return DAILY_REPORT_ROLE_NAMES.includes(String(roleName ?? '').trim() as typeof DAILY_REPORT_ROLE_NAMES[number]);
@@ -200,7 +198,7 @@ export function isOperationUser(user?: unknown): boolean {
 
 function assertCanSubmitOperationDaily(user: JwtPayload): void {
   if (!canSubmitOperationDaily(user)) {
-    throw Object.assign(new Error('仅运营专员或运营主管可以提交每日登记'), { statusCode: 403 });
+    throw Object.assign(new Error('仅运营专员可以提交每日登记'), { statusCode: 403 });
   }
 }
 
@@ -887,14 +885,20 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
   const monthEnd = dateStringToDbDate(endDate);
   const yesterdayDate = dateStringToDbDate(yesterday);
 
-  const [activeUsers, monthReports, monthLogs, yesterdayReports, workdayStatusMap, yesterdayWorkdayStatus] = await Promise.all([
-    prisma.user.findMany({
-      where: dailyReportParticipantWhere,
-      select: { id: true, name: true, role: { select: { name: true } } },
-      orderBy: { id: 'asc' },
-    }),
+  const activeUsers = await prisma.user.findMany({
+    where: dailyReportParticipantWhere,
+    select: { id: true, name: true, role: { select: { name: true } } },
+    orderBy: { id: 'asc' },
+  });
+
+  const operationUsers = activeUsers;
+  const operationUserIdList = activeUsers.map((user) => user.id);
+  const safeUserIds = operationUserIdList.length > 0 ? operationUserIdList : [-1];
+
+  const [monthReports, monthLogs, yesterdayReports, workdayStatusMap, yesterdayWorkdayStatus] = await Promise.all([
     prisma.operationDailyReport.findMany({
       where: {
+        userId: { in: safeUserIds },
         workDate: {
           gte: monthStart,
           lte: monthEnd,
@@ -904,6 +908,7 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
     }),
     prisma.operationDailyLog.findMany({
       where: {
+        userId: { in: safeUserIds },
         workDate: {
           gte: monthStart,
           lte: monthEnd,
@@ -921,15 +926,17 @@ export async function getOperationDailyMonthlyOverview(params: { user: JwtPayloa
       },
     }),
     prisma.operationDailyReport.findMany({
-      where: { workDate: yesterdayDate },
+      where: {
+        userId: { in: safeUserIds },
+        workDate: yesterdayDate,
+      },
       select: { userId: true },
     }),
     getWorkdayStatusMap(startDate, endDate),
     getWorkdayStatusForDate(yesterday),
   ]);
 
-  const operationUsers = activeUsers;
-  const operationUserIds = new Set(operationUsers.map((user) => user.id));
+  const operationUserIds = new Set(operationUserIdList);
   const reportMap = new Map<string, { id: number; userId: number; workDate: Date; editCount: number }>();
   for (const report of monthReports) {
     if (!operationUserIds.has(report.userId)) continue;
