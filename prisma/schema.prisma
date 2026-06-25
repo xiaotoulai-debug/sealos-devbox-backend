@@ -288,6 +288,11 @@ model StoreProduct {
   profitBreakdown      Json?      @map("profit_breakdown")          // 利润明细拆解 JSON（各项扣费 + 估算标识）
   emagLinkType         String?    @map("emag_link_type")            // SELF_BUILT / RESELL / UNKNOWN
   isArchived           Boolean    @default(false) @map("is_archived")
+  hasPlatformAttention Boolean    @default(false) @map("has_platform_attention")
+  hasBlockingIssue     Boolean    @default(false) @map("has_blocking_issue")
+  platformDiagnostics  Json?      @map("platform_diagnostics")
+  emagStatusSnapshot   Json?      @map("emag_status_snapshot")
+  diagnosticsUpdatedAt DateTime?  @map("diagnostics_updated_at")
   syncedAt         DateTime @default(now()) @map("synced_at")
   shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
 
@@ -296,6 +301,8 @@ model StoreProduct {
   @@index([pnk])
   @@index([vendorSku])
   @@index([shopId, comprehensiveSales(sort: Desc)])
+  @@index([shopId, hasPlatformAttention])
+  @@index([shopId, hasBlockingIssue])
   @@map("store_products")
 }
 

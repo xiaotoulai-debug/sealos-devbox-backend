@@ -8,7 +8,7 @@ import { EmagCredentials, emagApiCall, EmagApiResponse, REGION_CURRENCY, EmagReg
 //   3. order/save   — 更新订单 (注意: 必须回传原始全量字段, 否则会覆盖)
 //
 // 订单状态映射:
-//   1 = New, 2 = In progress, 3 = Prepared, 4 = Finalized, 5 = Cancelled
+//   0 = Cancelled, 1 = New, 2 = In progress, 3 = Prepared, 4 = Finalized, 5 = Returned
 
 export interface EmagOrder {
   id: number;
@@ -164,8 +164,8 @@ export interface ReadOrdersOptions {
   itemsPerPage?: number;
 }
 
-/** 全状态常量：1=New, 2=In progress, 3=Prepared, 4=Finalized, 5=Cancelled */
-export const ALL_ORDER_STATUSES = [1, 2, 3, 4, 5] as const;
+/** 全状态常量：0=Cancelled, 1=New, 2=In progress, 3=Prepared, 4=Finalized, 5=Returned */
+export const ALL_ORDER_STATUSES = [0, 1, 2, 3, 4, 5] as const;
 
 /** 转为 eMAG 日期格式 YYYY-mm-dd HH:ii:ss */
 function toEmagDateTime(dateStr: string, time: string): string {

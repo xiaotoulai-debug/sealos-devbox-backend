@@ -696,6 +696,9 @@ router.get('/', async (req: Request, res: Response) => {
         validation_status: validationStatusDisplay,
         doc_errors: p.docErrors ?? null,
         rejection_reason: p.rejectionReason ?? null,
+        platformDiagnostics: Array.isArray(p.platformDiagnostics) ? p.platformDiagnostics : (p.platformDiagnostics ?? []),
+        hasPlatformAttention: p.hasPlatformAttention ?? false,
+        hasBlockingIssue: p.hasBlockingIssue ?? false,
       };
     });
 

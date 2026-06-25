@@ -85,15 +85,13 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
     }
   };
 
-  await fetchPage(); // 先不传 status，拉取全部
+  await fetchPage(); // 轮次 1：默认全量（正常产品为主）
   await new Promise((r) => setTimeout(r, DELAY_MS));
-  await fetchPage({ validation_status: 8 }); // 强制拉取 validation_status=8 驳回产品
+  await fetchPage({ validation_status: 8 }); // 轮次 2：资料驳回（保留）
   await new Promise((r) => setTimeout(r, DELAY_MS));
-  if (allOffers.length === 0) {
-    await fetchPage({ status: 1 });
-    await new Promise((r) => setTimeout(r, DELAY_MS));
-    await fetchPage({ status: 0 });
-  }
+  await fetchPage({ validation_status: 10 }); // 轮次 3：平台锁定（新增）
+  await new Promise((r) => setTimeout(r, DELAY_MS));
+  await fetchPage({ status: 0 }); // 轮次 4：下架产品（从兜底改为常规补拉）
   result.totalFetched = allOffers.length;
 
   console.log(
@@ -197,6 +195,11 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
         validationStatus: np.validationStatus,
         docErrors: np.docErrors ?? undefined,
         rejectionReason: np.rejectionReason,
+        hasPlatformAttention: np.hasPlatformAttention,
+        hasBlockingIssue: np.hasBlockingIssue,
+        platformDiagnostics: np.platformDiagnostics as unknown as Prisma.InputJsonValue,
+        emagStatusSnapshot: np.emagStatusSnapshot as unknown as Prisma.InputJsonValue,
+        diagnosticsUpdatedAt: new Date(),
       };
 
       // 构建 update 对象：有新图片时强制覆盖，无图片时保留 DB 已有值（不传 undefined = 跳过更新）
