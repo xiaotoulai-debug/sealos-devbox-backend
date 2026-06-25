@@ -349,6 +349,11 @@ model StoreProduct {
   firstAvailableAt DateTime? @map("first_available_at") // 当前店铺下首次平台库存 > 0 的时间（新品观察期基准）
   firstStockSignalAt DateTime? @map("first_stock_signal_at") // 首次平台库存>0 或 FBE/ERP 在途>0 的时间
   firstInboundAt     DateTime? @map("first_inbound_at") // 首次 FBE/ERP 在途 > 0 的时间
+  hasPlatformAttention Boolean   @default(false) @map("has_platform_attention")
+  hasBlockingIssue     Boolean   @default(false) @map("has_blocking_issue")
+  platformDiagnostics  Json?     @map("platform_diagnostics")
+  emagStatusSnapshot   Json?     @map("emag_status_snapshot")
+  diagnosticsUpdatedAt DateTime? @map("diagnostics_updated_at")
   syncedAt         DateTime @default(now()) @map("synced_at")
   shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
   inventorySnapshots StoreProductInventorySnapshot[]
@@ -371,6 +376,8 @@ model StoreProduct {
   @@index([shopId, firstAvailableAt])
   @@index([shopId, firstStockSignalAt])
   @@index([shopId, firstInboundAt])
+  @@index([shopId, hasPlatformAttention])
+  @@index([shopId, hasBlockingIssue])
   @@map("store_products")
 }
 
