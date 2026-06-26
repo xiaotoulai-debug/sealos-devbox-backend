@@ -166,6 +166,226 @@ export interface NormalizedProduct {
   buyButtonRank: number | null;
   offerValidationStatus: unknown | null;
   brand: string | null;
+  // ── VAT 字段（来自 product_offer.vat_id）─────────────────────
+  vatId: number | null;  // eMAG VAT 分类 ID，原样存储，不做税率换算
+  // ── 新诊断体系字段 ──────────────────────────────────────────────
+  platformDiagnostics: PlatformDiagnostic[];
+  emagStatusSnapshot: EmagStatusSnapshot;
+  hasPlatformAttention: boolean;
+  hasBlockingIssue: boolean;
+}
+
+// ─── 平台诊断标签系统 ─────────────────────────────────────────────────────
+
+export type PlatformDiagnosticCode =
+  | 'DRAFT_INCOMPLETE'
+  | 'PLATFORM_LOCKED'
+  | 'PRICE_INVALID'
+  | 'BRAND_REJECTED'
+  | 'EAN_REJECTED'
+  | 'DOCUMENTATION_REJECTED'
+  | 'TRANSLATION_FAILED'
+  | 'UPDATE_REJECTED'
+  | 'UPDATE_REVIEW_PENDING'
+  | 'MARKETPLACE_REVIEW_PENDING'
+  | 'BRAND_REVIEW_PENDING'
+  | 'DOCUMENTATION_REVIEW_PENDING'
+  | 'TRANSLATION_PENDING'
+  | 'WAITING_SALEABLE_OFFER'
+  | 'OFFER_INACTIVE'
+  | 'OFFER_EOL';
+
+export interface PlatformDiagnostic {
+  code: PlatformDiagnosticCode;
+  severity: 'critical' | 'warning' | 'pending' | 'inactive';
+  saleImpact: 'blocked' | 'saleable' | 'unknown';
+  actionType: 'fix' | 'wait' | 'check' | 'none';
+  reason: string | null;
+  sources: Array<'validation_status' | 'translation_validation_status' | 'offer_validation_status' | 'offer_status'>;
+  rawValues: number[];
+}
+
+export interface EmagStatusSnapshotItem {
+  value: number | null;
+  description: string | null;
+  errors: string[];
+}
+
+export interface EmagStatusSnapshot {
+  vs: EmagStatusSnapshotItem | null;
+  transVs: EmagStatusSnapshotItem | null;
+  offerVs: EmagStatusSnapshotItem | null;
+  offerStatus: number | null;
+}
+
+type DiagMeta = {
+  code: PlatformDiagnosticCode;
+  severity: 'critical' | 'warning' | 'pending' | 'inactive';
+  saleImpact: 'blocked' | 'saleable' | 'unknown';
+  actionType: 'fix' | 'wait' | 'check' | 'none';
+};
+
+const COMMON_VALUE_MAP: Record<number, DiagMeta | null> = {
+  0:  { code: 'DRAFT_INCOMPLETE',             severity: 'warning',   saleImpact: 'blocked',  actionType: 'fix'   },
+  1:  { code: 'MARKETPLACE_REVIEW_PENDING',   severity: 'pending',   saleImpact: 'blocked',  actionType: 'wait'  },
+  2:  { code: 'BRAND_REVIEW_PENDING',         severity: 'pending',   saleImpact: 'blocked',  actionType: 'wait'  },
+  3:  null,
+  4:  { code: 'DOCUMENTATION_REVIEW_PENDING', severity: 'pending',   saleImpact: 'blocked',  actionType: 'wait'  },
+  5:  { code: 'BRAND_REJECTED',               severity: 'critical',  saleImpact: 'blocked',  actionType: 'fix'   },
+  6:  { code: 'EAN_REJECTED',                 severity: 'critical',  saleImpact: 'blocked',  actionType: 'fix'   },
+  8:  { code: 'DOCUMENTATION_REJECTED',       severity: 'critical',  saleImpact: 'blocked',  actionType: 'fix'   },
+  9:  null,
+  10: { code: 'PLATFORM_LOCKED',              severity: 'critical',  saleImpact: 'blocked',  actionType: 'check' },
+  11: { code: 'UPDATE_REVIEW_PENDING',        severity: 'pending',   saleImpact: 'saleable', actionType: 'wait'  },
+  12: { code: 'UPDATE_REJECTED',              severity: 'warning',   saleImpact: 'saleable', actionType: 'fix'   },
+};
+
+const TRANS_ONLY_VALUE_MAP: Record<number, DiagMeta | null> = {
+  13: { code: 'WAITING_SALEABLE_OFFER', severity: 'pending',   saleImpact: 'blocked', actionType: 'check' },
+  14: { code: 'TRANSLATION_FAILED',    severity: 'critical',  saleImpact: 'blocked', actionType: 'fix'   },
+  15: { code: 'TRANSLATION_PENDING',   severity: 'pending',   saleImpact: 'blocked', actionType: 'wait'  },
+  16: { code: 'TRANSLATION_PENDING',   severity: 'pending',   saleImpact: 'blocked', actionType: 'wait'  },
+  17: null,
+};
+
+const OFFER_INACTIVE_SUPPRESSOR_CODES = new Set<PlatformDiagnosticCode>([
+  'PLATFORM_LOCKED', 'BRAND_REJECTED', 'EAN_REJECTED',
+  'DOCUMENTATION_REJECTED', 'TRANSLATION_FAILED', 'DRAFT_INCOMPLETE',
+]);
+
+const DIAG_SEVERITY_ORDER: Record<string, number> = { critical: 0, warning: 1, pending: 2, inactive: 3 };
+const DIAG_CODE_ORDER: Record<PlatformDiagnosticCode, number> = {
+  PLATFORM_LOCKED: 0, DOCUMENTATION_REJECTED: 1, BRAND_REJECTED: 2, EAN_REJECTED: 3,
+  TRANSLATION_FAILED: 4, PRICE_INVALID: 5, DRAFT_INCOMPLETE: 6,
+  UPDATE_REJECTED: 10,
+  MARKETPLACE_REVIEW_PENDING: 20, BRAND_REVIEW_PENDING: 21, DOCUMENTATION_REVIEW_PENDING: 22,
+  TRANSLATION_PENDING: 23, WAITING_SALEABLE_OFFER: 24, UPDATE_REVIEW_PENDING: 25,
+  OFFER_EOL: 30, OFFER_INACTIVE: 31,
+};
+
+function extractStatusObjFromRaw(raw: unknown): EmagStatusSnapshotItem | null {
+  if (raw == null) return null;
+  const item = Array.isArray(raw) ? raw[0] : raw;
+  if (item == null) return null;
+  if (typeof item === 'number') return { value: item, description: null, errors: [] };
+  if (typeof item !== 'object') return null;
+  const obj = item as Record<string, unknown>;
+  const value = obj.value != null ? Number(obj.value) : null;
+  const description = typeof obj.description === 'string' && obj.description ? obj.description : null;
+  const errors = extractErrorsForSnapshot(obj);
+  return { value, description, errors };
+}
+
+function extractErrorsForSnapshot(obj: Record<string, unknown>): string[] {
+  const errsRaw = obj.errors ?? obj.doc_errors ?? obj.messages;
+  const msgs: string[] = [];
+  const addMsg = (e: unknown): void => {
+    let m = '';
+    if (typeof e === 'string') {
+      m = e.trim();
+    } else if (e && typeof e === 'object') {
+      const o = e as Record<string, unknown>;
+      m = String(o.message ?? o.error ?? o.description ?? o.field ?? o.text ?? '').trim();
+      if (!m) m = JSON.stringify(e).slice(0, 500);
+    }
+    if (m && m !== '{}') msgs.push(m.slice(0, 500));
+  };
+  if (Array.isArray(errsRaw)) {
+    for (const e of errsRaw.slice(0, 10)) addMsg(e);
+  } else if (typeof errsRaw === 'string' && errsRaw.trim()) {
+    msgs.push(errsRaw.trim().slice(0, 500));
+  }
+  return msgs;
+}
+
+function reasonFromStatusItem(item: EmagStatusSnapshotItem | null): string | null {
+  if (!item) return null;
+  if (item.errors.length > 0) return item.errors.join('; ');
+  return item.description;
+}
+
+export function buildPlatformDiagnostics(
+  vs: EmagStatusSnapshotItem | null,
+  transVs: EmagStatusSnapshotItem | null,
+  offerVs: EmagStatusSnapshotItem | null,
+  offerStatus: number | null,
+): PlatformDiagnostic[] {
+  const byCode = new Map<PlatformDiagnosticCode, PlatformDiagnostic>();
+
+  const processCommon = (
+    item: EmagStatusSnapshotItem | null,
+    sourceKey: 'validation_status' | 'translation_validation_status',
+  ): void => {
+    if (!item || item.value == null) return;
+    const val = item.value;
+    if (!(val in COMMON_VALUE_MAP)) return;
+    const meta = COMMON_VALUE_MAP[val];
+    if (!meta) return;
+    const existing = byCode.get(meta.code);
+    if (existing) {
+      if (!existing.sources.includes(sourceKey)) existing.sources.push(sourceKey);
+      if (!existing.rawValues.includes(val)) existing.rawValues.push(val);
+      if (sourceKey === 'validation_status' && !existing.reason) {
+        existing.reason = reasonFromStatusItem(item);
+      }
+    } else {
+      byCode.set(meta.code, {
+        code: meta.code, severity: meta.severity, saleImpact: meta.saleImpact, actionType: meta.actionType,
+        reason: reasonFromStatusItem(item), sources: [sourceKey], rawValues: [val],
+      });
+    }
+  };
+
+  processCommon(vs, 'validation_status');
+  processCommon(transVs, 'translation_validation_status');
+
+  if (transVs && transVs.value != null) {
+    const val = transVs.value;
+    if (val in TRANS_ONLY_VALUE_MAP) {
+      const meta = TRANS_ONLY_VALUE_MAP[val];
+      if (meta) {
+        const existing = byCode.get(meta.code);
+        if (meta.code === 'TRANSLATION_PENDING' && existing) {
+          if (!existing.rawValues.includes(val)) existing.rawValues.push(val);
+        } else if (!existing) {
+          byCode.set(meta.code, {
+            code: meta.code, severity: meta.severity, saleImpact: meta.saleImpact, actionType: meta.actionType,
+            reason: reasonFromStatusItem(transVs), sources: ['translation_validation_status'], rawValues: [val],
+          });
+        }
+      }
+    }
+  }
+
+  if (offerVs && offerVs.value === 2) {
+    byCode.set('PRICE_INVALID', {
+      code: 'PRICE_INVALID', severity: 'critical', saleImpact: 'blocked', actionType: 'fix',
+      reason: reasonFromStatusItem(offerVs), sources: ['offer_validation_status'], rawValues: [2],
+    });
+  }
+
+  const rootCodes = new Set(byCode.keys());
+
+  if (offerStatus === 0 && ![...OFFER_INACTIVE_SUPPRESSOR_CODES].some(c => rootCodes.has(c))) {
+    byCode.set('OFFER_INACTIVE', {
+      code: 'OFFER_INACTIVE', severity: 'inactive', saleImpact: 'blocked', actionType: 'check',
+      reason: null, sources: ['offer_status'], rawValues: [0],
+    });
+  }
+
+  if (offerStatus === 2) {
+    byCode.set('OFFER_EOL', {
+      code: 'OFFER_EOL', severity: 'inactive', saleImpact: 'blocked', actionType: 'check',
+      reason: null, sources: ['offer_status'], rawValues: [2],
+    });
+  }
+
+  return [...byCode.values()].sort((a, b) => {
+    const sa = DIAG_SEVERITY_ORDER[a.severity] ?? 99;
+    const sb = DIAG_SEVERITY_ORDER[b.severity] ?? 99;
+    if (sa !== sb) return sa - sb;
+    return (DIAG_CODE_ORDER[a.code] ?? 99) - (DIAG_CODE_ORDER[b.code] ?? 99);
+  });
 }
 
 function extractBrand(raw: Record<string, unknown>): string | null {
@@ -304,12 +524,15 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
     stock = raw.stock.reduce((s: number, x: any) => s + Number(x?.value ?? x ?? 0), 0);
   } else if (typeof raw?.stock === 'number') stock = raw.stock;
 
-  // 校验状态
-  const vsRaw = raw?.validation_status ?? raw?.offer_validation_status;
+  // 校验状态（三字段独立解析，禁止互相兜底）
+  const validationRaw = raw?.validation_status;                    // 独立来源 1
+  const translationValidationRaw = raw?.translation_validation_status; // 独立来源 2
+  const offerValidationRaw = raw?.offer_validation_status;         // 独立来源 3
+  const vsRaw = validationRaw;                                     // legacy 别名（仅限本函数内部 legacy 逻辑使用）
   const vsArr = Array.isArray(vsRaw) ? vsRaw : vsRaw ? [vsRaw] : [];
-  const transVsRaw = raw?.translation_validation_status;
+  const transVsRaw = translationValidationRaw;
   const transVsArr = Array.isArray(transVsRaw) ? transVsRaw : transVsRaw ? [transVsRaw] : [];
-  const offerVs = raw?.offer_validation_status;
+  const offerVs = offerValidationRaw;
   const offerVsArr = Array.isArray(offerVs) ? offerVs : offerVs ? [offerVs] : [];
   const compactValidationStatus = (value: unknown): unknown | null => {
     if (value == null || value === '') return null;
@@ -397,6 +620,21 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
 
   const isRejected = vsValue === 8 || vsValue === '8' || transRejected || (offerRejected && allErrorMsgs.length > 0);
   const isApproved = (vsValue === 9 || vsValue === '9') && !transRejected;
+
+  // ─── 新诊断体系（三字段严格独立解析）─────────────────────────────
+  const vsItem = extractStatusObjFromRaw(validationRaw);
+  const transVsItem = extractStatusObjFromRaw(translationValidationRaw);
+  const offerVsItem = extractStatusObjFromRaw(offerValidationRaw);
+  const offerStatusNum = raw?.status != null ? Number(raw.status) : null;
+  const platformDiagnostics = buildPlatformDiagnostics(vsItem, transVsItem, offerVsItem, offerStatusNum);
+  const hasPlatformAttention = platformDiagnostics.length > 0;
+  const hasBlockingIssue = platformDiagnostics.some(d => d.saleImpact === 'blocked');
+  const emagStatusSnapshot: EmagStatusSnapshot = {
+    vs: vsItem,
+    transVs: transVsItem,
+    offerVs: offerVsItem,
+    offerStatus: offerStatusNum,
+  };
   const fallbackText = isRejected ? '待更新' : '待完善';
   const rawName = String(raw?.name ?? raw?.title ?? '').trim();
   const name = rawName || fallbackText;
@@ -416,6 +654,9 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
   const mainOfferPrice = toNullableNumber(raw?.main_offer_price, raw?.mainOfferPrice);
   const buyButtonRank = toNullableNumber(raw?.buy_button_rank, raw?.buyButtonRank);
   const brand = extractBrand(raw);
+  // vatId：从 eMAG product_offer.vat_id 原样提取，整数 ID，不做税率换算
+  const vatId = toNullableNumber(raw?.vat_id, raw?.vatId);
+  const vatIdInt = vatId != null && Number.isInteger(vatId) ? vatId : null;
   const skuDisplay = sku ?? vendorSku ?? pnk;
 
   if (options?.logOutput !== false) {
@@ -447,5 +688,10 @@ function normalizeProductOffer(raw: Record<string, unknown>, region: EmagRegion,
     buyButtonRank,
     offerValidationStatus: compactOfferValidationStatus,
     brand,
+    vatId: vatIdInt,
+    platformDiagnostics,
+    emagStatusSnapshot,
+    hasPlatformAttention,
+    hasBlockingIssue,
   };
 }

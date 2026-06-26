@@ -261,6 +261,7 @@ model ShopAuthorization {
   operationDailyLogs OperationDailyLog[]
   employeeTasks EmployeeTask[]
   dailyReminderTemplates DailyReminderTemplate[]
+  vatMappings     VatMapping[]
 
   @@index([platform])
   @@index([status])
@@ -315,13 +316,36 @@ model StoreProduct {
   docErrors        String?  @map("doc_errors") // eMAG 驳回原因 (JSON 或文本)
   rejectionReason  String?  @map("rejection_reason") // 驳回原因（便于展示）
   comprehensiveSales Float    @default(0) @map("comprehensive_sales") // 综合日销 = d7/7*0.3 + d14/14*0.3 + d30/30*0.4
+  // ── VAT（税率快照，来自 eMAG vat/read，按店铺+vatId 缓存）────────────────
+  // vat_id / vat_rate 为影子列（已通过直接 SQL 添加），只做 Prisma 映射，勿重复 ADD COLUMN
+  vatId                Int?       @map("vat_id")                   // eMAG VAT 分类 ID，来自 product_offer.vat_id
+  vatRate              Decimal?   @map("vat_rate") @db.Decimal(8, 6)  // VAT 税率小数（如 0.190000 = 19%）
+  vatSyncedAt          DateTime?  @map("vat_synced_at")            // 本条 vatRate 最近一次从 eMAG vat/read 同步时间
+
+  // ── FBE 费用（平台维度，StoreProduct 层，来自人工录入或模拟器）──────────
+  fbeFee               Decimal?   @map("fbe_fee") @db.Decimal(10, 2)  // FBE 费用金额
+  fbeCurrency          String?    @map("fbe_currency")             // FBE 费用币种（RON/EUR/HUF/CNY），DB 层不设默认值
+  fbeSource            String?    @map("fbe_source")               // FBE 来源：MANUAL_STORE_PRODUCT / FBE_SIMULATOR_ESTIMATE（DB 层不设 DEFAULT_CNY_7）
+  fbeUpdatedAt         DateTime?  @map("fbe_updated_at")           // FBE 费用最近更新时间
+  // ── 人工 FBE 纠偏（影子列，DB 已存在，仅 Prisma 映射）────────────────────
+  fbeFeeOverrideCny        Decimal?  @map("fbe_fee_override_cny") @db.Decimal(10, 2)       // 人工纠偏 FBE（CNY）
+  fbeFeeOverrideNote       String?   @map("fbe_fee_override_note")                          // 纠偏备注
+  fbeFeeOverrideSource     String?   @map("fbe_fee_override_source")                        // 纠偏来源（如 MANUAL_STORE_PRODUCT）
+  fbeFeeOverrideUpdatedAt  DateTime? @map("fbe_fee_override_updated_at")                    // 纠偏最近更新时间
+
   // ── 利润预计算缓存字段（由 profitCalculator 定时写入，列表接口直读零计算）──
-  commissionRate       Float?     @map("commission_rate")          // eMAG 佣金比例（小数，0.15 = 15%）
-  estimatedProfit      Decimal?   @map("estimated_profit") @db.Decimal(12, 2)      // 预估毛利（站点当地货币）
-  estimatedProfitCny   Decimal?   @map("estimated_profit_cny") @db.Decimal(12, 2)  // 预估毛利（CNY）
-  profitMarginPct      Float?     @map("profit_margin_pct")        // 毛利率 % = profit / salePrice × 100
-  profitCalculatedAt   DateTime?  @map("profit_calculated_at")     // 上次利润计算时间
-  profitBreakdown      Json?      @map("profit_breakdown")          // 利润明细拆解 JSON（各项扣费 + 估算标识）
+  commissionRate           Float?     @map("commission_rate")              // eMAG 佣金比例（小数，0.18 = 18%）
+  commissionRateSource     String?    @map("commission_rate_source")       // 佣金来源：LEGACY_DICTIONARY / RUNTIME_DICTIONARY / DEFAULT_FALLBACK / EMAG_API_ESTIMATE
+  // ── 佣金 API 同步状态（Migration B 新增字段，执行后生效）───────────────────
+  commissionSyncedAt       DateTime?  @map("commission_synced_at")         // 最近一次成功同步 API 佣金率的时间
+  commissionLastAttemptAt  DateTime?  @map("commission_last_attempt_at")   // 最近一次请求 API 的时间（成功/失败均记录，防高频重试）
+  commissionApiCreatedRaw  String?    @map("commission_api_created_raw")   // API 返回 data.created 原字符串，不做时区推断
+  commissionApiPriority    String?    @map("commission_api_priority")      // API 返回 data.priority 原值（如 "4"）
+  estimatedProfit      Decimal?   @map("estimated_profit") @db.Decimal(12, 2)      // 预估毛利（站点当地货币），利润无法计算时为 null
+  estimatedProfitCny   Decimal?   @map("estimated_profit_cny") @db.Decimal(12, 2)  // 预估毛利（CNY），利润无法计算时为 null
+  profitMarginPct      Float?     @map("profit_margin_pct")        // 毛利率 % = profit / salePrice × 100，利润无法计算时为 null
+  profitCalculatedAt   DateTime?  @map("profit_calculated_at")     // 最近一次利润评估尝试时间（无论成功或失败）
+  profitBreakdown      Json?      @map("profit_breakdown")          // 利润明细拆解 JSON（含 profitCalculationStatus 状态枚举）
   productClass         String?    @map("product_class")             // 平台产品业务分类：HOT/POTENTIAL/NORMAL/DEAD/NEW/TO_BE_ELIMINATED
   classificationReason String?    @map("classification_reason")     // 分类原因说明，面向运营展示
   classificationMetrics Json?     @map("classification_metrics")    // 分类计算指标快照（不伪造 90 天有货数据）
@@ -349,6 +373,11 @@ model StoreProduct {
   firstAvailableAt DateTime? @map("first_available_at") // 当前店铺下首次平台库存 > 0 的时间（新品观察期基准）
   firstStockSignalAt DateTime? @map("first_stock_signal_at") // 首次平台库存>0 或 FBE/ERP 在途>0 的时间
   firstInboundAt     DateTime? @map("first_inbound_at") // 首次 FBE/ERP 在途 > 0 的时间
+  hasPlatformAttention Boolean   @default(false) @map("has_platform_attention")
+  hasBlockingIssue     Boolean   @default(false) @map("has_blocking_issue")
+  platformDiagnostics  Json?     @map("platform_diagnostics")
+  emagStatusSnapshot   Json?     @map("emag_status_snapshot")
+  diagnosticsUpdatedAt DateTime? @map("diagnostics_updated_at")
   syncedAt         DateTime @default(now()) @map("synced_at")
   shop         ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
   inventorySnapshots StoreProductInventorySnapshot[]
@@ -371,6 +400,8 @@ model StoreProduct {
   @@index([shopId, firstAvailableAt])
   @@index([shopId, firstStockSignalAt])
   @@index([shopId, firstInboundAt])
+  @@index([shopId, hasPlatformAttention])
+  @@index([shopId, hasBlockingIssue])
   @@map("store_products")
 }
 
@@ -1063,6 +1094,24 @@ model FbeShipment {
   @@index([ownerId])
   @@index([createdAt(sort: Desc)])
   @@map("fbe_shipments")
+}
+
+/// VAT 税率映射缓存（按店铺 + eMAG vatId 唯一存储，来自 eMAG vat/read，未来 Step 2 接入）
+/// 本阶段数据结构已就绪，不调用 vat/read，vatRate 可为空
+model VatMapping {
+  id        Int               @id @default(autoincrement())
+  shopId    Int               @map("shop_id")
+  region    String?                            // 辅助展示，不参与唯一键
+  vatId     Int               @map("vat_id")
+  vatRate   Decimal?          @map("vat_rate") @db.Decimal(8, 6) // 小数税率，如 0.190000 = 19%；AMBIGUOUS 时留空
+  syncedAt  DateTime?         @map("synced_at")
+  createdAt DateTime          @default(now()) @map("created_at")
+  updatedAt DateTime          @updatedAt @map("updated_at")
+  shop      ShopAuthorization @relation(fields: [shopId], references: [id], onDelete: Cascade)
+
+  @@unique([shopId, vatId])
+  @@index([shopId, syncedAt])
+  @@map("vat_mappings")
 }
 
 /// FBE 发货单明细（一单多 SKU）

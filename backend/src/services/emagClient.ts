@@ -487,6 +487,132 @@ export async function emagApiCall<T = any>(
   throw lastErr ?? new Error('eMAG API 请求失败');
 }
 
+// ─── REST GET 请求（佣金 API 等 /api/v1/ 系列，非 api-3 体系）──────────
+//
+// 与 emagApiCall 的区别：
+//   - Base URL：https://marketplace.emag.{region}（无 /api-3 前缀）
+//   - HTTP 方法：GET（路径参数直接拼在 URL 中）
+//   - 无 { data: ... } 包裹层
+//   - 响应结构：{ code: 200, data: ... }
+//
+// 复用策略（与现有 POST 体系完全一致）：
+//   - generalThrottle 令牌桶限流（3 req/sec）
+//   - acquireConcurrent / releaseConcurrent 并发控制
+//   - getEmagProxyAgent() 代理 Agent
+//   - 429 指数退避（同 MAX_RETRIES_429 / BACKOFF_BASE_MS）
+//   - 网络层重试（同 MAX_NET_RETRIES / doRequestWithNetRetry 逻辑）
+//   - Basic Auth（与 POST 相同构造）
+//   - safeLogTag / safeErrorDetail 脱敏日志
+
+/** REST GET 响应结构（/api/v1/ 系列） */
+export interface EmagRestResponse<T = any> {
+  code: number;
+  data?: T;
+  message?: string;
+}
+
+/** marketplace.emag.{region} 域名映射（非 marketplace-api 体系） */
+const REGION_REST_HOSTS: Record<EmagRegion, string> = {
+  RO: 'https://marketplace.emag.ro',
+  BG: 'https://marketplace.emag.bg',
+  HU: 'https://marketplace.emag.hu',
+};
+
+/**
+ * eMAG REST GET 请求（/api/v1/ 系列）
+ *
+ * @param creds  由 getEmagCredentials 获取的凭证（含 region）
+ * @param path   完整路径，如 "/api/v1/commission/estimate/785396099981"
+ * @param options timeout（默认 15s，GET 比 POST 快）
+ *
+ * 内部复用 generalThrottle、acquireConcurrent、getEmagProxyAgent、429退避、网络层重试
+ */
+export async function emagRestGet<T = any>(
+  creds: EmagCredentials,
+  path: string,
+  options: { timeout?: number } = {},
+): Promise<EmagRestResponse<T>> {
+  await generalThrottle.acquire();
+  await acquireConcurrent();
+
+  const restHost  = REGION_REST_HOSTS[creds.region];
+  const url       = `${restHost}${path}`;
+  const basicAuth = Buffer.from(`${creds.username}:${creds.password}`).toString('base64');
+  const tag       = safeLogTag(creds);
+  const timeoutMs = options.timeout ?? 15_000;
+
+  console.log(`[eMAG REST] GET ${restHost}${path.replace(/\/\d+$/, '/***')}  shop=${creds.region}`);
+
+  const doGet = async (): Promise<{ data: any; status: number; headers: Record<string, any> }> => {
+    const proxyAgent = getEmagProxyAgent();
+    const resp = await axios.get(url, {
+      headers: { 'Authorization': `Basic ${basicAuth}`, 'Accept': 'application/json' },
+      timeout: timeoutMs,
+      validateStatus: () => true,
+      ...(proxyAgent ? { httpsAgent: proxyAgent, proxy: false } : {}),
+    });
+    return { data: resp.data, status: resp.status, headers: resp.headers ?? {} };
+  };
+
+  const doGetWithNetRetry = async (): Promise<{ data: any; status: number; headers: Record<string, any> }> => {
+    let lastError: any = null;
+    for (let attempt = 0; attempt < MAX_NET_RETRIES; attempt++) {
+      try {
+        const result = await doGet();
+        if (isRetryableHttpStatus(result.status) && attempt < MAX_NET_RETRIES - 1) {
+          const delayMs = NET_RETRY_BASE_MS * Math.pow(2, attempt);
+          console.warn(`${tag} REST GET ${path} HTTP ${result.status} — ${delayMs}ms 后重试 (${attempt + 1}/${MAX_NET_RETRIES})`);
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
+        return result;
+      } catch (netErr: any) {
+        lastError = netErr;
+        if (isRetryableNetworkError(netErr) && attempt < MAX_NET_RETRIES - 1) {
+          const delayMs = NET_RETRY_BASE_MS * Math.pow(2, attempt);
+          console.warn(`${tag} REST GET 网络错误 — ${delayMs}ms 后重试 (${attempt + 1}/${MAX_NET_RETRIES})`);
+          await new Promise((r) => setTimeout(r, delayMs));
+          continue;
+        }
+        throw new Error(`eMAG REST GET 请求失败：${netErr.message?.slice(0, 200)}`);
+      }
+    }
+    throw lastError ?? new Error('eMAG REST GET 请求失败');
+  };
+
+  const startMs = Date.now();
+  try {
+    for (let attempt = 0; attempt <= MAX_RETRIES_429; attempt++) {
+      const { data: body, status, headers } = await doGetWithNetRetry();
+      const elapsed = Date.now() - startMs;
+
+      if (status === 429) {
+        const waitMs = BACKOFF_BASE_MS * Math.pow(2, attempt);
+        if (attempt < MAX_RETRIES_429) {
+          console.warn(`${tag} REST GET ${path} 429 — ${waitMs}ms 后重试 (${attempt + 1}/${MAX_RETRIES_429})`);
+          await new Promise((r) => setTimeout(r, waitMs));
+          continue;
+        }
+        throw new Error(`eMAG REST GET 429 Rate Limit，已退避重试 ${MAX_RETRIES_429} 次`);
+      }
+
+      updateRateLimitFromHeaders(headers);
+      if (shouldDelayNextSync()) setDelayMultiplier(2);
+
+      if (status === 401 || status === 403) {
+        throw new Error(`eMAG REST GET ${status}：认证失败，请检查凭证`);
+      }
+
+      console.log(`${tag} REST GET ${path.replace(/\/\d+$/, '/***')} HTTP ${status} (${elapsed}ms)`);
+      return body as EmagRestResponse<T>;
+    }
+  } finally {
+    releaseConcurrent();
+  }
+
+  throw new Error('eMAG REST GET 请求意外退出');
+}
+
 // ─── 便捷方法 ────────────────────────────────────────────────────
 
 export async function emagRead<T = any>(

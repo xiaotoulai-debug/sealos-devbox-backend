@@ -833,7 +833,7 @@ router.put('/:id/recalculate', async (req: Request, res: Response) => {
       devName = currentUser?.name ?? req.user!.username ?? null;
     }
 
-    await prisma.product.update({
+    const updated = await prisma.product.update({
       where: { id: productId },
       data: {
         sku:           typeof sku === 'string' && sku.trim() ? sku.trim() : undefined,
@@ -849,9 +849,23 @@ router.put('/:id/recalculate', async (req: Request, res: Response) => {
         width:         pWid          != null ? Number(pWid)          : null,
         height:        pHei          != null ? Number(pHei)          : null,
       },
+      select: { sku: true },
     });
 
     res.json({ code: 200, data: null, message: '建库数据已保存' });
+
+    // ── 异步利润联动（fire-and-forget，不阻塞响应）──────────────────────────
+    const updatedSku = updated.sku;
+    if (updatedSku) {
+      setImmediate(async () => {
+        try {
+          const cnt = await recalcProfitBySkus([updatedSku]);
+          console.log(`[PUT /:id/recalculate] 利润联动重算完成：SKU=${updatedSku} → ${cnt} 条 StoreProduct 已评估`);
+        } catch (e: any) {
+          console.error('[PUT /:id/recalculate] 利润联动重算失败:', e?.message ?? e);
+        }
+      });
+    }
   } catch (err: unknown) {
     const prismaErr = err as { code?: string; meta?: { target?: string[] } };
     if (prismaErr.code === 'P2002' && prismaErr.meta?.target?.includes('sku')) {
@@ -976,6 +990,7 @@ router.put('/batch-update', async (req: Request, res: Response) => {
 
     const userId = req.user!.userId;
     let count = 0;
+    const updatedIds: number[] = [];
 
     await prisma.$transaction(async (tx) => {
       for (const item of items) {
@@ -997,11 +1012,31 @@ router.put('/batch-update', async (req: Request, res: Response) => {
           where: { id, status: 'PURCHASING', ownerId: userId },
           data,
         });
+        if (result.count > 0) updatedIds.push(id);
         count += result.count;
       }
     });
 
     res.json({ code: 200, data: { count }, message: `已更新 ${count} 个产品` });
+
+    // ── 异步利润联动（fire-and-forget，更新采购价/尺寸/重量后级联重算）──
+    if (updatedIds.length > 0) {
+      setImmediate(async () => {
+        try {
+          const products = await prisma.product.findMany({
+            where: { id: { in: updatedIds }, sku: { not: null } },
+            select: { sku: true },
+          });
+          const skus = products.map((p) => p.sku!).filter(Boolean);
+          if (skus.length > 0) {
+            const cnt = await recalcProfitBySkus(skus);
+            console.log(`[PUT /batch-update] 利润联动重算完成：${skus.length} 个 SKU → ${cnt} 条 StoreProduct 已评估`);
+          }
+        } catch (e: any) {
+          console.error('[PUT /batch-update] 利润联动重算失败:', e?.message ?? e);
+        }
+      });
+    }
   } catch (err) {
     console.error('[PUT /api/products/batch-update]', err);
     res.status(500).json({ code: 500, data: null, message: '服务器内部错误' });

@@ -1113,16 +1113,48 @@ RECEIVED（已全部入库）
 - **camelCase + snake_case**：采购链等字段同时读取两套命名（例如 `purchaseUrl` 与 `purchase_url`），避免 Body 仅带 snake_case 时组装出的 `data` 为空、循环内 `continue` 导致 **从未执行 `updateMany`**，却误报 `code:200, count:0`。
 - **空结果语义**：`count===0` 时若存在「空 payload」行 → **400** 明确提示字段名；若全部行 id 无效 → **400**；否则 → **404**（产品不存在或无权限）。调试日志：`[inventory-batch-update] updateMany` 输出 `where` 与 `dataKeys`（Prisma 默认不打印完整 SQL）。
 
-### 冷启动兜底（v3，2026-04-09 更新）
+### 冷启动兜底（v4，2026-06-26 更新）
 
 | 缺失数据 | 策略 |
 |----------|------|
-| 无佣金率 | 三级降级：① `sp.commissionRate`（精确）→ ② `guessCommissionRate()`（字典匹配）→ ③ `DEFAULT_COMMISSION_RATE=0.18`；`profitBreakdown.commissionRateSource` 标记来源，`isEstimatedCommission=true` 标记已估算 |
-| 无 FBE 费 | **`DEFAULT_FBE_CNY = 7` 换算为当地货币兜底**（≈5 RON/1 EUR/2000 HUF），严禁按 0；`isEstimatedFbe=true` 标记已估算 |
+| 无佣金率 | 三级降级：① `sp.commissionRate`（精确）→ ② `guessCommissionRate()`（字典匹配）→ ③ `DEFAULT_COMMISSION_RATE`；`profitBreakdown.effectiveCommissionSource` 标记来源 |
+| 无 FBE 费 | **三级优先级**（见下）；`DEFAULT_CNY_7` 兜底时 `isEstimatedFbe=true` |
 | 无退货损耗率 | `returnLossRate` 默认 0.0（即不扣减），不影响存量计算；前端录入真实值后自动生效 |
 | 无头程数据 | 按 0 计算 |
 | 无采购价 | 跳过，不写利润字段，前端显示 "-" |
 | 无汇率 | 保留上次结果，日志 warn |
+
+### FBE 费用优先级（v4，2026-06-26）
+
+```
+1. StoreProduct.fbe_fee_override_cny + fbe_fee_override_source + fbe_fee_override_updated_at 均有效
+   → effectiveFbeSource = MANUAL_STORE_PRODUCT，isEstimatedFbe = false
+2. StoreProduct.fbeFee + fbeCurrency + fbeSource 为可信值（MANUAL_STORE_PRODUCT / FBE_SIMULATOR_ESTIMATE）
+   → 使用对应来源，isEstimatedFbe = false
+3. 其他所有情况
+   → DEFAULT_FBE_CNY = 7 换算为当地货币，effectiveFbeSource = DEFAULT_CNY_7，isEstimatedFbe = true
+```
+
+- **人工纠偏入口**：`PATCH /api/store-products/:pnk/cost-correction` 的 `fbeFee`（CNY）写入 `store_products.fbe_fee_override_*`，不再写入 `products.fbe_fee`
+- **Product.fbeFee**：历史字段，仅写入 `profitBreakdown.legacyFbeReference*`，绝不参与扣减
+- **profitBreakdown 新增字段**：`effectiveFbeLocal`、`manualFbeOverrideCny`、`manualFbeOverrideSource`、`isEstimatedFbe`
+
+### VAT 快照同步（2026-06-26）
+
+```
+eMAG vat/read → VatMapping(shopId+vatId) → StoreProduct.vatId/vatRate/vatSyncedAt
+```
+
+| 组件 | 说明 |
+|------|------|
+| `src/services/vatSync.ts` | `syncVatMappingsForShop()` / `syncVatMappingsForAllShops()` |
+| 缓存策略 | 7 天内有效 **且** 当前店铺全部产品 vatId 均有 VatMapping 才 CACHE_HIT |
+| 触发点 | `POST /sync` 前、`runProductRadar` 前、`POST /sync-vat` 手动 |
+| VAT 不参与利润扣减 | VAT 同步不触发利润重算 |
+
+**边界规则（2026-06-26）**：
+- vatId 无有效 VatMapping 且 API 成功 → `vatRate=null, vatSyncedAt=null`（禁止挂旧税率）
+- vat/read 失败 → 保留同 vatId 旧映射，不删除不清空
 
 ### 跨店 SKU 继承（Phase 2 Scheme A，2026-04-09）
 
@@ -1143,7 +1175,9 @@ RECEIVED（已全部入库）
   "salePrice": 40.00, "currency": "RON",
   "commissionRate": 0.18, "commissionRateSource": "dictionary", "isEstimatedCommission": true,
   "commission": 7.20,
-  "fbe": 4.46, "isEstimatedFbe": true,
+  "fbe": 4.46, "effectiveFbeLocal": 4.46, "isEstimatedFbe": true,
+  "effectiveFbeSource": "DEFAULT_CNY_7",
+  "manualFbeOverrideCny": null, "manualFbeOverrideSource": null,
   "headFreightLocal": 0.30, "headFreightCny": 0.47,
   "purchaseCostLocal": 11.34, "purchaseCostCny": 17.80,
   "returnLossRate": 0.03, "returnLossLocal": 0.34, "returnLossCny": 0.53,
@@ -1158,7 +1192,8 @@ RECEIVED（已全部入库）
 |------|------|
 | `src/services/exchangeRateSync.ts` | 汇率拉取（open.er-api.com）+ DB upsert + `loadExchangeRateMap()` |
 | `src/services/freightCalculator.ts` | `calcHeadFreightCny()` 头程运费工具函数 |
-| `src/services/profitCalculator.ts` | `recalcProfitForShop()` / `recalcProfitForAllShops()` / `recalcProfitBySkus()` |
+| `src/services/profitCalculator.ts` | `calcProfitForProduct()` / `recalcProfitForShop()` / `recalcProfitForAllShops()` / `recalcProfitBySkus()` |
+| `src/services/vatSync.ts` | VAT 映射同步与 StoreProduct 回填 |
 | `src/services/syncCron.ts` | 新增 Cron `0 0 * * *` 汇率+利润级联 |
 | `src/routes/storeProducts.ts` | 新增 `POST recalc-profit`、`POST sync-exchange-rates`；列表接口直读缓存 |
 

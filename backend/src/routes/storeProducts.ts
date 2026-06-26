@@ -15,6 +15,8 @@ import { getSalesStatsByShop, getSalesForProduct, logZeroSalesDiagnostic } from 
 import { tryAcquireLock, releaseLock } from '../lib/syncStatus';
 import { backfillProductUrls, backfillProductImages, syncStoreProducts, backfillComprehensiveSales } from '../services/storeProductSync';
 import { recalcProfitForShop, recalcProfitForAllShops } from '../services/profitCalculator';
+import { syncVatMappingsForShop, syncVatMappingsForAllShops } from '../services/vatSync';
+import { syncCommissionForShop, syncCommissionForAllShops } from '../services/commissionSync';
 import { syncExchangeRates } from '../services/exchangeRateSync';
 import { resolveEffectiveStockSignals, scheduleStockSignalBackfill } from '../services/firstAvailableAt';
 import { generateOperationAdvices } from '../services/operationAdvice';
@@ -418,11 +420,43 @@ router.post('/sync', async (req: Request, res: Response) => {
       return;
     }
 
-    const results: Array<{ shopId: number; totalFetched: number; upserted: number; rejectedCount: number; errors: string[]; eanImagesRecovered?: number; deepSyncImagesUpdated?: number }> = [];
+    const results: Array<{
+      shopId: number; totalFetched: number; upserted: number; rejectedCount: number;
+      errors: string[]; eanImagesRecovered?: number; deepSyncImagesUpdated?: number;
+      profitRecalcUpdated?: number;
+      vatSync?: { status: string; vatMappingsUpserted: number; productsBackfilled: number; errorMessage?: string };
+    }> = [];
     for (const shopId of validIds) {
+      // ── 产品同步前：非强制 VAT 缓存确认（7天内有缓存则跳过 API）──
+      let vatSyncResult: { status: string; vatMappingsUpserted: number; productsBackfilled: number; errorMessage?: string } | undefined;
+      try {
+        const vatRes = await syncVatMappingsForShop(shopId, { force: false });
+        vatSyncResult = {
+          status: vatRes.status,
+          vatMappingsUpserted: vatRes.vatMappingsUpserted,
+          productsBackfilled: vatRes.productsBackfilled,
+          errorMessage: vatRes.errorMessage,
+        };
+        console.log(`[POST /api/store-products/sync] shopId=${shopId} VAT 缓存确认：${vatRes.status}`);
+      } catch (vatErr: any) {
+        // VAT 失败不阻断产品同步
+        vatSyncResult = { status: 'FAILED', vatMappingsUpserted: 0, productsBackfilled: 0, errorMessage: vatErr?.message };
+        console.error(`[POST /api/store-products/sync] shopId=${shopId} VAT 缓存确认失败（不阻断）:`, vatErr?.message ?? vatErr);
+      }
+
       const creds = await getEmagCredentials(shopId);
       console.log(`[POST /api/store-products/sync] shopId=${shopId} region=${creds.region} baseUrl=${creds.baseUrl}`);
       const result = await syncStoreProducts(creds);
+
+      // ── 产品同步完成后，同步触发该店铺利润重算（等待结果，保证接口返回最新利润）──
+      let profitRecalcUpdated = 0;
+      try {
+        profitRecalcUpdated = await recalcProfitForShop(shopId);
+        console.log(`[POST /api/store-products/sync] shopId=${shopId} 利润重算完成：${profitRecalcUpdated} 条已评估`);
+      } catch (profitErr: any) {
+        console.error(`[POST /api/store-products/sync] shopId=${shopId} 利润重算失败:`, profitErr?.message ?? profitErr);
+      }
+
       results.push({
         shopId: result.shopId,
         totalFetched: result.totalFetched,
@@ -431,17 +465,21 @@ router.post('/sync', async (req: Request, res: Response) => {
         errors: result.errors,
         eanImagesRecovered: result.eanImagesRecovered,
         deepSyncImagesUpdated: result.deepSyncImagesUpdated,
+        profitRecalcUpdated,
+        vatSync: vatSyncResult,
       });
     }
 
     const totalUpserted = results.reduce((s, r) => s + r.upserted, 0);
+    const totalProfitRecalc = results.reduce((s, r) => s + (r.profitRecalcUpdated ?? 0), 0);
     res.json({
       code: 200,
       data: {
         results,
         totalUpserted,
+        totalProfitRecalc,
       },
-      message: `同步完成，共 ${validIds.length} 个店铺，入库 ${totalUpserted} 个产品`,
+      message: `同步完成，共 ${validIds.length} 个店铺，入库 ${totalUpserted} 个产品，利润评估 ${totalProfitRecalc} 条`,
     });
   } catch (err: any) {
     console.error('[POST /api/store-products/sync]', err);
@@ -697,9 +735,17 @@ router.post('/map', async (req: Request, res: Response) => {
       data:  { mappedInventorySku: resolvedSku },
     });
 
+    // ── Step 5：SKU 绑定后同步触发利润重算（保证返回最新利润数据）──
+    let profitRecalcUpdated = 0;
+    try {
+      profitRecalcUpdated = await recalcProfitForShop(sp.shopId);
+    } catch (profitErr: any) {
+      console.error('[POST /api/store-products/map] 利润重算失败:', profitErr?.message ?? profitErr);
+    }
+
     res.json({
       code: 200,
-      data: { storeProductId, pnk: sp.pnk, shopId: sp.shopId, inventorySku: resolvedSku },
+      data: { storeProductId, pnk: sp.pnk, shopId: sp.shopId, inventorySku: resolvedSku, profitRecalcUpdated },
       message: '绑定成功',
     });
   } catch (err) {
@@ -1536,16 +1582,37 @@ router.get('/', async (req: Request, res: Response) => {
         estimated_profit_cny: p.estimatedProfitCny ? Number(p.estimatedProfitCny) : null,
         profit_margin_pct:    profitMarginPct,
         commission_rate:      p.commissionRate ?? null,
+        commission_rate_source: p.commissionRateSource ?? null,
         profit_calculated_at: p.profitCalculatedAt ?? null,
         // ── camelCase 别名（与架构方案文档 & 前端接口契约严格对齐，向前兼容）──
         estimatedProfitLocal: estimatedProfit,
         estimatedProfitCny:   p.estimatedProfitCny ? Number(p.estimatedProfitCny) : null,
         profitMarginPct,
         commissionRate:       p.commissionRate ?? null,
+        commissionRateSource: p.commissionRateSource ?? null,
         profitCalculatedAt:   p.profitCalculatedAt ?? null,
+        // ── 利润评估状态（从 profitBreakdown 中提取，方便前端判断）──
+        profit_calculation_status: (p.profitBreakdown as any)?.profitCalculationStatus ?? null,
+        profitCalculationStatus:   (p.profitBreakdown as any)?.profitCalculationStatus ?? null,
         // ── 利润明细拆解（前端可直接渲染，无需重算）──
         profit_breakdown:     p.profitBreakdown ?? null,
         profitBreakdown:      p.profitBreakdown ?? null,
+        // ── VAT 快照字段（影子列映射 + 新增字段）──
+        vat_id:        p.vatId ?? null,
+        vatId:         p.vatId ?? null,
+        vat_rate:      p.vatRate ? Number(p.vatRate) : null,
+        vatRate:       p.vatRate ? Number(p.vatRate) : null,
+        vat_synced_at: p.vatSyncedAt ?? null,
+        vatSyncedAt:   p.vatSyncedAt ?? null,
+        // ── StoreProduct FBE 字段（新增）──
+        fbe_fee:        p.fbeFee ? Number(p.fbeFee) : null,
+        fbeFee:         p.fbeFee ? Number(p.fbeFee) : null,
+        fbe_currency:   p.fbeCurrency ?? null,
+        fbeCurrency:    p.fbeCurrency ?? null,
+        fbe_source:     p.fbeSource ?? null,
+        fbeSource:      p.fbeSource ?? null,
+        fbe_updated_at: p.fbeUpdatedAt ?? null,
+        fbeUpdatedAt:   p.fbeUpdatedAt ?? null,
         comprehensive_sales: compSales,   // 实时计算，与 sales_stats 强耦合，永不陈旧
         comprehensiveSales: compSales,
         sales3: sales_stats.d3,
@@ -1621,6 +1688,9 @@ router.get('/', async (req: Request, res: Response) => {
         validation_status: validationStatusDisplay,
         doc_errors: p.docErrors ?? null,
         rejection_reason: p.rejectionReason ?? null,
+        platformDiagnostics: Array.isArray(p.platformDiagnostics) ? p.platformDiagnostics : (p.platformDiagnostics ?? []),
+        hasPlatformAttention: p.hasPlatformAttention ?? false,
+        hasBlockingIssue: p.hasBlockingIssue ?? false,
       };
     });
 
@@ -1696,14 +1766,14 @@ router.post('/recalc-profit', async (req: Request, res: Response) => {
 
 /**
  * PATCH /api/store-products/:pnk/cost-correction
- * 成本纠偏接口：允许用户手动修正 commissionRate（店铺级）/ fbeFee / returnLossRate（产品级），
+ * 成本纠偏接口：允许用户手动修正 commissionRate（店铺级）/ fbeFee（店铺级人工纠偏 CNY）/ returnLossRate（产品级），
  * 并同步触发利润重算，返回最新的 profitBreakdown。
  *
  * Body（均可选，至少传一项）：
  *   commissionRate  number   0~1，佣金率（写入 StoreProduct）
- *   fbeFee          number   >=0，FBE 费用 CNY（写入 Product）
+ *   fbeFee          number   >=0，FBE 费用 CNY（写入 StoreProduct.fbe_fee_override_cny，来源 MANUAL_STORE_PRODUCT）
  *   returnLossRate  number   0~1，退货损耗率（写入 Product）
- *   shopId          number   可选；指定则只更新该店 commissionRate；否则全 PNK 店铺同步更新
+ *   shopId          number   可选；指定则只更新该店；否则全 PNK 店铺同步更新
  */
 router.patch('/:pnk/cost-correction', async (req: Request, res: Response) => {
   try {
@@ -1767,24 +1837,34 @@ router.patch('/:pnk/cost-correction', async (req: Request, res: Response) => {
       });
     }
 
-    // ── Step 3b：更新 products.fbe_fee / return_loss_rate（产品级）─
-    // 找第一个有 mappedInventorySku 的记录作为 Product 的查找键
+    // ── Step 3b：更新 store_products.fbe_fee_override_*（店铺级人工 FBE 纠偏 CNY）──
+    if (fbeFee !== undefined) {
+      const overrideCny = Number(fbeFee);
+      const now = new Date();
+      await prisma.storeProduct.updateMany({
+        where: { pnk, isArchived: false, ...(shopId ? { shopId } : {}) },
+        data: {
+          fbeFeeOverrideCny:       overrideCny,
+          fbeFeeOverrideSource:    'MANUAL_STORE_PRODUCT',
+          fbeFeeOverrideUpdatedAt: now,
+        },
+      });
+    }
+
+    // ── Step 3c：更新 products.return_loss_rate（产品级，需绑定 SKU）─
     const effectiveSku = storeProducts.find((sp) => sp.mappedInventorySku)?.mappedInventorySku ?? null;
     let updatedProduct = false;
     const warning: string[] = [];
 
-    if (fbeFee !== undefined || returnLossRate !== undefined) {
+    if (returnLossRate !== undefined) {
       if (effectiveSku) {
-        const productData: Record<string, unknown> = {};
-        if (fbeFee        !== undefined) productData.fbeFee        = Number(fbeFee);
-        if (returnLossRate !== undefined) productData.returnLossRate = Number(returnLossRate);
         await prisma.product.update({
           where: { sku: effectiveSku },
-          data: productData,
+          data: { returnLossRate: Number(returnLossRate) },
         });
         updatedProduct = true;
       } else {
-        warning.push('该 PNK 未绑定本地库存 SKU，fbeFee / returnLossRate 未能保存，请先在"平台产品"页绑定库存 SKU');
+        warning.push('该 PNK 未绑定本地库存 SKU，returnLossRate 未能保存，请先在"平台产品"页绑定库存 SKU');
       }
     }
 
@@ -1844,6 +1924,164 @@ router.post('/sync-exchange-rates', async (_req: Request, res: Response) => {
   } catch (err: any) {
     console.error('[POST /api/store-products/sync-exchange-rates]', err);
     res.status(500).json({ code: 500, data: null, message: err?.message ?? '汇率同步失败' });
+  }
+});
+
+/**
+ * POST /api/store-products/sync-vat
+ * 手动触发 VAT 映射同步与 StoreProduct 回填
+ *
+ * Body (可选):
+ *   { shopId: number }           — 同步单个店铺
+ *   { shopIds: number[] }        — 同步多个店铺
+ *   {}                           — 同步全部 active eMAG 店铺
+ *   { force: true }              — 强制刷新（忽略 7 天缓存）
+ *
+ * 注意：只同步 VAT 映射，不同步产品，不重算利润
+ */
+router.post('/sync-vat', authenticate, async (req: Request, res: Response) => {
+  try {
+    const force      = req.body?.force === true;
+    const rawShopId  = req.body?.shopId;
+    const rawShopIds = req.body?.shopIds;
+
+    let shopIds: number[] | null = null;
+
+    if (rawShopIds != null) {
+      const arr = Array.isArray(rawShopIds) ? rawShopIds : String(rawShopIds).split(',');
+      shopIds = arr.map(Number).filter((n) => !isNaN(n) && n > 0);
+    } else if (rawShopId != null) {
+      const single = Number(rawShopId);
+      if (!isNaN(single) && single > 0) shopIds = [single];
+    }
+
+    let results;
+    if (shopIds != null && shopIds.length > 0) {
+      results = await Promise.all(
+        shopIds.map((id) => syncVatMappingsForShop(id, { force })),
+      );
+    } else {
+      results = await syncVatMappingsForAllShops({ force });
+    }
+
+    const totalMappings  = results.reduce((s, r) => s + r.vatMappingsUpserted, 0);
+    const totalBackfill  = results.reduce((s, r) => s + r.productsBackfilled, 0);
+    const failedShops    = results.filter((r) => r.status === 'FAILED').map((r) => r.shopName);
+
+    res.json({
+      code: 200,
+      data: {
+        results,
+        totalMappingsUpserted: totalMappings,
+        totalProductsBackfilled: totalBackfill,
+        failedShops,
+      },
+      message: `VAT 同步完成：${results.length} 家店铺，映射写入 ${totalMappings} 条，产品回填 ${totalBackfill} 条${failedShops.length > 0 ? `，失败店铺：${failedShops.join(', ')}` : ''}`,
+    });
+  } catch (err: any) {
+    console.error('[POST /api/store-products/sync-vat]', err);
+    res.status(500).json({ code: 500, data: null, message: err?.message ?? 'VAT 同步失败' });
+  }
+});
+
+/**
+ * POST /api/store-products/sync-commission
+ * 手动触发 eMAG 佣金 API 同步
+ *
+ * Body 格式（必须显式传 shopId/shopIds，不允许全量无限制执行）：
+ *   { "shopId": 1 }                              — 单店铺，正常模式
+ *   { "shopId": 1, "force": true, "limit": 50 } — 单店铺，强制刷新，limit 必须显式传
+ *   { "shopIds": [1, 2], "limit": 100 }          — 多店铺
+ *
+ * 限制：
+ *   - 未传 shopId/shopIds 时拒绝执行
+ *   - force=true 必须显式传 limit
+ *   - limit 最大 500
+ *   - 响应返回聚合结果，不返回所有商品明细
+ */
+router.post('/sync-commission', authenticate, async (req: Request, res: Response) => {
+  try {
+    const rawShopId  = req.body?.shopId;
+    const rawShopIds = req.body?.shopIds;
+    const force      = req.body?.force === true;
+    const rawLimit   = req.body?.limit;
+
+    // ── 1. 必须显式指定 shopId 或 shopIds ──
+    if (rawShopId == null && (rawShopIds == null || !Array.isArray(rawShopIds) || rawShopIds.length === 0)) {
+      return res.status(400).json({
+        code: 400, data: null,
+        message: '必须显式传入 shopId 或 shopIds，不支持全量无限制执行。如需全量，请直接触发 commission_refresh Cron 或明确传入所有 shopId。',
+      });
+    }
+
+    // ── 2. force=true 时必须显式传 limit ──
+    if (force && rawLimit == null) {
+      return res.status(400).json({
+        code: 400, data: null,
+        message: 'force=true 时必须显式传入 limit，防止强制模式意外全量调用 API。',
+      });
+    }
+
+    // ── 3. limit 上限 500 ──
+    const limit = rawLimit != null ? Math.min(Math.max(1, Number(rawLimit)), 500) : 500;
+
+    // ── 4. 解析 shopIds ──
+    let shopIds: number[];
+    if (rawShopIds != null && Array.isArray(rawShopIds)) {
+      shopIds = (rawShopIds as any[]).map(Number).filter((n) => !isNaN(n) && n > 0);
+    } else {
+      const single = Number(rawShopId);
+      if (isNaN(single) || single <= 0) {
+        return res.status(400).json({ code: 400, data: null, message: `shopId "${rawShopId}" 无效` });
+      }
+      shopIds = [single];
+    }
+
+    if (shopIds.length === 0) {
+      return res.status(400).json({ code: 400, data: null, message: 'shopIds 列表为空' });
+    }
+
+    // ── 5. 串行执行（与 Cron 一致，防并发过载） ──
+    const results = [];
+    for (const shopId of shopIds) {
+      const res_ = await syncCommissionForShop(shopId, { force, limit });
+      results.push(res_);
+    }
+
+    // ── 6. 聚合结果 ──
+    const totalSucceeded = results.reduce((s, r) => s + r.succeeded, 0);
+    const totalFailed    = results.reduce((s, r) => s + r.failed, 0);
+    const totalSkipped   = results.reduce((s, r) => s + r.skipped, 0);
+    const hasError       = results.some((r) => r.error != null);
+
+    return res.json({
+      code: 200,
+      data: {
+        shops:    results.length,
+        force,
+        limit,
+        succeeded: totalSucceeded,
+        failed:    totalFailed,
+        skipped:   totalSkipped,
+        shopDetails: results.map((r) => ({
+          shopId:      r.shopId,
+          region:      r.region,
+          candidates:  r.candidates,
+          succeeded:   r.succeeded,
+          failed:      r.failed,
+          skipped:     r.skipped,
+          noOfferId:   r.noOfferId,
+          profitRecalc: r.profitRecalc,
+          durationMs:  r.durationMs,
+          error:       r.error ?? null,
+        })),
+      },
+      message: `佣金同步完成：${results.length} 家店铺，成功 ${totalSucceeded} 条，失败 ${totalFailed} 条，跳过 ${totalSkipped} 条${hasError ? '（含店铺级错误，请查看 shopDetails）' : ''}`,
+    });
+
+  } catch (err: any) {
+    console.error('[POST /api/store-products/sync-commission]', err);
+    return res.status(500).json({ code: 500, data: null, message: err?.message ?? '佣金同步失败' });
   }
 });
 

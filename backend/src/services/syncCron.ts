@@ -18,10 +18,12 @@ import { getEmagCredentials } from './emagClient';
 import { shouldDelayNextSync, setDelayMultiplier, getDelayMultiplier } from './emagRateLimit';
 import { syncPurchaseOrderFromAlibaba } from './alibabaService';
 import { syncExchangeRates } from './exchangeRateSync';
-import { recalcProfitForAllShops } from './profitCalculator';
+import { recalcProfitForAllShops, recalcProfitForShop } from './profitCalculator';
+import { syncVatMappingsForShop } from './vatSync';
+import { syncCommissionForAllShops } from './commissionSync';
 import { createInventorySnapshotsForAllShops } from './storeProductInventorySnapshot';
 
-export type SyncType = 'order_sentinel' | 'order_daily_catchup' | 'product_radar' | 'inventory_sync' | 'alibaba_purchase_sync' | 'store_product_inventory_snapshot';
+export type SyncType = 'order_sentinel' | 'order_daily_catchup' | 'product_radar' | 'inventory_sync' | 'alibaba_purchase_sync' | 'store_product_inventory_snapshot' | 'commission_refresh';
 
 async function logSync(
   syncType: SyncType,
@@ -50,6 +52,7 @@ let orderDailyCatchupRunning = false;
 let productRadarRunning = false;
 let inventorySyncRunning = false;
 let inventorySnapshotRunning = false;
+let commissionRefreshRunning = false;
 
 // ═══════════════════════════════════════════════════════════════════
 // 【订单哨兵】每 10 分钟，同步最近 30 分钟内有变动的订单
@@ -168,9 +171,27 @@ function runProductRadar() {
         select: { id: true },
       });
       for (const shop of shops) {
+        // ── 产品同步前：非强制 VAT 缓存确认（7天内有缓存则跳过 API，失败不阻塞）──
+        try {
+          await syncVatMappingsForShop(shop.id, { force: false });
+        } catch (vatErr: any) {
+          console.error(`[产品雷达] shopId=${shop.id} VAT 缓存确认失败（不阻断）:`, vatErr?.message ?? vatErr);
+        }
+
         const creds = await getEmagCredentials(shop.id);
         const syncRes = await syncStoreProducts(creds, modifiedAfter);
         totalUpdated += syncRes.upserted;
+        // ── 产品同步完成后，触发该店铺利润重算（异步 fire-and-forget，不阻塞下一店铺）──
+        if (syncRes.upserted > 0) {
+          setImmediate(async () => {
+            try {
+              const profitUpdated = await recalcProfitForShop(shop.id);
+              console.log(`[产品雷达] shopId=${shop.id} 利润重算完成：${profitUpdated} 条已评估`);
+            } catch (e: any) {
+              console.error(`[产品雷达] shopId=${shop.id} 利润重算失败:`, e?.message ?? e);
+            }
+          });
+        }
       }
       const urlRes = await backfillProductUrls();
       totalUpdated += urlRes.updated;
@@ -346,6 +367,61 @@ function runAlibabaPurchaseSync() {
   })();
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// 【佣金刷新】每日一次（UTC 04:00 = 北京 12:00）
+// 独立任务，不与 product_radar 绑定；店铺串行；单店最多 500 条
+// Migration B 执行后方可正常写入新字段
+// ═══════════════════════════════════════════════════════════════════
+function runCommissionRefresh() {
+  if (commissionRefreshRunning) {
+    console.log('[佣金刷新] 跳过（上次未完成）');
+    return;
+  }
+  commissionRefreshRunning = true;
+  const start = Date.now();
+
+  (async () => {
+    try {
+      console.log('[佣金刷新] 开始全店铺佣金 API 同步（串行，每店最多 500 条）...');
+      const results = await syncCommissionForAllShops({ force: false, limit: 500 });
+      const totalSucceeded = results.reduce((s, r) => s + r.succeeded, 0);
+      const totalFailed    = results.reduce((s, r) => s + r.failed, 0);
+      const totalSkipped   = results.reduce((s, r) => s + r.skipped, 0);
+      const durationMs     = Date.now() - start;
+
+      await logSync(
+        'commission_refresh',
+        totalSucceeded,
+        durationMs,
+        totalSucceeded + totalFailed === 0 ? 'success' : totalSucceeded === 0 ? 'partial' : 'success',
+        JSON.stringify({
+          shops:     results.length,
+          succeeded: totalSucceeded,
+          failed:    totalFailed,
+          skipped:   totalSkipped,
+          shopDetails: results.map(r => ({
+            shopId: r.shopId, region: r.region,
+            succeeded: r.succeeded, failed: r.failed,
+            skipped: r.skipped, profitRecalc: r.profitRecalc,
+          })),
+        }),
+      );
+
+      console.log(
+        `[佣金刷新] 完成 shops=${results.length} ` +
+        `总成功=${totalSucceeded} 总失败=${totalFailed} 总跳过=${totalSkipped} ` +
+        `耗时=${durationMs}ms`,
+      );
+    } catch (e: any) {
+      const durationMs = Date.now() - start;
+      await logSync('commission_refresh', 0, durationMs, 'failed', e.message ?? String(e));
+      console.error('[佣金刷新] 任务级异常:', e.message ?? e);
+    } finally {
+      commissionRefreshRunning = false;
+    }
+  })();
+}
+
 export function startSyncCrons(): void {
   cron.schedule('*/10 * * * *', () => runOrderSentinel());          // 每 10 分钟（订单锁）
   cron.schedule('0 2 * * *',   () => runOrderDailyCatchup());       // 每天凌晨 2 点（订单锁，48h 兜底）
@@ -353,6 +429,7 @@ export function startSyncCrons(): void {
   cron.schedule('5 * * * *',   () => runInventorySync());           // 每 1 小时（无锁）
   cron.schedule('0 */6 * * *', () => runAlibabaPurchaseSync());     // 每 6 小时（1688 采购同步）
   cron.schedule('30 1 * * *',  () => runStoreProductInventorySnapshot()); // 每天 UTC 01:30（北京 09:30）
+  cron.schedule('30 20 * * *', () => runCommissionRefresh());       // 每天 UTC 20:30（北京次日 04:30）佣金刷新
 
   // 汇率同步 + 利润引擎级联：每天 08:00（北京时间 = UTC+8 = UTC 00:00）
   cron.schedule('0 0 * * *', async () => {
@@ -377,4 +454,5 @@ export function startSyncCrons(): void {
   console.log('[Cron] 1688采购同步: 每 6 小时（PLACED/IN_TRANSIT 活跃单，串行防限流）');
   console.log('[Cron] 平台产品库存快照: 每天 UTC 01:30（北京 09:30）');
   console.log('[Cron] 汇率+利润: 每天 UTC 00:00（北京 08:00，级联重算）');
+  console.log('[Cron] 佣金刷新: 每天 UTC 20:30（北京次日 04:30，独立任务，不挂产品雷达）');
 }

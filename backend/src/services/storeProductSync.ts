@@ -343,6 +343,13 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
           buyBoxActionTips: buyBoxResult.buyBoxActionTips as Prisma.InputJsonValue,
           buyBoxMeta: buyBoxMeta as Prisma.InputJsonValue,
           isArchived: false,
+          hasPlatformAttention: np.hasPlatformAttention,
+          hasBlockingIssue: np.hasBlockingIssue,
+          platformDiagnostics: np.platformDiagnostics as unknown as Prisma.InputJsonValue,
+          emagStatusSnapshot: np.emagStatusSnapshot as unknown as Prisma.InputJsonValue,
+          diagnosticsUpdatedAt: new Date(),
+          // ── VAT ID（来自 eMAG product_offer.vat_id，原样存储，税率留给 vat/read 阶段）
+          ...(np.vatId != null ? { vatId: np.vatId } : {}),
         };
 
         const updateData: Record<string, any> = { ...data };
@@ -449,15 +456,13 @@ export async function syncStoreProducts(creds: EmagCredentials, modifiedAfter?: 
     }
   };
 
-  await fetchPage(); // 先不传 status，拉取全部
+  await fetchPage(); // 轮次 1：默认全量（正常产品为主）
   await new Promise((r) => setTimeout(r, DELAY_MS));
-  await fetchPage({ validation_status: 8 }); // 强制拉取 validation_status=8 驳回产品
+  await fetchPage({ validation_status: 8 }); // 轮次 2：资料驳回（保留）
   await new Promise((r) => setTimeout(r, DELAY_MS));
-  if (result.totalFetched === 0) {
-    await fetchPage({ status: 1 });
-    await new Promise((r) => setTimeout(r, DELAY_MS));
-    await fetchPage({ status: 0 });
-  }
+  await fetchPage({ validation_status: 10 }); // 轮次 3：平台锁定（新增）
+  await new Promise((r) => setTimeout(r, DELAY_MS));
+  await fetchPage({ status: 0 }); // 轮次 4：下架产品（从兜底改为常规补拉）
 
   console.log(
     `[storeProductSync] shop=${creds.shopId} ${modifiedAfter ? `增量 modified_after=${modifiedAfter}` : '全量'}，` +
